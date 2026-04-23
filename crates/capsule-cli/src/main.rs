@@ -2,17 +2,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
-use capsule_core::{Acceptance, ExpectExit, Status};
+use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
     AbandonRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
     HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
 };
 use clap::{Parser, Subcommand};
+use time::format_description::well_known::Rfc3339;
 
 mod init;
 
 #[derive(Parser)]
-#[command(name = "capsule", version, about = "Path-prefix lock + verified atomic land for parallel agents.")]
+#[command(
+    name = "capsule",
+    version,
+    about = "Path-prefix lock + verified atomic land for parallel agents."
+)]
 struct Cli {
     /// Path to the store dir (default: `.capsule/` in cwd).
     #[arg(long, env = "CAPSULE_DIR", global = true)]
@@ -30,7 +35,7 @@ struct Cli {
 enum Cmd {
     /// Initialize a capsule store at `<dir>/state.db`.
     Init(InitArgs),
-    /// Run the deployment ACL test suite (DESIGN.md §8.2). [unimplemented]
+    /// Run the deployment ACL test suite. [unimplemented]
     DeployVerify,
     /// Create a new capsule.
     Create(CreateArgs),
@@ -52,7 +57,7 @@ enum Cmd {
     RemoveDep(DepArgs),
     /// List capsules.
     List(ListArgs),
-    /// Run the reconciler decision tree on a frozen capsule (DESIGN §7.1.2).
+    /// Run the reconciler on a frozen capsule (pending_land set).
     Reconcile(ReconcileArgs),
     /// Operator escape hatch: force-clear a stuck pending_land.
     ForceUnfreeze(ForceUnfreezeArgs),
@@ -129,7 +134,7 @@ struct AttestArgs {
     exit_code: String,
     #[arg(long = "duration-ms")]
     duration_ms: u64,
-    /// Write-once or content-addressed URI (DESIGN.md §7.2 log_ref integrity).
+    /// Write-once or content-addressed URI for the verification log.
     #[arg(long = "log-ref")]
     log_ref: String,
 }
@@ -166,7 +171,7 @@ struct ForceUnfreezeArgs {
     /// Operator identity, audited on every emitted incident event.
     #[arg(long)]
     operator: String,
-    /// Operator MUST confirm the lander is dead/unresponsive (§7.1.2).
+    /// Operator MUST confirm the lander is dead/unresponsive.
     #[arg(long = "lander-confirmed-dead")]
     lander_confirmed_dead: bool,
 }
@@ -196,13 +201,15 @@ struct DepArgs {
 struct ListArgs {
     #[arg(long, value_parser = parse_status_arg)]
     status: Option<Status>,
-    /// Only show capsules eligible for an immediate `claim`: status=planned,
-    /// all deps landed, no scope conflict with in-flight capsules.
+    /// Only capsules claimable right now.
     #[arg(long)]
     available: bool,
-    /// Only show capsules whose scope_prefixes overlap this path.
+    /// Only capsules whose scope overlaps this path.
     #[arg(long = "scope-overlaps")]
     scope_overlaps: Option<String>,
+    /// Emit full `Capsule` records in `--json` (default: summary rows).
+    #[arg(long)]
+    full: bool,
 }
 
 fn parse_status_arg(s: &str) -> std::result::Result<Status, String> {
@@ -268,14 +275,11 @@ fn main() -> Result<()> {
                 .scope
                 .iter()
                 .map(|s| {
-                    CanonicalPath::new(s)
-                        .map_err(|e| anyhow::anyhow!("invalid --scope {s:?}: {e}"))
+                    CanonicalPath::new(s).map_err(|e| anyhow::anyhow!("invalid --scope {s:?}: {e}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let id = args
-                .id
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             let capsule = store.create_capsule(NewCapsule {
                 id,
@@ -295,7 +299,12 @@ fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&capsule)?);
             } else {
-                println!("{}\t{}\t{}", capsule.id, status_str(capsule.status), capsule.title);
+                println!(
+                    "{}\t{}\t{}",
+                    capsule.id,
+                    status_str(capsule.status),
+                    capsule.title
+                );
             }
         }
         Cmd::List(args) => {
@@ -314,7 +323,13 @@ fn main() -> Result<()> {
                 scope_overlaps,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&capsules)?);
+                if args.full {
+                    println!("{}", serde_json::to_string_pretty(&capsules)?);
+                } else {
+                    let summaries: Vec<CapsuleSummary<'_>> =
+                        capsules.iter().map(CapsuleSummary::from).collect();
+                    println!("{}", serde_json::to_string_pretty(&summaries)?);
+                }
             } else {
                 for c in capsules {
                     let scope = c
@@ -351,7 +366,7 @@ fn main() -> Result<()> {
                     attempt.id,
                     attempt.branch,
                     attempt.witness_branch,
-                    attempt.lease.expires_at
+                    fmt_ts(attempt.lease.expires_at)
                 );
             }
         }
@@ -364,7 +379,7 @@ fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&ack)?);
             } else {
-                println!("heartbeat\tlease_expires={}", ack.lease_expires_at);
+                println!("lease_expires={}", fmt_ts(ack.lease_expires_at));
             }
         }
         Cmd::Attest(args) => {
@@ -510,5 +525,31 @@ fn status_str(s: Status) -> &'static str {
         Status::Accepted => "accepted",
         Status::Landed => "landed",
         Status::Abandoned => "abandoned",
+    }
+}
+
+fn fmt_ts(t: time::OffsetDateTime) -> String {
+    t.format(&Rfc3339).unwrap_or_else(|_| t.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct CapsuleSummary<'a> {
+    id: &'a str,
+    status: Status,
+    base_ref: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scope_prefixes: Vec<&'a str>,
+    title: &'a str,
+}
+
+impl<'a> From<&'a Capsule> for CapsuleSummary<'a> {
+    fn from(c: &'a Capsule) -> Self {
+        Self {
+            id: &c.id,
+            status: c.status,
+            base_ref: &c.base_ref,
+            scope_prefixes: c.scope_prefixes.iter().map(|p| p.as_str()).collect(),
+            title: &c.title,
+        }
     }
 }

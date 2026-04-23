@@ -32,7 +32,9 @@ pub enum AttemptOutcome {
 pub struct Acceptance {
     pub run: String,
     pub expect_exit: ExpectExit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_sec: Option<u64>,
 }
 
@@ -63,13 +65,18 @@ pub struct Attempt {
     pub branch: String,
     pub witness_branch: String,
     pub base_sha: Sha,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_sha: Option<Sha>,
     #[serde(with = "time::serde::iso8601")]
     pub last_heartbeat: OffsetDateTime,
     pub outcome: AttemptOutcome,
     #[serde(with = "time::serde::iso8601")]
     pub opened_at: OffsetDateTime,
-    #[serde(with = "time::serde::iso8601::option")]
+    #[serde(
+        default,
+        with = "time::serde::iso8601::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub closed_at: Option<OffsetDateTime>,
 }
 
@@ -122,14 +129,21 @@ pub struct Capsule {
     pub title: String,
     pub description: String,
     pub acceptance: Acceptance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_prefixes: Vec<CanonicalPath>,
     pub base_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<CapsuleId>,
     pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_attempt: Option<AttemptId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<Attempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_land: Option<PendingLand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<Landing>,
     #[serde(with = "time::serde::iso8601")]
     pub created_at: OffsetDateTime,

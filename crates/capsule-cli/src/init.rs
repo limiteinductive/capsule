@@ -49,7 +49,7 @@ pub fn run(opts: InitOpts) -> Result<InitReport> {
     if worktree.is_none() {
         warnings.push(
             "cwd is not inside a git worktree; capsule needs a git repo with a remote before \
-             `capsule land` can run (DESIGN §3.1)"
+             `capsule land` can run"
                 .to_string(),
         );
     }
@@ -61,16 +61,7 @@ pub fn run(opts: InitOpts) -> Result<InitReport> {
     let (gitignore_updated, gitignore_skipped) =
         maybe_update_gitignore(&opts.dir, worktree.as_deref(), opts.no_gitignore)?;
 
-    let next_steps = vec![
-        "capsule create --title ... --scope <prefix> --acceptance-cmd '<test cmd>' --base-ref main"
-            .to_string(),
-        "capsule list --available".to_string(),
-        "before production use: capsule deploy verify (DESIGN §8.2 — not yet implemented)"
-            .to_string(),
-        "remote setup: restrict branch creation on `refs/heads/capsule-witness/**` and \
-         `refs/heads/<base_ref>` to the lander principal (DESIGN §3.1)"
-            .to_string(),
-    ];
+    let next_steps = vec!["capsule list --available".to_string()];
 
     Ok(InitReport {
         dir: opts.dir,
@@ -105,17 +96,14 @@ fn check_git() -> Option<String> {
         Ok(o) if o.status.success() => o,
         _ => {
             return Some(
-                "`git` not found on PATH; capsule shells out to git for land/reconcile (DESIGN \
-                 §7.1.2)"
-                    .to_string(),
+                "`git` not found on PATH; capsule shells out to git for land/reconcile".to_string(),
             )
         }
     };
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     match parse_git_version(&text) {
         Some((major, minor)) if (major, minor) < (2, 13) => Some(format!(
-            "git {major}.{minor} detected; capsule requires >= 2.13 for `--force-with-lease` \
-             (DESIGN §3.1)"
+            "git {major}.{minor} detected; capsule requires >= 2.13 for `--force-with-lease`"
         )),
         Some(_) => None,
         None => Some(format!("could not parse git version from: {}", text.trim())),
@@ -241,7 +229,10 @@ mod tests {
         assert_eq!(r.gitignore_updated.as_deref(), Some(gi.as_path()));
         assert!(r.gitignore_skipped.is_none());
         let contents = fs::read_to_string(&gi).unwrap();
-        assert!(contents.lines().any(|l| l == ".capsule/"), "got: {contents:?}");
+        assert!(
+            contents.lines().any(|l| l == ".capsule/"),
+            "got: {contents:?}"
+        );
         assert!(store.join("state.db").exists());
     }
 
@@ -283,9 +274,14 @@ mod tests {
         let r = run_at(tmp.path(), store, false).unwrap();
 
         assert!(r.gitignore_updated.is_none());
-        assert_eq!(r.gitignore_skipped.as_deref(), Some("not inside a git worktree"));
+        assert_eq!(
+            r.gitignore_skipped.as_deref(),
+            Some("not inside a git worktree")
+        );
         assert!(
-            r.warnings.iter().any(|w| w.contains("not inside a git worktree")),
+            r.warnings
+                .iter()
+                .any(|w| w.contains("not inside a git worktree")),
             "warnings: {:?}",
             r.warnings
         );
