@@ -1,0 +1,15 @@
+[package]
+name = "capsule-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure types and protocol logic for capsule (no I/O)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true

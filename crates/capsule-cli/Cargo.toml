@@ -1,0 +1,23 @@
+[package]
+name = "capsule-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reference CLI for capsule."
+
+[[bin]]
+name = "capsule"
+path = "src/main.rs"
+
+[dependencies]
+capsule-core.workspace = true
+capsule-store.workspace = true
+capsule-git.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

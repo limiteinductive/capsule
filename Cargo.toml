@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capsule-core",
+    "crates/capsule-store",
+    "crates/capsule-git",
+    "crates/capsule-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/limiteinductive/capsule"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# workspace-internal
+capsule-core = { path = "crates/capsule-core" }
+capsule-store = { path = "crates/capsule-store" }
+capsule-git = { path = "crates/capsule-git" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

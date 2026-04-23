@@ -1,0 +1,13 @@
+[package]
+name = "capsule-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Git wire integration for capsule (atomic multi-ref push, --force-with-lease)."
+
+[dependencies]
+capsule-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
