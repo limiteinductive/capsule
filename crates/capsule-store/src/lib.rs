@@ -5,7 +5,7 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 use capsule_core::path::CanonicalPath;
-use capsule_core::{Acceptance, Capsule, CapsuleId, Status};
+use capsule_core::{Acceptance, Capsule, CapsuleId, Landing, PendingLand, Status, Verification};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json as json;
 use thiserror::Error;
@@ -39,6 +39,12 @@ pub enum StoreError {
     LeaseExpired(String),
     #[error("capsule has pending_land — reclaim/claim frozen until reconciled")]
     PendingLandFrozen,
+    #[error("capsule {0} not landable: missing verification or active_attempt")]
+    NotLandable(CapsuleId),
+    #[error("git: {0}")]
+    Git(#[from] capsule_git::GitError),
+    #[error("land push other failure: {0}")]
+    LandOtherFailure(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -559,6 +565,237 @@ impl Store {
         })
     }
 
+    /// Land an `accepted` capsule via the git-atomic multi-ref fast-forward push.
+    /// See DESIGN.md §7.1.2.
+    ///
+    /// Three steps interleaved with two DB transactions:
+    ///   1. ls_remote `base_ref` to read `prior_base_sha` (no DB).
+    ///   2. DB tx: re-verify preconditions; write complete `PendingLand`. Commit.
+    ///   3. `git push --atomic --force-with-lease=<witness>: ...` (no DB).
+    ///   4. DB tx: based on push outcome, write Landing+clear or clear+abandon /
+    ///      clear+stay-accepted; emit events.
+    ///
+    /// Crash between (3) and (4) leaves `pending_land != null` for the
+    /// reconciler to repair (§7.1.2 reconciler decision tree). Until then,
+    /// the capsule is reclaim-frozen (§7.2).
+    pub fn land(&mut self, req: LandRequest) -> Result<LandAck> {
+        use capsule_core::Lease;
+        use capsule_git::{land_push, ls_remote_branch, LandOutcome as GitOutcome};
+
+        // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
+        // We need this for both the PendingLand record and the eventual
+        // Landing.advanced_base_ref computation. If the remote moves between
+        // here and step 3, the atomic push will reject as base_ref_moved.
+        let (base_ref, witness_branch, verified_sha) = {
+            let cap = self.get_capsule(&req.capsule_id)?;
+            let v = cap.verification.as_ref().ok_or_else(|| {
+                StoreError::NotLandable(req.capsule_id.clone())
+            })?;
+            let aid = cap
+                .active_attempt
+                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            let att = cap
+                .attempts
+                .iter()
+                .find(|a| a.id == aid)
+                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            (cap.base_ref.clone(), att.witness_branch.clone(), v.verified_sha.clone())
+        };
+        let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
+
+        // ---- Step 2: write PendingLand under preconditions. ----
+        let attempt_id: i64;
+        let pending = {
+            let now = OffsetDateTime::now_utc();
+            let now_str = format_iso8601(now)?;
+            let tx = self.conn.transaction()?;
+
+            let (status_str, active_attempt, pending_land_json, verification_json): (
+                String, Option<i64>, Option<String>, Option<String>,
+            ) = tx
+                .query_row(
+                    "SELECT status, active_attempt, pending_land_json, verification_json
+                     FROM capsule WHERE id = ?1",
+                    params![req.capsule_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+
+            if pending_land_json.is_some() {
+                return Err(StoreError::PendingLandFrozen);
+            }
+            let status = parse_status(&status_str);
+            if status != Status::Accepted {
+                return Err(StoreError::NotClaimable(
+                    req.capsule_id.clone(),
+                    status_to_str(status),
+                ));
+            }
+            let aid = active_attempt
+                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            attempt_id = aid;
+            let v_json = verification_json
+                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            let v: Verification = json::from_str(&v_json)?;
+            // Re-bind verified_sha from the in-tx read (defense-in-depth: no
+            // gap between read and PendingLand write).
+            if v.verified_sha != verified_sha {
+                return Err(StoreError::NotLandable(req.capsule_id.clone()));
+            }
+
+            let lease_json: String = tx.query_row(
+                "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params![req.capsule_id, aid],
+                |r| r.get(0),
+            )?;
+            let lease: Lease = json::from_str(&lease_json)?;
+            if lease.session_id != req.session_id {
+                return Err(StoreError::CrossSession);
+            }
+            if now > lease.expires_at {
+                return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
+            }
+
+            let pending = PendingLand {
+                at: now,
+                attempt_id: aid as u64,
+                verified_sha: verified_sha.clone(),
+                prior_base_sha: prior_base_sha.clone(),
+                witness_branch: witness_branch.clone(),
+                lander: req.lander.clone(),
+            };
+            let pending_json = json::to_string(&pending)?;
+
+            tx.execute(
+                "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
+                params![pending_json, now_str, req.capsule_id],
+            )?;
+            tx.execute(
+                "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, 'pending_land_committed', ?5)",
+                params![now_str, req.capsule_id, aid, req.lander, pending_json],
+            )?;
+            tx.commit()?;
+            pending
+        };
+
+        // ---- Step 3: atomic multi-ref push. No DB. ----
+        let push_outcome = land_push(
+            &req.repo_dir,
+            &req.remote,
+            &base_ref,
+            &witness_branch,
+            &verified_sha,
+            &prior_base_sha,
+        )?;
+
+        // ---- Step 4: synchronous reconcile from outcome. ----
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+        let tx = self.conn.transaction()?;
+
+        let outcome = match push_outcome {
+            GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
+                let advanced_base_ref = verified_sha != prior_base_sha;
+                let landing = Landing {
+                    at: now,
+                    landed_sha: verified_sha.clone(),
+                    prior_base_sha: pending.prior_base_sha.clone(),
+                    landed_by: req.lander.clone(),
+                    attempt_id: pending.attempt_id,
+                    witness_branch: pending.witness_branch.clone(),
+                    advanced_base_ref,
+                };
+                let landing_json = json::to_string(&landing)?;
+
+                tx.execute(
+                    "UPDATE capsule
+                        SET status='landed',
+                            landing_json=?1,
+                            pending_land_json=NULL,
+                            updated_at=?2
+                      WHERE id=?3",
+                    params![landing_json, now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempt SET outcome='landed', closed_at=?1
+                      WHERE capsule_id=?2 AND attempt_id=?3",
+                    params![now_str, req.capsule_id, attempt_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
+                    params![now_str, req.capsule_id, attempt_id, req.lander, landing_json],
+                )?;
+                LandOutcome::Landed { landing }
+            }
+            GitOutcome::BaseRefMoved => {
+                tx.execute(
+                    "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
+                    params![now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
+                             json_object('reason', 'base_ref_moved', 'by', ?4))",
+                    params![now_str, req.capsule_id, attempt_id, req.lander],
+                )?;
+                LandOutcome::BaseRefMoved
+            }
+            GitOutcome::WitnessOidMismatch => {
+                tx.execute(
+                    "UPDATE capsule
+                        SET status='abandoned',
+                            pending_land_json=NULL,
+                            updated_at=?1
+                      WHERE id=?2",
+                    params![now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempt SET outcome='abandoned', closed_at=?1
+                      WHERE capsule_id=?2 AND attempt_id=?3",
+                    params![now_str, req.capsule_id, attempt_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'operational_incident',
+                             json_object('kind', 'witness_oid_mismatch',
+                                         'witness_branch', ?5,
+                                         'verified_sha', ?6))",
+                    params![
+                        now_str, req.capsule_id, attempt_id, req.lander,
+                        witness_branch, verified_sha,
+                    ],
+                )?;
+                LandOutcome::WitnessOidMismatch
+            }
+            GitOutcome::OtherFailure { stderr } => {
+                // Per DESIGN: not enumerated in §7.1.2 step 5 (only base_ref_moved
+                // and witness_oid_mismatch are). Treat as transient: clear
+                // pending_land so the caller can retry without manual unfreeze;
+                // bubble the stderr up as an error.
+                tx.execute(
+                    "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
+                    params![now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
+                             json_object('reason', 'other_failure',
+                                         'stderr', ?5,
+                                         'by', ?4))",
+                    params![now_str, req.capsule_id, attempt_id, req.lander, stderr],
+                )?;
+                tx.commit()?;
+                return Err(StoreError::LandOtherFailure(stderr));
+            }
+        };
+
+        tx.commit()?;
+        Ok(LandAck { outcome })
+    }
+
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
         let row: RowCapsule = self
             .conn
@@ -652,6 +889,37 @@ pub struct AttestRequest {
 pub struct AttestAck {
     pub accepted: bool,
     pub new_status: Status,
+}
+
+#[derive(Debug, Clone)]
+pub struct LandRequest {
+    pub capsule_id: CapsuleId,
+    pub session_id: String,
+    /// Principal id of the lander (recorded in PendingLand/Landing/events).
+    pub lander: String,
+    /// Git remote name or URL for ls-remote and the atomic push.
+    pub remote: String,
+    /// Working directory the `git push` is invoked from — must have
+    /// `verified_sha` in its object database (typically the lander's clone).
+    pub repo_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LandOutcome {
+    /// Push succeeded; capsule is `landed`.
+    Landed { landing: Landing },
+    /// `base_ref` advanced between PendingLand commit and push. Capsule
+    /// stays `accepted`; pending_land cleared. Caller rebases + re-attests.
+    BaseRefMoved,
+    /// Witness ref existed at a different sha. Capsule moved to `abandoned`;
+    /// `operational_incident` event emitted.
+    WitnessOidMismatch,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LandAck {
+    pub outcome: LandOutcome,
 }
 
 /// Sweep expired leases (DESIGN.md §3.3, §7.2). Run inside any tx that may
@@ -1230,5 +1498,176 @@ mod tests {
         s.create_capsule(nc.clone()).unwrap();
         let err = s.create_capsule(nc).unwrap_err();
         assert!(matches!(err, StoreError::DuplicateId(_)));
+    }
+
+    // ---- land() integration tests against a real local bare repo. ----
+
+    fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git invocation failed");
+        if !out.status.success() {
+            panic!(
+                "git {args:?} in {cwd:?} failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Build a bare repo with `main` at one commit, plus a worker clone with
+    /// a second commit pushed under `capsules/<id>/a1` so the bare repo has
+    /// the verified_sha object available for the land push.
+    /// Returns `(tempdir, bare_repo_path, work_dir_path, verified_sha)`.
+    /// The `work_dir_path` doubles as the lander's `repo_dir` for `land()`.
+    fn setup_bare_with_attempt(
+        capsule_id: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.git");
+        std::fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "--bare", "--initial-branch=main"]);
+
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "--initial-branch=main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("README"), "init\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&work, &["push", "origin", "main"]);
+
+        // Worker creates a new commit; this is the verified_sha.
+        std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "feature"]);
+        let verified_sha = git(&work, &["rev-parse", "HEAD"]);
+        let attempt_branch = format!("capsules/{capsule_id}/a1");
+        // Push to the per-attempt branch so the bare repo has the object.
+        git(&work, &["push", "origin", &format!("HEAD:refs/heads/{attempt_branch}")]);
+
+        (dir, bare, work, verified_sha)
+    }
+
+    fn land_setup_capsule(s: &mut Store, id: &str) {
+        s.create_capsule(NewCapsule {
+            id: id.into(),
+            title: "t".into(),
+            description: "d".into(),
+            acceptance: Acceptance {
+                run: "true".into(),
+                expect_exit: capsule_core::ExpectExit::Code(0),
+                cwd: None,
+                timeout_sec: None,
+            },
+            scope_prefixes: vec![CanonicalPath::new("feature.txt").unwrap()],
+            base_ref: "main".into(),
+            depends_on: vec![],
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn land_happy_path_advances_base_ref_and_writes_landing() {
+        let id = "land1";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+
+        let ack = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work.clone(),
+            })
+            .unwrap();
+
+        match ack.outcome {
+            LandOutcome::Landed { ref landing } => {
+                assert_eq!(landing.landed_sha, verified_sha);
+                assert!(landing.advanced_base_ref);
+                assert_eq!(landing.witness_branch, format!("capsule-witness/{id}/a1"));
+            }
+            other => panic!("expected Landed, got {other:?}"),
+        }
+
+        // Bare repo should now have main at verified_sha + the witness branch.
+        let bare_main = git(&bare, &["rev-parse", "main"]);
+        assert_eq!(bare_main, verified_sha);
+        let witness = git(
+            &bare,
+            &["rev-parse", &format!("capsule-witness/{id}/a1")],
+        );
+        assert_eq!(witness, verified_sha);
+
+        // DB: status=landed, landing populated, pending_land cleared, attempt closed.
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Landed);
+        assert!(c.landing.is_some());
+        assert!(c.pending_land.is_none());
+        let att = c.attempts.iter().find(|a| a.id == 1).unwrap();
+        assert_eq!(att.outcome, capsule_core::AttemptOutcome::Landed);
+    }
+
+    #[test]
+    fn land_idempotent_re_run_is_no_op_on_witness() {
+        // Second land call with the same verified_sha against a bare that already
+        // has main + witness at that sha is the §7.1.2 crash-retry case.
+        // We simulate it by running land() twice; the second one finds main
+        // already at verified_sha (NoOp on base_ref) and witness already
+        // at verified_sha (same-OID lease accepted as no-op).
+        let id = "land2";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work.clone(),
+        })
+        .unwrap();
+
+        // Second land — capsule is now `landed`, so we expect NotClaimable.
+        let err = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotClaimable(_, "landed")));
     }
 }

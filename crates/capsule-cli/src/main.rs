@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, ExpectExit, Status};
 use capsule_store::{
-    AttestRequest, ClaimRequest, HeartbeatRequest, ListFilter, NewCapsule, Store,
+    AttestRequest, ClaimRequest, HeartbeatRequest, LandRequest, ListFilter, NewCapsule, Store,
 };
 use clap::{Parser, Subcommand};
 
@@ -37,8 +37,8 @@ enum Cmd {
     Heartbeat(HeartbeatArgs),
     /// Record verification for the active attempt.
     Attest(AttestArgs),
-    /// Land an accepted capsule via atomic multi-ref push. [unimplemented]
-    Land,
+    /// Land an accepted capsule via atomic multi-ref push.
+    Land(LandArgs),
     /// Abandon a capsule. [unimplemented]
     Abandon,
     /// Reclaim an expired capsule (manual). [unimplemented]
@@ -120,6 +120,23 @@ struct AttestArgs {
     /// Write-once or content-addressed URI (DESIGN.md §7.2 log_ref integrity).
     #[arg(long = "log-ref")]
     log_ref: String,
+}
+
+#[derive(clap::Args)]
+struct LandArgs {
+    capsule_id: String,
+    #[arg(long)]
+    session: String,
+    /// Lander principal id. Recorded in PendingLand / Landing / events.
+    #[arg(long)]
+    lander: String,
+    /// Git remote name or URL (e.g. "origin" or a path to a bare repo).
+    #[arg(long)]
+    remote: String,
+    /// Working directory the lander invokes `git push` from. Must have
+    /// `verified_sha` in its object database. Defaults to cwd.
+    #[arg(long = "repo-dir")]
+    repo_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -305,7 +322,37 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::DeployVerify | Cmd::Land
+        Cmd::Land(args) => {
+            let mut store = open_store(&dir)?;
+            let repo_dir = args
+                .repo_dir
+                .map_or_else(std::env::current_dir, Ok)
+                .context("resolving --repo-dir / cwd")?;
+            let ack = store.land(LandRequest {
+                capsule_id: args.capsule_id,
+                session_id: args.session,
+                lander: args.lander,
+                remote: args.remote,
+                repo_dir,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&ack)?);
+            } else {
+                match &ack.outcome {
+                    capsule_store::LandOutcome::Landed { landing } => println!(
+                        "landed\tsha={}\tprior={}\tadvanced={}",
+                        landing.landed_sha, landing.prior_base_sha, landing.advanced_base_ref
+                    ),
+                    capsule_store::LandOutcome::BaseRefMoved => {
+                        println!("base_ref_moved\tcapsule stays accepted; rebase + re-attest");
+                    }
+                    capsule_store::LandOutcome::WitnessOidMismatch => {
+                        println!("witness_oid_mismatch\tcapsule abandoned; investigate");
+                    }
+                }
+            }
+        }
+        Cmd::DeployVerify
         | Cmd::Abandon
         | Cmd::Reclaim
         | Cmd::AddDep

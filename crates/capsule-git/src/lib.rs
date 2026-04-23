@@ -74,10 +74,15 @@ pub enum LandOutcome {
 ///   <verified_sha>:refs/heads/<witness_branch>
 /// ```
 ///
+/// `repo_dir` is the git working directory the push is invoked from — it
+/// must have `verified_sha` in its object database (typically the lander's
+/// clone of the remote, which has fetched/received the worker's commits).
+///
 /// The `expected_prior_base_sha` argument is informational — it lets the
 /// caller compute `Landing.advanced_base_ref`. The atomic push uses git's
 /// own FF check on `base_ref`, not the `expected_prior_base_sha`.
 pub fn land_push(
+    repo_dir: &std::path::Path,
     remote: &str,
     base_ref: &str,
     witness_branch: &str,
@@ -89,6 +94,7 @@ pub fn land_push(
     let witness_refspec = format!("{verified_sha}:refs/heads/{witness_branch}");
 
     let out = Command::new("git")
+        .current_dir(repo_dir)
         .args([
             "push",
             "--atomic",

@@ -133,6 +133,7 @@ name = "capsule-store"
 version = "0.0.1"
 dependencies = [
  "capsule-core",
+ "capsule-git",
  "rusqlite",
  "serde",
  "serde_json",
