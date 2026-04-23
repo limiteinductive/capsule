@@ -1014,6 +1014,195 @@ impl Store {
         Ok(())
     }
 
+    /// Reconciler decision tree (DESIGN.md §7.1.2). No-op if `pending_land`
+    /// is null. CAS-conditioned: if `pending_land` changed between the
+    /// outside read and the in-tx commit, the in-tx update no-ops (loser
+    /// of a reconciler race). Returns the outcome that was applied.
+    ///
+    /// `repo_dir` is only needed if a future variant invokes git push;
+    /// reconcile only ls-remotes, so any cwd is fine — but we accept it
+    /// uniformly for symmetry with `land`.
+    pub fn reconcile(&mut self, req: ReconcileRequest) -> Result<ReconcileOutcome> {
+        self.reconcile_inner(req, /* operator: */ None)
+    }
+
+    /// Operator escape hatch (DESIGN.md §7.1.2). Same decision tree as
+    /// `reconcile`, but emits a mandatory `operational_incident` event and
+    /// requires the operator to assert `lander_confirmed_dead`.
+    pub fn force_unfreeze(&mut self, req: ForceUnfreezeRequest) -> Result<ReconcileOutcome> {
+        if !req.lander_confirmed_dead {
+            return Err(StoreError::LandOtherFailure(
+                "force-unfreeze requires --lander-confirmed-dead".into(),
+            ));
+        }
+        let operator = Some(req.operator.clone());
+        self.reconcile_inner(
+            ReconcileRequest {
+                capsule_id: req.capsule_id,
+                remote: req.remote,
+            },
+            operator,
+        )
+    }
+
+    fn reconcile_inner(
+        &mut self,
+        req: ReconcileRequest,
+        operator: Option<String>,
+    ) -> Result<ReconcileOutcome> {
+        use capsule_git::ls_remote_branch;
+
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+
+        // Outside-tx read of pending_land. We snapshot the JSON for CAS.
+        let pending_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pending_land_json FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        let Some(snapshot_json) = pending_json else {
+            return Ok(ReconcileOutcome::NotFrozen);
+        };
+        let pending: PendingLand = json::from_str(&snapshot_json)?;
+
+        // ls-remote witness branch.
+        let witness_sha = ls_remote_branch(&req.remote, &pending.witness_branch)?;
+        let witness_state = if witness_sha == capsule_git::ZERO_OID {
+            WitnessState::Absent
+        } else if witness_sha == pending.verified_sha {
+            WitnessState::AtVerifiedSha
+        } else {
+            WitnessState::Different(witness_sha)
+        };
+
+        let actor = operator.clone().unwrap_or_else(|| "reconciler".into());
+
+        let tx = self.conn.transaction()?;
+        // CAS: re-read pending_land in tx. If it has been mutated since the
+        // outside read, abort with a no-op (another reconciler/lander won).
+        let cur_pending: Option<String> = tx
+            .query_row(
+                "SELECT pending_land_json FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        if cur_pending.as_deref() != Some(snapshot_json.as_str()) {
+            tx.commit()?;
+            return Ok(ReconcileOutcome::CasLost);
+        }
+
+        let outcome = match witness_state {
+            WitnessState::AtVerifiedSha => {
+                // Push ran before crash. Reconstruct Landing from PendingLand.
+                let landing = Landing {
+                    at: now,
+                    landed_sha: pending.verified_sha.clone(),
+                    prior_base_sha: pending.prior_base_sha.clone(),
+                    landed_by: actor.clone(),
+                    attempt_id: pending.attempt_id,
+                    witness_branch: pending.witness_branch.clone(),
+                    advanced_base_ref: pending.verified_sha != pending.prior_base_sha,
+                };
+                let landing_json = json::to_string(&landing)?;
+                tx.execute(
+                    "UPDATE capsule
+                        SET status='landed',
+                            landing_json=?1,
+                            pending_land_json=NULL,
+                            updated_at=?2
+                      WHERE id=?3",
+                    params![landing_json, now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempt SET outcome='landed', closed_at=?1
+                      WHERE capsule_id=?2 AND attempt_id=?3",
+                    params![now_str, req.capsule_id, pending.attempt_id as i64],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
+                    params![
+                        now_str, req.capsule_id, pending.attempt_id as i64, actor, landing_json
+                    ],
+                )?;
+                if operator.is_some() {
+                    tx.execute(
+                        "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                         VALUES (?1, ?2, ?3, ?4, 'operational_incident',
+                                 json_object('kind', 'force_unfreeze',
+                                             'resolution', 'reconciled_landed'))",
+                        params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
+                    )?;
+                }
+                ReconcileOutcome::Landed
+            }
+            WitnessState::Different(found_sha) => {
+                tx.execute(
+                    "UPDATE capsule
+                        SET status='abandoned',
+                            pending_land_json=NULL,
+                            updated_at=?1
+                      WHERE id=?2",
+                    params![now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "UPDATE attempt SET outcome='abandoned', closed_at=?1
+                      WHERE capsule_id=?2 AND attempt_id=?3",
+                    params![now_str, req.capsule_id, pending.attempt_id as i64],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'operational_incident',
+                             json_object('kind', 'witness_oid_mismatch',
+                                         'witness_branch', ?5,
+                                         'expected_sha', ?6,
+                                         'found_sha', ?7,
+                                         'by', ?4))",
+                    params![
+                        now_str, req.capsule_id, pending.attempt_id as i64, actor,
+                        pending.witness_branch, pending.verified_sha, found_sha,
+                    ],
+                )?;
+                ReconcileOutcome::Abandoned
+            }
+            WitnessState::Absent => {
+                tx.execute(
+                    "UPDATE capsule
+                        SET pending_land_json=NULL,
+                            updated_at=?1
+                      WHERE id=?2",
+                    params![now_str, req.capsule_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
+                             json_object('reason', 'witness_absent', 'by', ?4))",
+                    params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
+                )?;
+                if operator.is_some() {
+                    tx.execute(
+                        "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+                         VALUES (?1, ?2, ?3, ?4, 'operational_incident',
+                                 json_object('kind', 'force_unfreeze',
+                                             'resolution', 'cleared_witness_absent'))",
+                        params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
+                    )?;
+                }
+                ReconcileOutcome::Cleared
+            }
+        };
+
+        tx.commit()?;
+        Ok(outcome)
+    }
+
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
         let row: RowCapsule = self
             .conn
@@ -1151,6 +1340,47 @@ pub struct AbandonRequest {
 pub struct DepRequest {
     pub capsule_id: CapsuleId,
     pub depends_on: CapsuleId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconcileRequest {
+    pub capsule_id: CapsuleId,
+    /// Git remote name or URL for ls-remote witness.
+    pub remote: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForceUnfreezeRequest {
+    pub capsule_id: CapsuleId,
+    pub remote: String,
+    /// Operator identity, recorded as the actor on emitted events.
+    pub operator: String,
+    /// Operator must confirm the lander process is dead/unresponsive
+    /// before bypassing the reconciler. Without this flag the call is
+    /// rejected (DESIGN.md §7.1.2 force-unfreeze precondition).
+    pub lander_confirmed_dead: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileOutcome {
+    /// `pending_land` was null — nothing to do.
+    NotFrozen,
+    /// `pending_land` mutated between the snapshot and the in-tx CAS check
+    /// (another reconciler / lander won the race). No-op.
+    CasLost,
+    /// Witness exists at verified_sha → reconstructed Landing, status=landed.
+    Landed,
+    /// Witness exists at a different sha → status=abandoned + incident.
+    Abandoned,
+    /// Witness absent → cleared pending_land; capsule remains accepted.
+    Cleared,
+}
+
+enum WitnessState {
+    Absent,
+    AtVerifiedSha,
+    Different(String),
 }
 
 /// Sweep expired leases (DESIGN.md §3.3, §7.2). Run inside any tx that may
@@ -2147,5 +2377,232 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::NotClaimable(_, "landed")));
+    }
+
+    // ---- reconciler / force-unfreeze tests ----
+
+    /// Simulate a crash between `land`'s git push (step 3) and DB commit
+    /// (step 4) by writing PendingLand directly + executing the push out
+    /// of band, leaving status=accepted with pending_land set.
+    fn simulate_land_crash(
+        s: &mut Store,
+        id: &str,
+        verified_sha: &str,
+        prior_base_sha: &str,
+        bare: &std::path::Path,
+        work: &std::path::Path,
+        do_push: bool,
+        push_witness_at: Option<&str>,
+    ) {
+        // Force PendingLand into the DB without going through Store::land()
+        // (which would also commit Landing on success).
+        let pending = PendingLand {
+            at: OffsetDateTime::now_utc(),
+            attempt_id: 1,
+            verified_sha: verified_sha.into(),
+            prior_base_sha: prior_base_sha.into(),
+            witness_branch: format!("capsule-witness/{id}/a1"),
+            lander: "test-lander".into(),
+        };
+        let pending_json = json::to_string(&pending).unwrap();
+        let now_str = format_iso8601(OffsetDateTime::now_utc()).unwrap();
+        s.conn
+            .execute(
+                "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
+                params![pending_json, now_str, id],
+            )
+            .unwrap();
+
+        if do_push {
+            // Real atomic land push (this is what Store::land's step 3 does).
+            let outcome = capsule_git::land_push(
+                work,
+                bare.to_str().unwrap(),
+                "main",
+                &pending.witness_branch,
+                verified_sha,
+                prior_base_sha,
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                capsule_git::LandOutcome::Advanced { .. } | capsule_git::LandOutcome::NoOp
+            ));
+        } else if let Some(other_sha) = push_witness_at {
+            // Manually create the witness ref at a *different* sha to simulate
+            // protection leak / corruption (decision-tree branch 3).
+            git(work, &["push", bare.to_str().unwrap(),
+                       &format!("{other_sha}:refs/heads/{}", pending.witness_branch)]);
+        }
+    }
+
+    #[test]
+    fn reconcile_noop_when_pending_land_null() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let outcome = s
+            .reconcile(ReconcileRequest {
+                capsule_id: "x".into(),
+                remote: "/dev/null".into(),
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::NotFrozen);
+    }
+
+    #[test]
+    fn reconcile_landed_when_witness_at_verified_sha() {
+        // Push happened, DB commit didn't.
+        let id = "rec1";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, true, None);
+
+        let outcome = s
+            .reconcile(ReconcileRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Landed);
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Landed);
+        assert!(c.landing.is_some());
+        assert!(c.pending_land.is_none());
+        assert_eq!(c.landing.as_ref().unwrap().landed_by, "reconciler");
+    }
+
+    #[test]
+    fn reconcile_cleared_when_witness_absent() {
+        // Crash before push. Witness absent → clear, capsule stays accepted.
+        let id = "rec2";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        let outcome = s
+            .reconcile(ReconcileRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Cleared);
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Accepted);
+        assert!(c.pending_land.is_none());
+    }
+
+    #[test]
+    fn reconcile_abandoned_when_witness_at_different_sha() {
+        // Witness exists at some other sha — protection leak / corruption.
+        let id = "rec3";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        // Push a *different* commit at the witness ref.
+        std::fs::write(work.join("noise.txt"), "noise\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "noise"]);
+        let other_sha = git(&work, &["rev-parse", "HEAD"]);
+        simulate_land_crash(
+            &mut s, id, &verified_sha, &prior, &bare, &work, false, Some(&other_sha),
+        );
+
+        let outcome = s
+            .reconcile(ReconcileRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Abandoned);
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Abandoned);
+        assert!(c.pending_land.is_none());
+    }
+
+    #[test]
+    fn force_unfreeze_requires_lander_confirmed_dead() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let err = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: "x".into(),
+                remote: "/dev/null".into(),
+                operator: "op".into(),
+                lander_confirmed_dead: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::LandOtherFailure(_)));
+    }
+
+    #[test]
+    fn force_unfreeze_lands_when_witness_at_verified_sha() {
+        let id = "force1";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        land_setup_capsule(&mut s, id);
+        s.claim(claim_req(id, "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.clone(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, true, None);
+
+        let outcome = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+                operator: "operator-jane".into(),
+                lander_confirmed_dead: true,
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Landed);
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Landed);
+        assert_eq!(c.landing.as_ref().unwrap().landed_by, "operator-jane");
     }
 }

@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, ExpectExit, Status};
 use capsule_store::{
-    AbandonRequest, AttestRequest, ClaimRequest, DepRequest, HeartbeatRequest, LandRequest,
-    ListFilter, NewCapsule, Store,
+    AbandonRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
+    HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
 };
 use clap::{Parser, Subcommand};
 
@@ -50,8 +50,10 @@ enum Cmd {
     RemoveDep(DepArgs),
     /// List capsules.
     List(ListArgs),
-    /// Operator escape hatch: force-clear a stuck pending_land. [unimplemented]
-    ForceUnfreeze,
+    /// Run the reconciler decision tree on a frozen capsule (DESIGN §7.1.2).
+    Reconcile(ReconcileArgs),
+    /// Operator escape hatch: force-clear a stuck pending_land.
+    ForceUnfreeze(ForceUnfreezeArgs),
 }
 
 #[derive(clap::Args)]
@@ -138,6 +140,26 @@ struct LandArgs {
     /// `verified_sha` in its object database. Defaults to cwd.
     #[arg(long = "repo-dir")]
     repo_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct ReconcileArgs {
+    capsule_id: String,
+    #[arg(long)]
+    remote: String,
+}
+
+#[derive(clap::Args)]
+struct ForceUnfreezeArgs {
+    capsule_id: String,
+    #[arg(long)]
+    remote: String,
+    /// Operator identity, audited on every emitted incident event.
+    #[arg(long)]
+    operator: String,
+    /// Operator MUST confirm the lander is dead/unresponsive (§7.1.2).
+    #[arg(long = "lander-confirmed-dead")]
+    lander_confirmed_dead: bool,
 }
 
 #[derive(clap::Args)]
@@ -422,7 +444,33 @@ fn main() -> Result<()> {
                 println!("dep-removed");
             }
         }
-        Cmd::DeployVerify | Cmd::ForceUnfreeze => {
+        Cmd::Reconcile(args) => {
+            let mut store = open_store(&dir)?;
+            let outcome = store.reconcile(ReconcileRequest {
+                capsule_id: args.capsule_id,
+                remote: args.remote,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("reconcile\toutcome={outcome:?}");
+            }
+        }
+        Cmd::ForceUnfreeze(args) => {
+            let mut store = open_store(&dir)?;
+            let outcome = store.force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: args.capsule_id,
+                remote: args.remote,
+                operator: args.operator,
+                lander_confirmed_dead: args.lander_confirmed_dead,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("force-unfreeze\toutcome={outcome:?}");
+            }
+        }
+        Cmd::DeployVerify => {
             anyhow::bail!("not yet implemented")
         }
     }
