@@ -51,6 +51,9 @@ pub struct Lease {
     pub acquired_at: OffsetDateTime,
     #[serde(with = "time::serde::iso8601")]
     pub expires_at: OffsetDateTime,
+    /// TTL set at claim. Heartbeat extends `expires_at` by this amount; workers
+    /// cannot specify a different TTL post-claim. See DESIGN.md §3.3.
+    pub ttl_sec: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

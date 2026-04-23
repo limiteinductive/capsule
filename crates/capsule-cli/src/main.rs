@@ -101,8 +101,6 @@ struct HeartbeatArgs {
     capsule_id: String,
     #[arg(long)]
     session: String,
-    #[arg(long = "lease-ttl-sec", default_value_t = 300)]
-    lease_ttl_sec: u64,
 }
 
 #[derive(clap::Args)]
@@ -128,6 +126,13 @@ struct AttestArgs {
 struct ListArgs {
     #[arg(long, value_parser = parse_status_arg)]
     status: Option<Status>,
+    /// Only show capsules eligible for an immediate `claim`: status=planned,
+    /// all deps landed, no scope conflict with in-flight capsules.
+    #[arg(long)]
+    available: bool,
+    /// Only show capsules whose scope_prefixes overlap this path.
+    #[arg(long = "scope-overlaps")]
+    scope_overlaps: Option<String>,
 }
 
 fn parse_status_arg(s: &str) -> std::result::Result<Status, String> {
@@ -207,8 +212,20 @@ fn main() -> Result<()> {
             }
         }
         Cmd::List(args) => {
-            let store = open_store(&dir)?;
-            let capsules = store.list_capsules(ListFilter { status: args.status })?;
+            let mut store = open_store(&dir)?;
+            let scope_overlaps = args
+                .scope_overlaps
+                .as_deref()
+                .map(|s| {
+                    CanonicalPath::new(s)
+                        .map_err(|e| anyhow::anyhow!("invalid --scope-overlaps {s:?}: {e}"))
+                })
+                .transpose()?;
+            let capsules = store.list_capsules(ListFilter {
+                status: args.status,
+                available: args.available,
+                scope_overlaps,
+            })?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&capsules)?);
             } else {
@@ -256,7 +273,6 @@ fn main() -> Result<()> {
             let ack = store.heartbeat(HeartbeatRequest {
                 capsule_id: args.capsule_id,
                 session_id: args.session,
-                lease_ttl_sec: args.lease_ttl_sec,
             })?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&ack)?);

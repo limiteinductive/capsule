@@ -25,6 +25,8 @@ pub enum StoreError {
     NotFound(CapsuleId),
     #[error("capsule {0} already exists")]
     DuplicateId(CapsuleId),
+    #[error("invalid capsule id {0}: {1}")]
+    InvalidId(CapsuleId, String),
     #[error("capsule {0} not claimable: status={1}")]
     NotClaimable(CapsuleId, &'static str),
     #[error("capsule {0} has unmet deps: {1:?}")]
@@ -67,6 +69,8 @@ impl Store {
     /// Create a new capsule. Caller supplies the id (typically a uuid). All
     /// fields validated; status starts at `planned`.
     pub fn create_capsule(&mut self, c: NewCapsule) -> Result<Capsule> {
+        capsule_core::id::validate(&c.id)
+            .map_err(|e| StoreError::InvalidId(c.id.clone(), e.to_string()))?;
         let now = OffsetDateTime::now_utc();
         let capsule = Capsule {
             id: c.id.clone(),
@@ -138,7 +142,11 @@ impl Store {
         Ok(capsule)
     }
 
-    pub fn list_capsules(&self, filter: ListFilter) -> Result<Vec<Capsule>> {
+    pub fn list_capsules(&mut self, filter: ListFilter) -> Result<Vec<Capsule>> {
+        let now = OffsetDateTime::now_utc();
+        let tx = self.conn.transaction()?;
+        reclaim_expired_in_tx(&tx, now)?;
+
         let mut q = String::from(
             "SELECT id, title, description, acceptance_json, scope_json, base_ref,
                     depends_on_json, status, active_attempt, verification_json,
@@ -155,7 +163,7 @@ impl Store {
         }
         q.push_str(" ORDER BY created_at ASC");
 
-        let mut stmt = self.conn.prepare(&q)?;
+        let mut stmt = tx.prepare(&q)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(RowCapsule {
@@ -176,10 +184,61 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        rows.into_iter()
-            .map(|r| r.into_capsule(&self.conn))
-            .collect()
+        let mut capsules: Vec<Capsule> = rows
+            .into_iter()
+            .map(|r| r.into_capsule(&tx))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Status of dependencies — needed for `--available`.
+        if filter.available {
+            let landed_ids: std::collections::HashSet<String> = tx
+                .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+            let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
+                .prepare(
+                    "SELECT id, scope_json FROM capsule
+                     WHERE status IN ('active','accepted')",
+                )?
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .map(|(id, j)| Ok::<_, json::Error>((id, json::from_str(&j)?)))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            capsules.retain(|c| {
+                if c.status != Status::Planned {
+                    return false;
+                }
+                if !c.depends_on.iter().all(|d| landed_ids.contains(d)) {
+                    return false;
+                }
+                for (other_id, other_scope) in &in_flight_scopes {
+                    if other_id == &c.id {
+                        continue;
+                    }
+                    for a in &c.scope_prefixes {
+                        for b in other_scope {
+                            if a.overlaps(b) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            });
+        }
+
+        if let Some(probe) = &filter.scope_overlaps {
+            capsules.retain(|c| c.scope_prefixes.iter().any(|p| p.overlaps(probe)));
+        }
+
+        tx.commit()?;
+        Ok(capsules)
     }
 
     /// Atomic claim. See DESIGN.md §7.1.1.
@@ -195,23 +254,19 @@ impl Store {
 
         let tx = self.conn.transaction()?;
 
-        // Load capsule core fields.
-        let (status_str, active_attempt, pending, depends_on_json, scope_json): (
+        // Reclaim every expired lease across the store before evaluating this
+        // claim. Skips capsules with pending_land != null (§7.2 reclaim freeze).
+        reclaim_expired_in_tx(&tx, now)?;
+
+        // Re-read after reclaim.
+        let (status_str, _active_attempt, pending, depends_on_json, scope_json): (
             String, Option<i64>, Option<String>, String, String,
         ) = tx
             .query_row(
                 "SELECT status, active_attempt, pending_land_json, depends_on_json, scope_json
                  FROM capsule WHERE id = ?1",
                 params![req.capsule_id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                    ))
-                },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
@@ -220,48 +275,12 @@ impl Store {
             return Err(StoreError::PendingLandFrozen);
         }
 
-        // §7.1.1 step 2: if status ∈ {active, accepted} but lease expired, expire & revert.
         let status = parse_status(&status_str);
-        match status {
-            Status::Planned => {}
-            Status::Active | Status::Accepted => {
-                let aid = active_attempt.expect("active|accepted ⇒ active_attempt set");
-                let lease_json: String = tx.query_row(
-                    "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-                    params![req.capsule_id, aid],
-                    |r| r.get(0),
-                )?;
-                let lease: Lease = json::from_str(&lease_json)?;
-                if now <= lease.expires_at {
-                    return Err(StoreError::NotClaimable(
-                        req.capsule_id.clone(),
-                        status_to_str(status),
-                    ));
-                }
-                // Expire the prior attempt.
-                tx.execute(
-                    "UPDATE attempt SET outcome='expired', closed_at=?1
-                     WHERE capsule_id=?2 AND attempt_id=?3",
-                    params![now_str, req.capsule_id, aid],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, 'system', 'attempt_expired',
-                             json_object('prior_lease_expires_at', ?4))",
-                    params![now_str, req.capsule_id, aid, format_iso8601(lease.expires_at)?],
-                )?;
-                tx.execute(
-                    "UPDATE capsule SET status='planned', active_attempt=NULL, updated_at=?1
-                     WHERE id=?2",
-                    params![now_str, req.capsule_id],
-                )?;
-            }
-            Status::Landed | Status::Abandoned => {
-                return Err(StoreError::NotClaimable(
-                    req.capsule_id.clone(),
-                    status_to_str(status),
-                ));
-            }
+        if status != Status::Planned {
+            return Err(StoreError::NotClaimable(
+                req.capsule_id.clone(),
+                status_to_str(status),
+            ));
         }
 
         // §7.1.1 step 3: deps must be landed.
@@ -326,6 +345,7 @@ impl Store {
             session_id: req.session_id.clone(),
             acquired_at: now,
             expires_at: expires,
+            ttl_sec: req.lease_ttl_sec,
         };
         let lease_json = json::to_string(&lease)?;
 
@@ -464,13 +484,13 @@ impl Store {
         })
     }
 
-    /// Heartbeat: refresh lease.expires_at = now + lease_ttl. See DESIGN.md §3.3.
+    /// Heartbeat: refresh `lease.expires_at = now + lease.ttl_sec`. See DESIGN.md §3.3.
+    /// TTL is fixed at claim time; heartbeat does not let the worker change it.
     pub fn heartbeat(&mut self, req: HeartbeatRequest) -> Result<HeartbeatAck> {
         use capsule_core::Lease;
 
         let now = OffsetDateTime::now_utc();
         let now_str = format_iso8601(now)?;
-        let new_expires = now + time::Duration::seconds(req.lease_ttl_sec as i64);
 
         let tx = self.conn.transaction()?;
 
@@ -513,11 +533,13 @@ impl Store {
             return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
         }
 
+        let new_expires = now + time::Duration::seconds(lease.ttl_sec as i64);
         let new_lease = Lease {
             owner: lease.owner,
             session_id: lease.session_id,
             acquired_at: lease.acquired_at,
             expires_at: new_expires,
+            ttl_sec: lease.ttl_sec,
         };
         let new_lease_json = json::to_string(&new_lease)?;
 
@@ -585,6 +607,13 @@ pub struct NewCapsule {
 #[derive(Debug, Clone, Default)]
 pub struct ListFilter {
     pub status: Option<Status>,
+    /// `planned` capsules whose deps are all `landed` and whose scope does not
+    /// overlap any in-flight (`active`/`accepted`) capsule. See DESIGN.md §7.1.1
+    /// — the same predicate `claim` would evaluate.
+    pub available: bool,
+    /// Restrict to capsules whose scope_prefixes overlap this path
+    /// (path-component-wise, see `CanonicalPath::overlaps`).
+    pub scope_overlaps: Option<CanonicalPath>,
 }
 
 #[derive(Debug, Clone)]
@@ -600,7 +629,6 @@ pub struct ClaimRequest {
 pub struct HeartbeatRequest {
     pub capsule_id: CapsuleId,
     pub session_id: String,
-    pub lease_ttl_sec: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -624,6 +652,75 @@ pub struct AttestRequest {
 pub struct AttestAck {
     pub accepted: bool,
     pub new_status: Status,
+}
+
+/// Sweep expired leases (DESIGN.md §3.3, §7.2). Run inside any tx that may
+/// observe stale `active`/`accepted` capsules. Skips capsules whose
+/// `pending_land_json` is non-null (those are §7.2 reclaim-frozen).
+///
+/// For every matching attempt: marks `outcome=expired`, sets `closed_at=now`,
+/// clears `verification_json`, sets capsule `status=planned`, clears
+/// `active_attempt`, and emits an `attempt_expired` event.
+fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) -> Result<()> {
+    use capsule_core::Lease;
+
+    let now_str = format_iso8601(now)?;
+
+    let mut stmt = tx.prepare(
+        "SELECT c.id, c.active_attempt, a.lease_json
+         FROM capsule c
+         JOIN attempt a
+           ON a.capsule_id = c.id AND a.attempt_id = c.active_attempt
+         WHERE c.status IN ('active','accepted')
+           AND c.active_attempt IS NOT NULL
+           AND c.pending_land_json IS NULL",
+    )?;
+    let candidates: Vec<(String, i64, String)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (capsule_id, attempt_id, lease_json) in candidates {
+        let lease: Lease = json::from_str(&lease_json)?;
+        if now <= lease.expires_at {
+            continue;
+        }
+
+        tx.execute(
+            "UPDATE attempt SET outcome='expired', closed_at=?1
+             WHERE capsule_id=?2 AND attempt_id=?3",
+            params![now_str, capsule_id, attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE capsule
+                SET status='planned',
+                    active_attempt=NULL,
+                    verification_json=NULL,
+                    updated_at=?1
+              WHERE id=?2",
+            params![now_str, capsule_id],
+        )?;
+        tx.execute(
+            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+             VALUES (?1, ?2, ?3, 'system', 'attempt_expired',
+                     json_object('lease_expires_at', ?4, 'session_id', ?5))",
+            params![
+                now_str,
+                capsule_id,
+                attempt_id,
+                format_iso8601(lease.expires_at)?,
+                lease.session_id,
+            ],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn exit_codes_match(
@@ -881,11 +978,13 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let a1 = s.claim(claim_req("x", "sess1")).unwrap();
+        // Brief sleep so the heartbeat-derived expires is strictly later than
+        // the claim-derived one (both are now + ttl, ttl is fixed at claim).
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let ack = s
             .heartbeat(HeartbeatRequest {
                 capsule_id: "x".into(),
                 session_id: "sess1".into(),
-                lease_ttl_sec: 600,
             })
             .unwrap();
         assert!(ack.lease_expires_at > a1.lease.expires_at);
@@ -962,10 +1061,153 @@ mod tests {
             .heartbeat(HeartbeatRequest {
                 capsule_id: "x".into(),
                 session_id: "wrong".into(),
-                lease_ttl_sec: 300,
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::CrossSession));
+    }
+
+    fn claim_req_with_ttl(id: &str, sess: &str, ttl_sec: u64) -> ClaimRequest {
+        ClaimRequest {
+            capsule_id: id.into(),
+            owner: "o".into(),
+            session_id: sess.into(),
+            lease_ttl_sec: ttl_sec,
+            base_sha: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn lease_expiry_reverts_to_planned_and_clears_verification() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        // Attest while the lease is still alive — populates verification_json.
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: "abc".into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        // Sleep past TTL so the next read-path sweep expires this attempt.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        // Any read path that runs reclaim sweeps the expiry.
+        let listed = s.list_capsules(ListFilter::default()).unwrap();
+        let c = listed.iter().find(|c| c.id == "x").unwrap();
+        assert_eq!(c.status, Status::Planned);
+        assert!(c.active_attempt.is_none());
+        assert!(c.verification.is_none());
+        // Attempt itself is closed with outcome=expired.
+        assert_eq!(c.attempts.len(), 1);
+        assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Expired);
+    }
+
+    #[test]
+    fn reclaim_does_not_touch_unrelated_capsules() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        make_capsule(&mut s, "y", "src/web");
+        s.claim(claim_req_with_ttl("x", "sess1", 0)).unwrap();
+        s.claim(claim_req_with_ttl("y", "sess2", 3600)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let listed = s.list_capsules(ListFilter::default()).unwrap();
+        let x = listed.iter().find(|c| c.id == "x").unwrap();
+        let y = listed.iter().find(|c| c.id == "y").unwrap();
+        assert_eq!(x.status, Status::Planned);
+        assert_eq!(y.status, Status::Active);
+        assert_eq!(y.active_attempt, Some(1));
+    }
+
+    #[test]
+    fn list_filter_available() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "claimed", "src/a");
+        make_capsule(&mut s, "free", "src/b");
+        make_capsule(&mut s, "conflict", "src/a/sub");
+        s.claim(claim_req("claimed", "sess1")).unwrap();
+
+        let avail = s
+            .list_capsules(ListFilter {
+                available: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
+        // `claimed` is active → excluded; `conflict` overlaps `claimed` → excluded.
+        assert_eq!(ids, vec!["free"]);
+    }
+
+    #[test]
+    fn list_filter_available_excludes_unmet_deps() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "dep", "src/dep");
+        s.create_capsule(NewCapsule {
+            id: "child".into(),
+            title: "t".into(),
+            description: "d".into(),
+            acceptance: Acceptance {
+                run: "true".into(),
+                expect_exit: capsule_core::ExpectExit::Code(0),
+                cwd: None,
+                timeout_sec: None,
+            },
+            scope_prefixes: vec![CanonicalPath::new("src/child").unwrap()],
+            base_ref: "main".into(),
+            depends_on: vec!["dep".into()],
+        })
+        .unwrap();
+
+        let avail = s
+            .list_capsules(ListFilter {
+                available: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
+        // `dep` is planned with no deps → eligible. `child` deps unmet → excluded.
+        assert_eq!(ids, vec!["dep"]);
+    }
+
+    #[test]
+    fn list_filter_scope_overlaps() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "api", "src/api");
+        make_capsule(&mut s, "web", "src/web");
+        let res = s
+            .list_capsules(ListFilter {
+                scope_overlaps: Some(CanonicalPath::new("src/api/users.ts").unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["api"]);
+    }
+
+    #[test]
+    fn create_rejects_invalid_id() {
+        let mut s = tmp_store();
+        let err = s
+            .create_capsule(NewCapsule {
+                id: "bad/id".into(),
+                title: "t".into(),
+                description: "d".into(),
+                acceptance: Acceptance {
+                    run: "true".into(),
+                    expect_exit: capsule_core::ExpectExit::Code(0),
+                    cwd: None,
+                    timeout_sec: None,
+                },
+                scope_prefixes: vec![CanonicalPath::new("a").unwrap()],
+                base_ref: "main".into(),
+                depends_on: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidId(_, _)));
     }
 
     #[test]

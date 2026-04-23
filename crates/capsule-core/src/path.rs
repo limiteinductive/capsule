@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -21,13 +22,9 @@ pub enum CanonicalizeError {
 }
 
 impl CanonicalPath {
-    /// Canonicalize a repo-relative path:
-    /// - reject empty / absolute / contains `..`
-    /// - normalize separators to `/`
-    /// - drop empty components and `.` components
-    /// - strip trailing `/`
-    /// - NFC normalization is applied per spec; here we accept input as-is
-    ///   (assume callers feed UTF-8 NFC). Re-normalization can be added later.
+    /// Canonicalize a repo-relative path: reject empty/absolute/`..`, normalize
+    /// separators to `/`, drop empty and `.` components, strip trailing `/`,
+    /// apply Unicode NFC to each component (DESIGN.md §7.0).
     pub fn new(input: &str) -> Result<Self, CanonicalizeError> {
         if input.is_empty() {
             return Err(CanonicalizeError::Empty);
@@ -35,11 +32,12 @@ impl CanonicalPath {
         if input.starts_with('/') {
             return Err(CanonicalizeError::Absolute);
         }
-        let parts: Vec<&str> = input
+        let parts: Vec<String> = input
             .split(|c| c == '/' || c == '\\')
             .filter(|p| !p.is_empty() && *p != ".")
+            .map(|p| p.nfc().collect::<String>())
             .collect();
-        if parts.iter().any(|p| *p == "..") {
+        if parts.iter().any(|p| p == "..") {
             return Err(CanonicalizeError::DotDot);
         }
         if parts.is_empty() {
@@ -111,5 +109,16 @@ mod tests {
     #[test]
     fn case_sensitive() {
         assert!(!cp("src/Foo").overlaps(&cp("src/foo")));
+    }
+
+    #[test]
+    fn nfc_normalizes_decomposed_to_composed() {
+        // 'é' as decomposed (e + combining acute) vs precomposed.
+        let decomposed = "src/cafe\u{0301}";
+        let composed = "src/caf\u{00e9}";
+        let a = CanonicalPath::new(decomposed).unwrap();
+        let b = CanonicalPath::new(composed).unwrap();
+        assert_eq!(a.as_str(), b.as_str());
+        assert!(a.overlaps(&b));
     }
 }
