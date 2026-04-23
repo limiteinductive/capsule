@@ -45,6 +45,12 @@ pub enum StoreError {
     Git(#[from] capsule_git::GitError),
     #[error("land push other failure: {0}")]
     LandOtherFailure(String),
+    #[error("capsule {0} is terminal: {1}")]
+    Terminal(CapsuleId, &'static str),
+    #[error("dependency cycle: adding {0} -> {1} would create a cycle")]
+    DependencyCycle(CapsuleId, CapsuleId),
+    #[error("dependency target {0} does not exist")]
+    DepNotFound(CapsuleId),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -796,6 +802,218 @@ impl Store {
         Ok(LandAck { outcome })
     }
 
+    /// Voluntarily release a capsule. Single DB tx. Refused if pending_land
+    /// is set (operator must use force-unfreeze first). See DESIGN.md §6.
+    pub fn abandon(&mut self, req: AbandonRequest) -> Result<()> {
+        use capsule_core::Lease;
+
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+        let tx = self.conn.transaction()?;
+
+        let (status_str, active_attempt, pending): (String, Option<i64>, Option<String>) = tx
+            .query_row(
+                "SELECT status, active_attempt, pending_land_json FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+
+        if pending.is_some() {
+            return Err(StoreError::PendingLandFrozen);
+        }
+        let status = parse_status(&status_str);
+        if matches!(status, Status::Landed | Status::Abandoned) {
+            return Err(StoreError::Terminal(
+                req.capsule_id.clone(),
+                status_to_str(status),
+            ));
+        }
+
+        // If a lease is held, the abandoning session must own it.
+        if let Some(aid) = active_attempt {
+            let lease_json: String = tx.query_row(
+                "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params![req.capsule_id, aid],
+                |r| r.get(0),
+            )?;
+            let lease: Lease = json::from_str(&lease_json)?;
+            if lease.session_id != req.session_id {
+                return Err(StoreError::CrossSession);
+            }
+            tx.execute(
+                "UPDATE attempt SET outcome='abandoned', closed_at=?1
+                  WHERE capsule_id=?2 AND attempt_id=?3",
+                params![now_str, req.capsule_id, aid],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE capsule
+                SET status='abandoned',
+                    active_attempt=NULL,
+                    updated_at=?1
+              WHERE id=?2",
+            params![now_str, req.capsule_id],
+        )?;
+        tx.execute(
+            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+             VALUES (?1, ?2, ?3, ?4, 'capsule_abandoned',
+                     json_object('reason', ?5))",
+            params![now_str, req.capsule_id, active_attempt, req.session_id, req.reason],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Manual reclaim — rarely needed since list/claim/heartbeat already
+    /// run an eager sweep (DESIGN.md §6).
+    /// Returns `true` if a lease was reclaimed; `false` for no-op.
+    pub fn reclaim(&mut self, capsule_id: &str) -> Result<bool> {
+        let now = OffsetDateTime::now_utc();
+
+        let pending: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pending_land_json FROM capsule WHERE id = ?1",
+                params![capsule_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(capsule_id.into()))?;
+        if pending.is_some() {
+            return Err(StoreError::PendingLandFrozen);
+        }
+
+        let before_status: String = self.conn.query_row(
+            "SELECT status FROM capsule WHERE id = ?1",
+            params![capsule_id],
+            |r| r.get(0),
+        )?;
+        let tx = self.conn.transaction()?;
+        reclaim_expired_in_tx(&tx, now)?;
+        let after_status: String = tx.query_row(
+            "SELECT status FROM capsule WHERE id = ?1",
+            params![capsule_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(before_status != after_status)
+    }
+
+    /// Add a dependency edge `capsule_id → depends_on`. DB-atomic with cycle
+    /// check (DESIGN.md §7.1.3). No-op on terminal capsules. Idempotent if
+    /// the edge already exists.
+    pub fn add_dep(&mut self, req: DepRequest) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+        let tx = self.conn.transaction()?;
+
+        let (status_str, deps_json): (String, String) = tx
+            .query_row(
+                "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+
+        let status = parse_status(&status_str);
+        if matches!(status, Status::Landed | Status::Abandoned) {
+            return Ok(()); // §7.1.3 explicit no-op on terminal
+        }
+
+        let target_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM capsule WHERE id = ?1",
+                params![req.depends_on],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !target_exists {
+            return Err(StoreError::DepNotFound(req.depends_on.clone()));
+        }
+
+        let mut deps: Vec<String> = json::from_str(&deps_json)?;
+        if deps.contains(&req.depends_on) {
+            return Ok(());
+        }
+        if req.depends_on == req.capsule_id {
+            return Err(StoreError::DependencyCycle(
+                req.capsule_id.clone(),
+                req.depends_on,
+            ));
+        }
+        // Cycle check: BFS from `depends_on` over depends_on edges; if we
+        // reach `capsule_id`, adding the edge would close a cycle.
+        if reachable(&tx, &req.depends_on, &req.capsule_id)? {
+            return Err(StoreError::DependencyCycle(
+                req.capsule_id.clone(),
+                req.depends_on,
+            ));
+        }
+        deps.push(req.depends_on.clone());
+        let new_json = json::to_string(&deps)?;
+
+        tx.execute(
+            "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
+            params![new_json, now_str, req.capsule_id],
+        )?;
+        tx.execute(
+            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+             VALUES (?1, ?2, NULL, 'system', 'dep_added',
+                     json_object('depends_on', ?3))",
+            params![now_str, req.capsule_id, req.depends_on],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove a dependency edge. DB-atomic. No-op on terminal capsules or if
+    /// the edge does not exist (DESIGN.md §7.1.3).
+    pub fn remove_dep(&mut self, req: DepRequest) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+        let tx = self.conn.transaction()?;
+
+        let (status_str, deps_json): (String, String) = tx
+            .query_row(
+                "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+
+        let status = parse_status(&status_str);
+        if matches!(status, Status::Landed | Status::Abandoned) {
+            return Ok(());
+        }
+
+        let mut deps: Vec<String> = json::from_str(&deps_json)?;
+        let before = deps.len();
+        deps.retain(|d| d != &req.depends_on);
+        if deps.len() == before {
+            return Ok(());
+        }
+        let new_json = json::to_string(&deps)?;
+
+        tx.execute(
+            "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
+            params![new_json, now_str, req.capsule_id],
+        )?;
+        tx.execute(
+            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+             VALUES (?1, ?2, NULL, 'system', 'dep_removed',
+                     json_object('depends_on', ?3))",
+            params![now_str, req.capsule_id, req.depends_on],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
         let row: RowCapsule = self
             .conn
@@ -922,6 +1140,19 @@ pub struct LandAck {
     pub outcome: LandOutcome,
 }
 
+#[derive(Debug, Clone)]
+pub struct AbandonRequest {
+    pub capsule_id: CapsuleId,
+    pub session_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DepRequest {
+    pub capsule_id: CapsuleId,
+    pub depends_on: CapsuleId,
+}
+
 /// Sweep expired leases (DESIGN.md §3.3, §7.2). Run inside any tx that may
 /// observe stale `active`/`accepted` capsules. Skips capsules whose
 /// `pending_land_json` is non-null (those are §7.2 reclaim-frozen).
@@ -989,6 +1220,40 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
     }
 
     Ok(())
+}
+
+/// BFS over the `depends_on` graph from `from` looking for `target`.
+/// Used by `add_dep` for cycle rejection (DESIGN.md §7.1.3).
+fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
+    use std::collections::{HashSet, VecDeque};
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut q: VecDeque<String> = VecDeque::new();
+    q.push_back(from.to_string());
+    while let Some(node) = q.pop_front() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if node == target {
+            return Ok(true);
+        }
+        let deps_json: Option<String> = tx
+            .query_row(
+                "SELECT depends_on_json FROM capsule WHERE id = ?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(deps_json) = deps_json else {
+            continue;
+        };
+        let deps: Vec<String> = json::from_str(&deps_json)?;
+        for d in deps {
+            if !seen.contains(&d) {
+                q.push_back(d);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn exit_codes_match(
@@ -1498,6 +1763,219 @@ mod tests {
         s.create_capsule(nc.clone()).unwrap();
         let err = s.create_capsule(nc).unwrap_err();
         assert!(matches!(err, StoreError::DuplicateId(_)));
+    }
+
+    // ---- abandon / reclaim / dep tests ----
+
+    #[test]
+    fn abandon_releases_mutex_and_marks_terminal() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "user request".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Abandoned);
+        assert!(c.active_attempt.is_none());
+        assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Abandoned);
+
+        // Overlapping capsule can now claim.
+        make_capsule(&mut s, "y", "src/api/users.ts");
+        s.claim(claim_req("y", "sess2")).unwrap();
+    }
+
+    #[test]
+    fn abandon_cross_session_rejected() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let err = s
+            .abandon(AbandonRequest {
+                capsule_id: "x".into(),
+                session_id: "wrong".into(),
+                reason: "r".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::CrossSession));
+    }
+
+    #[test]
+    fn abandon_already_terminal_rejected() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "r".into(),
+        })
+        .unwrap();
+        let err = s
+            .abandon(AbandonRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                reason: "r".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Terminal(_, "abandoned")));
+    }
+
+    #[test]
+    fn reclaim_noop_when_lease_live() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let reclaimed = s.reclaim("x").unwrap();
+        assert!(!reclaimed);
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Active);
+    }
+
+    #[test]
+    fn reclaim_reclaims_when_lease_expired() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let reclaimed = s.reclaim("x").unwrap();
+        assert!(reclaimed);
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Planned);
+    }
+
+    #[test]
+    fn add_dep_records_edge() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("a").unwrap();
+        assert_eq!(c.depends_on, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn add_dep_idempotent() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("a").unwrap();
+        assert_eq!(c.depends_on, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn add_dep_self_loop_rejected() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        let err = s
+            .add_dep(DepRequest {
+                capsule_id: "a".into(),
+                depends_on: "a".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DependencyCycle(_, _)));
+    }
+
+    #[test]
+    fn add_dep_cycle_rejected() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        make_capsule(&mut s, "c", "src/c");
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        s.add_dep(DepRequest {
+            capsule_id: "b".into(),
+            depends_on: "c".into(),
+        })
+        .unwrap();
+        // a → b → c, now try c → a (would close cycle).
+        let err = s
+            .add_dep(DepRequest {
+                capsule_id: "c".into(),
+                depends_on: "a".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DependencyCycle(_, _)));
+    }
+
+    #[test]
+    fn add_dep_target_not_found() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        let err = s
+            .add_dep(DepRequest {
+                capsule_id: "a".into(),
+                depends_on: "ghost".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DepNotFound(_)));
+    }
+
+    #[test]
+    fn remove_dep_removes_edge() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        s.remove_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("a").unwrap();
+        assert!(c.depends_on.is_empty());
+    }
+
+    #[test]
+    fn dep_ops_noop_on_terminal_capsules() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.claim(claim_req("a", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "a".into(),
+            session_id: "sess1".into(),
+            reason: "r".into(),
+        })
+        .unwrap();
+        // Both are no-ops on abandoned capsule.
+        s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        s.remove_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "b".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("a").unwrap();
+        assert!(c.depends_on.is_empty());
     }
 
     // ---- land() integration tests against a real local bare repo. ----

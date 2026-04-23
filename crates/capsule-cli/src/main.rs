@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, ExpectExit, Status};
 use capsule_store::{
-    AttestRequest, ClaimRequest, HeartbeatRequest, LandRequest, ListFilter, NewCapsule, Store,
+    AbandonRequest, AttestRequest, ClaimRequest, DepRequest, HeartbeatRequest, LandRequest,
+    ListFilter, NewCapsule, Store,
 };
 use clap::{Parser, Subcommand};
 
@@ -39,14 +40,14 @@ enum Cmd {
     Attest(AttestArgs),
     /// Land an accepted capsule via atomic multi-ref push.
     Land(LandArgs),
-    /// Abandon a capsule. [unimplemented]
-    Abandon,
-    /// Reclaim an expired capsule (manual). [unimplemented]
-    Reclaim,
-    /// Add a dependency edge. [unimplemented]
-    AddDep,
-    /// Remove a dependency edge. [unimplemented]
-    RemoveDep,
+    /// Abandon a capsule.
+    Abandon(AbandonArgs),
+    /// Reclaim an expired capsule (manual).
+    Reclaim(ReclaimArgs),
+    /// Add a dependency edge.
+    AddDep(DepArgs),
+    /// Remove a dependency edge.
+    RemoveDep(DepArgs),
     /// List capsules.
     List(ListArgs),
     /// Operator escape hatch: force-clear a stuck pending_land. [unimplemented]
@@ -137,6 +138,27 @@ struct LandArgs {
     /// `verified_sha` in its object database. Defaults to cwd.
     #[arg(long = "repo-dir")]
     repo_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct AbandonArgs {
+    capsule_id: String,
+    #[arg(long)]
+    session: String,
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(clap::Args)]
+struct ReclaimArgs {
+    capsule_id: String,
+}
+
+#[derive(clap::Args)]
+struct DepArgs {
+    capsule_id: String,
+    #[arg(long = "depends-on")]
+    depends_on: String,
 }
 
 #[derive(clap::Args)]
@@ -352,12 +374,55 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::DeployVerify
-        | Cmd::Abandon
-        | Cmd::Reclaim
-        | Cmd::AddDep
-        | Cmd::RemoveDep
-        | Cmd::ForceUnfreeze => {
+        Cmd::Abandon(args) => {
+            let mut store = open_store(&dir)?;
+            store.abandon(AbandonRequest {
+                capsule_id: args.capsule_id,
+                session_id: args.session,
+                reason: args.reason,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::json!({"ok": true}));
+            } else {
+                println!("abandoned");
+            }
+        }
+        Cmd::Reclaim(args) => {
+            let mut store = open_store(&dir)?;
+            let reclaimed = store.reclaim(&args.capsule_id)?;
+            if cli.json {
+                println!("{}", serde_json::json!({"reclaimed": reclaimed}));
+            } else if reclaimed {
+                println!("reclaimed");
+            } else {
+                println!("no-op");
+            }
+        }
+        Cmd::AddDep(args) => {
+            let mut store = open_store(&dir)?;
+            store.add_dep(DepRequest {
+                capsule_id: args.capsule_id,
+                depends_on: args.depends_on,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::json!({"ok": true}));
+            } else {
+                println!("dep-added");
+            }
+        }
+        Cmd::RemoveDep(args) => {
+            let mut store = open_store(&dir)?;
+            store.remove_dep(DepRequest {
+                capsule_id: args.capsule_id,
+                depends_on: args.depends_on,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::json!({"ok": true}));
+            } else {
+                println!("dep-removed");
+            }
+        }
+        Cmd::DeployVerify | Cmd::ForceUnfreeze => {
             anyhow::bail!("not yet implemented")
         }
     }
