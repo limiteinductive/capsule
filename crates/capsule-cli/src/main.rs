@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
@@ -8,6 +8,8 @@ use capsule_store::{
     HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
 };
 use clap::{Parser, Subcommand};
+
+mod init;
 
 #[derive(Parser)]
 #[command(name = "capsule", version, about = "Path-prefix lock + verified atomic land for parallel agents.")]
@@ -27,7 +29,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Initialize a capsule store at `<dir>/state.db`.
-    Init,
+    Init(InitArgs),
     /// Run the deployment ACL test suite (DESIGN.md §8.2). [unimplemented]
     DeployVerify,
     /// Create a new capsule.
@@ -54,6 +56,13 @@ enum Cmd {
     Reconcile(ReconcileArgs),
     /// Operator escape hatch: force-clear a stuck pending_land.
     ForceUnfreeze(ForceUnfreezeArgs),
+}
+
+#[derive(clap::Args)]
+struct InitArgs {
+    /// Don't touch `.gitignore`. Default: append a rule so `state.db` isn't committed.
+    #[arg(long = "no-gitignore")]
+    no_gitignore: bool,
 }
 
 #[derive(clap::Args)]
@@ -211,7 +220,7 @@ fn store_dir(arg: Option<PathBuf>) -> PathBuf {
     arg.unwrap_or_else(|| PathBuf::from(".capsule"))
 }
 
-fn open_store(dir: &PathBuf) -> Result<Store> {
+fn open_store(dir: &Path) -> Result<Store> {
     let db = dir.join("state.db");
     Store::open(&db).with_context(|| format!("opening store at {}", db.display()))
 }
@@ -228,12 +237,29 @@ fn main() -> Result<()> {
     let dir = store_dir(cli.dir);
 
     match cli.cmd {
-        Cmd::Init => {
-            let _ = open_store(&dir)?;
+        Cmd::Init(args) => {
+            let report = init::run(init::InitOpts {
+                dir: dir.clone(),
+                no_gitignore: args.no_gitignore,
+            })?;
             if cli.json {
-                println!("{}", serde_json::json!({"ok": true, "dir": dir}));
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("initialized capsule store at {}", dir.display());
+                println!("initialized capsule store at {}", report.dir.display());
+                if let Some(p) = &report.gitignore_updated {
+                    println!("gitignore: appended rule to {}", p.display());
+                } else if let Some(reason) = &report.gitignore_skipped {
+                    println!("gitignore: skipped ({reason})");
+                }
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                if !report.next_steps.is_empty() {
+                    println!("next:");
+                    for s in &report.next_steps {
+                        println!("  - {s}");
+                    }
+                }
             }
         }
         Cmd::Create(args) => {
