@@ -72,7 +72,9 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY); COMMIT;")?;
+    conn.execute_batch(
+        "BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY); COMMIT;",
+    )?;
 
     let current: i64 = conn
         .query_row(
@@ -89,10 +91,7 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
         }
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
-        tx.execute(
-            "INSERT INTO schema_version(version) VALUES (?1)",
-            [v],
-        )?;
+        tx.execute("INSERT INTO schema_version(version) VALUES (?1)", [v])?;
         tx.commit()?;
     }
 

@@ -29,6 +29,8 @@ pub enum StoreError {
     InvalidId(CapsuleId, String),
     #[error("capsule {0} not claimable: status={1}")]
     NotClaimable(CapsuleId, &'static str),
+    #[error("capsule {0} not amendable: status={1} (only planned capsules may be amended)")]
+    NotAmendable(CapsuleId, &'static str),
     #[error("capsule {0} has unmet deps: {1:?}")]
     UnmetDeps(CapsuleId, Vec<CapsuleId>),
     #[error("capsule {0} scope overlaps in-flight capsule {1}")]
@@ -154,6 +156,94 @@ impl Store {
         Ok(capsule)
     }
 
+    /// Amend a `Planned` capsule. Rejects any other status with
+    /// `StoreError::NotAmendable` — once `claim` has occurred the acceptance
+    /// contract is bound to any future `verified_sha` (DESIGN.md §5/§6), so
+    /// only pre-claim mutation is safe. `None` fields are unchanged.
+    pub fn amend(&mut self, req: AmendRequest) -> Result<Capsule> {
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_iso8601(now)?;
+        let tx = self.conn.transaction()?;
+
+        let status_str: String = tx
+            .query_row(
+                "SELECT status FROM capsule WHERE id = ?1",
+                params![req.capsule_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        let status = parse_status(&status_str);
+        if status != Status::Planned {
+            return Err(StoreError::NotAmendable(
+                req.capsule_id.clone(),
+                status_to_str(status),
+            ));
+        }
+
+        let mut sets: Vec<String> = Vec::new();
+        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+        let mut diff = json::Map::new();
+
+        if let Some(title) = &req.title {
+            sets.push(format!("title = ?{}", vals.len() + 1));
+            vals.push(title.clone().into());
+            diff.insert("title".into(), json::Value::String(title.clone()));
+        }
+        if let Some(desc) = &req.description {
+            sets.push(format!("description = ?{}", vals.len() + 1));
+            vals.push(desc.clone().into());
+            diff.insert("description".into(), json::Value::String(desc.clone()));
+        }
+        if let Some(acc) = &req.acceptance {
+            let s = json::to_string(acc)?;
+            sets.push(format!("acceptance_json = ?{}", vals.len() + 1));
+            vals.push(s.clone().into());
+            diff.insert("acceptance".into(), json::from_str(&s)?);
+        }
+        if let Some(scope) = &req.scope_prefixes {
+            let s = json::to_string(scope)?;
+            sets.push(format!("scope_json = ?{}", vals.len() + 1));
+            vals.push(s.clone().into());
+            diff.insert("scope_prefixes".into(), json::from_str(&s)?);
+        }
+        if let Some(base_ref) = &req.base_ref {
+            sets.push(format!("base_ref = ?{}", vals.len() + 1));
+            vals.push(base_ref.clone().into());
+            diff.insert("base_ref".into(), json::Value::String(base_ref.clone()));
+        }
+
+        if sets.is_empty() {
+            tx.commit()?;
+            return self.get_capsule(&req.capsule_id);
+        }
+
+        sets.push(format!("updated_at = ?{}", vals.len() + 1));
+        vals.push(now_str.clone().into());
+        let where_idx = vals.len() + 1;
+        vals.push(req.capsule_id.clone().into());
+        let sql = format!(
+            "UPDATE capsule SET {} WHERE id = ?{}",
+            sets.join(", "),
+            where_idx
+        );
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        tx.execute(&sql, params_slice.as_slice())?;
+
+        tx.execute(
+            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+             VALUES (?1, ?2, NULL, 'operator', 'capsule_amended', ?3)",
+            params![
+                now_str,
+                req.capsule_id,
+                json::Value::Object(diff).to_string()
+            ],
+        )?;
+        tx.commit()?;
+        self.get_capsule(&req.capsule_id)
+    }
+
     pub fn list_capsules(&mut self, filter: ListFilter) -> Result<Vec<Capsule>> {
         let now = OffsetDateTime::now_utc();
         let tx = self.conn.transaction()?;
@@ -214,9 +304,7 @@ impl Store {
                     "SELECT id, scope_json FROM capsule
                      WHERE status IN ('active','accepted')",
                 )?
-                .query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
                 .map(|(id, j)| Ok::<_, json::Error>((id, json::from_str(&j)?)))
@@ -272,7 +360,11 @@ impl Store {
 
         // Re-read after reclaim.
         let (status_str, _active_attempt, pending, depends_on_json, scope_json): (
-            String, Option<i64>, Option<String>, String, String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
         ) = tx
             .query_row(
                 "SELECT status, active_attempt, pending_land_json, depends_on_json, scope_json
@@ -333,22 +425,18 @@ impl Store {
             for a in &our_scope {
                 for b in &other {
                     if a.overlaps(b) {
-                        return Err(StoreError::ScopeConflict(
-                            req.capsule_id.clone(),
-                            other_id,
-                        ));
+                        return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
                     }
                 }
             }
         }
 
         // §7.1.1 step 5: allocate attempt_id.
-        let next_id: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
-                params![req.capsule_id],
-                |r| r.get(0),
-            )?;
+        let next_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
+            params![req.capsule_id],
+            |r| r.get(0),
+        )?;
 
         let branch = format!("capsules/{}/a{}", req.capsule_id, next_id);
         let witness_branch = format!("capsule-witness/{}/a{}", req.capsule_id, next_id);
@@ -468,7 +556,11 @@ impl Store {
         let verification_json = json::to_string(&verification)?;
 
         let pass = exit_codes_match(&acceptance.expect_exit, &req.exit_code);
-        let new_status = if pass { Status::Accepted } else { Status::Active };
+        let new_status = if pass {
+            Status::Accepted
+        } else {
+            Status::Active
+        };
 
         tx.execute(
             "UPDATE capsule SET verification_json=?1, status=?2, updated_at=?3 WHERE id=?4",
@@ -486,7 +578,13 @@ impl Store {
         tx.execute(
             "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
              VALUES (?1, ?2, ?3, ?4, 'attempt_attested', ?5)",
-            params![now_str, req.capsule_id, aid, req.session_id, verification_json],
+            params![
+                now_str,
+                req.capsule_id,
+                aid,
+                req.session_id,
+                verification_json
+            ],
         )?;
 
         tx.commit()?;
@@ -594,9 +692,10 @@ impl Store {
         // here and step 3, the atomic push will reject as base_ref_moved.
         let (base_ref, witness_branch, verified_sha) = {
             let cap = self.get_capsule(&req.capsule_id)?;
-            let v = cap.verification.as_ref().ok_or_else(|| {
-                StoreError::NotLandable(req.capsule_id.clone())
-            })?;
+            let v = cap
+                .verification
+                .as_ref()
+                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
             let aid = cap
                 .active_attempt
                 .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
@@ -605,7 +704,11 @@ impl Store {
                 .iter()
                 .find(|a| a.id == aid)
                 .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
-            (cap.base_ref.clone(), att.witness_branch.clone(), v.verified_sha.clone())
+            (
+                cap.base_ref.clone(),
+                att.witness_branch.clone(),
+                v.verified_sha.clone(),
+            )
         };
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
@@ -617,7 +720,10 @@ impl Store {
             let tx = self.conn.transaction()?;
 
             let (status_str, active_attempt, pending_land_json, verification_json): (
-                String, Option<i64>, Option<String>, Option<String>,
+                String,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
             ) = tx
                 .query_row(
                     "SELECT status, active_attempt, pending_land_json, verification_json
@@ -638,11 +744,11 @@ impl Store {
                     status_to_str(status),
                 ));
             }
-            let aid = active_attempt
-                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            let aid =
+                active_attempt.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
             attempt_id = aid;
-            let v_json = verification_json
-                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            let v_json =
+                verification_json.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
             let v: Verification = json::from_str(&v_json)?;
             // Re-bind verified_sha from the in-tx read (defense-in-depth: no
             // gap between read and PendingLand write).
@@ -732,7 +838,13 @@ impl Store {
                 tx.execute(
                     "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
                      VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
-                    params![now_str, req.capsule_id, attempt_id, req.lander, landing_json],
+                    params![
+                        now_str,
+                        req.capsule_id,
+                        attempt_id,
+                        req.lander,
+                        landing_json
+                    ],
                 )?;
                 LandOutcome::Landed { landing }
             }
@@ -770,8 +882,12 @@ impl Store {
                                          'witness_branch', ?5,
                                          'verified_sha', ?6))",
                     params![
-                        now_str, req.capsule_id, attempt_id, req.lander,
-                        witness_branch, verified_sha,
+                        now_str,
+                        req.capsule_id,
+                        attempt_id,
+                        req.lander,
+                        witness_branch,
+                        verified_sha,
                     ],
                 )?;
                 LandOutcome::WitnessOidMismatch
@@ -861,7 +977,13 @@ impl Store {
             "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
              VALUES (?1, ?2, ?3, ?4, 'capsule_abandoned',
                      json_object('reason', ?5))",
-            params![now_str, req.capsule_id, active_attempt, req.session_id, req.reason],
+            params![
+                now_str,
+                req.capsule_id,
+                active_attempt,
+                req.session_id,
+                req.reason
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -1129,7 +1251,11 @@ impl Store {
                     "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
                      VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
                     params![
-                        now_str, req.capsule_id, pending.attempt_id as i64, actor, landing_json
+                        now_str,
+                        req.capsule_id,
+                        pending.attempt_id as i64,
+                        actor,
+                        landing_json
                     ],
                 )?;
                 if operator.is_some() {
@@ -1166,8 +1292,13 @@ impl Store {
                                          'found_sha', ?7,
                                          'by', ?4))",
                     params![
-                        now_str, req.capsule_id, pending.attempt_id as i64, actor,
-                        pending.witness_branch, pending.verified_sha, found_sha,
+                        now_str,
+                        req.capsule_id,
+                        pending.attempt_id as i64,
+                        actor,
+                        pending.witness_branch,
+                        pending.verified_sha,
+                        found_sha,
                     ],
                 )?;
                 ReconcileOutcome::Abandoned
@@ -1258,6 +1389,20 @@ pub struct ListFilter {
     /// Restrict to capsules whose scope_prefixes overlap this path
     /// (path-component-wise, see `CanonicalPath::overlaps`).
     pub scope_overlaps: Option<CanonicalPath>,
+}
+
+/// Amend a `Planned` capsule. Fields left as `None` are unchanged. `depends_on`
+/// has its own `add_dep`/`remove_dep` (§7.1.3) and is intentionally not
+/// amendable here. Nothing else binds these fields until `claim`, so
+/// pre-claim mutation is spec-compatible (DESIGN.md §5/§6).
+#[derive(Debug, Clone, Default)]
+pub struct AmendRequest {
+    pub capsule_id: CapsuleId,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub acceptance: Option<Acceptance>,
+    pub scope_prefixes: Option<Vec<CanonicalPath>>,
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1486,10 +1631,7 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
     Ok(false)
 }
 
-fn exit_codes_match(
-    expect: &capsule_core::ExpectExit,
-    got: &capsule_core::ExitCode,
-) -> bool {
+fn exit_codes_match(expect: &capsule_core::ExpectExit, got: &capsule_core::ExitCode) -> bool {
     use capsule_core::{ExitCode, ExpectExit};
     match (expect, got) {
         (ExpectExit::Code(a), ExitCode::Code(b)) => a == b,
@@ -2011,7 +2153,10 @@ mod tests {
         let c = s.get_capsule("x").unwrap();
         assert_eq!(c.status, Status::Abandoned);
         assert!(c.active_attempt.is_none());
-        assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Abandoned);
+        assert_eq!(
+            c.attempts[0].outcome,
+            capsule_core::AttemptOutcome::Abandoned
+        );
 
         // Overlapping capsule can now claim.
         make_capsule(&mut s, "y", "src/api/users.ts");
@@ -2075,6 +2220,122 @@ mod tests {
         assert!(reclaimed);
         let c = s.get_capsule("x").unwrap();
         assert_eq!(c.status, Status::Planned);
+    }
+
+    #[test]
+    fn amend_planned_changes_all_fields() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let new_acc = Acceptance {
+            run: "pnpm test".into(),
+            expect_exit: capsule_core::ExpectExit::Code(0),
+            cwd: Some("webapp".into()),
+            timeout_sec: Some(600),
+        };
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("new title".into()),
+            description: Some("new desc".into()),
+            acceptance: Some(new_acc.clone()),
+            scope_prefixes: Some(vec![CanonicalPath::new("webapp/src").unwrap()]),
+            base_ref: Some("develop".into()),
+        })
+        .unwrap();
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Planned);
+        assert_eq!(c.title, "new title");
+        assert_eq!(c.description, "new desc");
+        assert_eq!(c.acceptance.run, "pnpm test");
+        assert_eq!(c.acceptance.cwd.as_deref(), Some("webapp"));
+        assert_eq!(c.scope_prefixes.len(), 1);
+        assert_eq!(c.scope_prefixes[0].as_str(), "webapp/src");
+        assert_eq!(c.base_ref, "develop");
+    }
+
+    #[test]
+    fn amend_partial_leaves_others_untouched() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let before = s.get_capsule("x").unwrap();
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("only title".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let after = s.get_capsule("x").unwrap();
+        assert_eq!(after.title, "only title");
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.acceptance.run, before.acceptance.run);
+        assert_eq!(after.base_ref, before.base_ref);
+        assert_eq!(after.scope_prefixes, before.scope_prefixes);
+    }
+
+    #[test]
+    fn amend_emits_event() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("t2".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let kind: String = s
+            .conn
+            .query_row(
+                "SELECT kind FROM event WHERE capsule_id = ?1 AND kind = 'capsule_amended'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "capsule_amended");
+    }
+
+    #[test]
+    fn amend_on_active_rejected() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let err = s
+            .amend(AmendRequest {
+                capsule_id: "x".into(),
+                title: Some("nope".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotAmendable(_, "active")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn amend_noop_when_all_none() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let before = s.get_capsule("x").unwrap();
+        let after = s
+            .amend(AmendRequest {
+                capsule_id: "x".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(before.title, after.title);
+        assert_eq!(before.updated_at, after.updated_at);
+    }
+
+    #[test]
+    fn amend_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .amend(AmendRequest {
+                capsule_id: "nope".into(),
+                title: Some("x".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[test]
@@ -2233,7 +2494,12 @@ mod tests {
     /// The `work_dir_path` doubles as the lander's `repo_dir` for `land()`.
     fn setup_bare_with_attempt(
         capsule_id: &str,
-    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, String) {
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let bare = dir.path().join("bare.git");
         std::fs::create_dir(&bare).unwrap();
@@ -2257,7 +2523,14 @@ mod tests {
         let verified_sha = git(&work, &["rev-parse", "HEAD"]);
         let attempt_branch = format!("capsules/{capsule_id}/a1");
         // Push to the per-attempt branch so the bare repo has the object.
-        git(&work, &["push", "origin", &format!("HEAD:refs/heads/{attempt_branch}")]);
+        git(
+            &work,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{attempt_branch}"),
+            ],
+        );
 
         (dir, bare, work, verified_sha)
     }
@@ -2320,10 +2593,7 @@ mod tests {
         // Bare repo should now have main at verified_sha + the witness branch.
         let bare_main = git(&bare, &["rev-parse", "main"]);
         assert_eq!(bare_main, verified_sha);
-        let witness = git(
-            &bare,
-            &["rev-parse", &format!("capsule-witness/{id}/a1")],
-        );
+        let witness = git(&bare, &["rev-parse", &format!("capsule-witness/{id}/a1")]);
         assert_eq!(witness, verified_sha);
 
         // DB: status=landed, landing populated, pending_land cleared, attempt closed.
@@ -2384,6 +2654,7 @@ mod tests {
     /// Simulate a crash between `land`'s git push (step 3) and DB commit
     /// (step 4) by writing PendingLand directly + executing the push out
     /// of band, leaving status=accepted with pending_land set.
+    #[allow(clippy::too_many_arguments)]
     fn simulate_land_crash(
         s: &mut Store,
         id: &str,
@@ -2431,8 +2702,14 @@ mod tests {
         } else if let Some(other_sha) = push_witness_at {
             // Manually create the witness ref at a *different* sha to simulate
             // protection leak / corruption (decision-tree branch 3).
-            git(work, &["push", bare.to_str().unwrap(),
-                       &format!("{other_sha}:refs/heads/{}", pending.witness_branch)]);
+            git(
+                work,
+                &[
+                    "push",
+                    bare.to_str().unwrap(),
+                    &format!("{other_sha}:refs/heads/{}", pending.witness_branch),
+                ],
+            );
         }
     }
 
@@ -2542,7 +2819,14 @@ mod tests {
         git(&work, &["commit", "-m", "noise"]);
         let other_sha = git(&work, &["rev-parse", "HEAD"]);
         simulate_land_crash(
-            &mut s, id, &verified_sha, &prior, &bare, &work, false, Some(&other_sha),
+            &mut s,
+            id,
+            &verified_sha,
+            &prior,
+            &bare,
+            &work,
+            false,
+            Some(&other_sha),
         );
 
         let outcome = s

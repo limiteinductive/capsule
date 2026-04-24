@@ -21,6 +21,7 @@ Do NOT invoke for: solo-dev one-session work in a repo without `.capsule/` (caps
 1. **Pick or create a capsule** before editing.
    ```
    capsule list --available --json
+   capsule status <id>                # full state of a single capsule
    ```
    If a suitable one exists, claim it. Otherwise:
    ```
@@ -32,18 +33,28 @@ Do NOT invoke for: solo-dev one-session work in a repo without `.capsule/` (caps
    ```
    **Scope rule:** narrowest prefix that covers your edits. `src/api/users.ts` not `src/`. Over-broad scope blocks other sessions for no reason.
 
+   **Got the scope or acceptance wrong?** While the capsule is still `planned` (before `claim`), amend in place — don't abandon + recreate:
+   ```
+   capsule amend <id> --acceptance-cmd "cargo test -p mycrate" \
+     --scope crates/mycrate
+   ```
+   Amendable pre-claim: `--title`, `--description`, `--acceptance-cmd` (+ `--acceptance-expect-exit/-cwd/-timeout-sec`), `--scope`, `--base-ref`. Once claimed, amend is refused — abandon and create a fresh capsule.
+
 2. **Claim it.**
    ```
-   SESSION=$(uuidgen)
-   capsule claim <id> --owner claude --session "$SESSION" --base-sha "$(git rev-parse main)"
+   capsule claim <id> --owner claude --session "$(uuidgen)" --base-sha "$(git rev-parse main)"
    ```
+   The `claim` output prints the session id and an `export CAPSULE_SESSION=<sid>` hint — run it once and you can omit `--session` on every later `heartbeat`/`attest`/`land`/`abandon`/`work` call (they all read `CAPSULE_SESSION`).
+
    On `scope_conflict`: see Recovery below. On `unmet_deps`: pick a different task.
 
-3. **Heartbeat while working.** Every `lease_ttl/3` seconds (default: 100s). A background loop:
+3. **Run your acceptance command under `capsule work`** — it spawns the command, inherits stdio, and heartbeats automatically until the command exits:
    ```
-   while ...; do capsule heartbeat <id> --session "$SESSION"; sleep 100; done
+   capsule work <id> -- cargo test -p mycrate
    ```
-   Three missed heartbeats → lease expires → capsule reclaimable. If you anticipate a long pause (waiting on a build), heartbeat first.
+   Exit code is forwarded verbatim. Use this instead of a manual heartbeat loop. Only fall back to `capsule heartbeat <id>` in a `while` loop if the work isn't a single command you can wrap (e.g. long interactive editing where you want the lease alive across many unrelated commands).
+
+   Three missed heartbeats → lease expires → capsule reclaimable.
 
 4. **Push commits to the attempt branch.**
    ```
@@ -53,7 +64,7 @@ Do NOT invoke for: solo-dev one-session work in a repo without `.capsule/` (caps
 
 5. **Attest after acceptance command passes.**
    ```
-   capsule attest <id> --session "$SESSION" \
+   capsule attest <id> \
      --verified-sha "$(git rev-parse HEAD)" \
      --command "<exact command run>" \
      --exit-code 0 \
@@ -64,7 +75,7 @@ Do NOT invoke for: solo-dev one-session work in a repo without `.capsule/` (caps
 
 6. **Land atomically.**
    ```
-   capsule land <id> --session "$SESSION"
+   capsule land <id> --lander claude --remote origin
    ```
    On `base_ref_moved`: rebase attempt branch onto new `main`, push, re-attest, retry land. On `witness_oid_mismatch`: escalate (operational incident — do not retry).
 
