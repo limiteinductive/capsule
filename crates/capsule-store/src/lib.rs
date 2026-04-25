@@ -192,7 +192,7 @@ impl Store {
             &now_str,
             &capsule.id,
             None,
-            "system",
+            actor::SYSTEM,
             EventKind::CapsuleCreated,
             &json::to_value(CreatedPayload {
                 acceptance: &capsule.acceptance,
@@ -300,7 +300,7 @@ impl Store {
             &now_str,
             &capsule_id,
             None,
-            "operator",
+            actor::OPERATOR,
             EventKind::CapsuleAmended,
             &json::Value::Object(diff),
         )?;
@@ -1175,7 +1175,7 @@ impl Store {
         let actor = operator
             .as_ref()
             .map(|(op, _)| op.clone())
-            .unwrap_or_else(|| "reconciler".into());
+            .unwrap_or_else(|| actor::RECONCILER.into());
         // SQLite INTEGER is i64; AttemptId is u64. Hoisted before the CAS
         // check so reconciler_ran on the CasLost path can bind it too.
         let attempt_id_i64 = pending.attempt_id as i64;
@@ -1585,6 +1585,20 @@ fn emit_reconciler_ran(
     )
 }
 
+/// Canonical fixed `event.actor` role values. The actor column
+/// is heterogeneous — it carries variable identifiers too (a worker's
+/// `session_id`, the lander's id, an operator's id, the original `landed_by`
+/// for reconciler-reconstructed events) — so it stays a `&str` parameter to
+/// `insert_event`. These three constants cover every callsite where the
+/// actor is a fixed protocol-role name, so a typo (`"systme"`,
+/// `"reconcillr"`) becomes a compile error rather than a silently-shipped
+/// audit-log discrepancy.
+mod actor {
+    pub const SYSTEM: &str = "system";
+    pub const OPERATOR: &str = "operator";
+    pub const RECONCILER: &str = "reconciler";
+}
+
 /// Wire-string vocabulary for `event.kind` (DESIGN.md §6). Closed enum so the
 /// canonical event kinds live in one place — a typo at a callsite (e.g.
 /// `"pendng_land_committed"`) would silently emit a kind no consumer expects.
@@ -1746,7 +1760,7 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
             &now_str,
             &capsule_id,
             Some(attempt_id),
-            "system",
+            actor::SYSTEM,
             EventKind::AttemptExpired,
             &payload,
         )?;
@@ -2100,7 +2114,7 @@ fn persist_dep_change(
         params![deps_json, now_str, capsule_id],
     )?;
     let payload = json::json!({ "dep_id": dep_id });
-    insert_event(tx, now_str, capsule_id, None, "system", event_kind, &payload)?;
+    insert_event(tx, now_str, capsule_id, None, actor::SYSTEM, event_kind, &payload)?;
     Ok(())
 }
 
