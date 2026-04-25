@@ -27,8 +27,15 @@ pub enum StoreError {
     DuplicateId(CapsuleId),
     #[error("invalid capsule id {0}: {1}")]
     InvalidId(CapsuleId, String),
-    #[error("capsule {0} not claimable: status={1}")]
-    NotClaimable(CapsuleId, &'static str),
+    /// A capsule operation was rejected because the capsule's current status
+    /// does not allow that transition. Struct variant (not tuple) so the two
+    /// `&'static str` fields can't be accidentally swapped at construction.
+    #[error("capsule {capsule_id}: cannot {op} when status={current_status}")]
+    WrongStatus {
+        capsule_id: CapsuleId,
+        op: &'static str,
+        current_status: &'static str,
+    },
     #[error("capsule {0} not amendable: status={1} (only planned capsules may be amended)")]
     NotAmendable(CapsuleId, &'static str),
     #[error("capsule {0} has unmet deps: {1:?}")]
@@ -39,8 +46,8 @@ pub enum StoreError {
     CrossSession,
     #[error("lease expired at {0}")]
     LeaseExpired(String),
-    #[error("capsule has pending_land — reclaim/claim frozen until reconciled")]
-    PendingLandFrozen,
+    #[error("capsule {0} has pending_land — operation refused; reconcile or force-unfreeze first")]
+    PendingLandFrozen(CapsuleId),
     #[error("capsule {0} not landable: missing verification or active_attempt")]
     NotLandable(CapsuleId),
     #[error("git: {0}")]
@@ -53,14 +60,66 @@ pub enum StoreError {
     DependencyCycle(CapsuleId, CapsuleId),
     #[error("dependency target {0} does not exist")]
     DepNotFound(CapsuleId),
+    #[error(
+        "capsule {0} land race: pending_land was finalized by reconcile/force-unfreeze \
+         between push and finalize — call get_capsule to read current state"
+    )]
+    LandRaceLost(CapsuleId),
+    #[error("invalid verified_sha: {0}")]
+    InvalidSha(#[from] capsule_core::sha::ShaError),
+    #[error(
+        "lease_ttl_sec {0} cannot be represented as a valid lease expiration; \
+         choose a smaller TTL (a day is 86400)."
+    )]
+    InvalidLeaseTtl(u64),
+    #[error(
+        "force-unfreeze requires the operator to assert --lander-confirmed-dead \
+         (DESIGN.md §7.1.2 — operator escape hatch demands explicit confirmation)"
+    )]
+    ForceUnfreezeNotConfirmed,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+impl StoreError {
+    /// Build a `WrongStatus` from a `Status` value, snapping its wire form
+    /// once. Used by every state-transition guard (`claim`, `attest`,
+    /// `heartbeat`, `land`) that rejects based on the current status — the
+    /// open-coded struct literal repeated four times let the
+    /// `current.as_wire_str()` call drift out of step with the type's
+    /// definition (forgetting it would compile, since `&'static str` is
+    /// already what the field wants).
+    fn wrong_status(capsule_id: CapsuleId, op: &'static str, current: Status) -> Self {
+        Self::WrongStatus {
+            capsule_id,
+            op,
+            current_status: current.as_wire_str(),
+        }
+    }
+}
+
+/// Map `rusqlite::Error::QueryReturnedNoRows` to `StoreError::NotFound(id)`,
+/// preserving any other rusqlite error via `From`. Centralizes the
+/// `query_row(...).optional()?.ok_or_else(|| NotFound(...))` boilerplate
+/// repeated at every CAS-style read in this file.
+trait NotFoundExt<T> {
+    fn or_not_found(self, capsule_id: &str) -> Result<T>;
+}
+
+impl<T> NotFoundExt<T> for std::result::Result<T, rusqlite::Error> {
+    fn or_not_found(self, capsule_id: &str) -> Result<T> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(StoreError::NotFound(capsule_id.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 pub struct Store {
     conn: Connection,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl Store {
@@ -68,16 +127,16 @@ impl Store {
     /// pending schema migrations on open. Used by both `init` and the
     /// per-command open path.
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        let db_path = db_path.as_ref().to_path_buf();
+        let db_path = db_path.as_ref();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         schema::ensure(&conn)?;
-        Ok(Self { conn, db_path })
+        Ok(Self { conn })
     }
 
     /// Create a new capsule. Caller supplies the id (typically a uuid). All
@@ -85,7 +144,7 @@ impl Store {
     pub fn create_capsule(&mut self, c: NewCapsule) -> Result<Capsule> {
         capsule_core::id::validate(&c.id)
             .map_err(|e| StoreError::InvalidId(c.id.clone(), e.to_string()))?;
-        let now = OffsetDateTime::now_utc();
+        let (now, now_str) = now_pair()?;
         let capsule = Capsule {
             id: c.id.clone(),
             title: c.title,
@@ -106,19 +165,10 @@ impl Store {
 
         let tx = self.conn.transaction()?;
 
-        let exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM capsule WHERE id = ?1",
-                params![capsule.id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if exists {
-            return Err(StoreError::DuplicateId(capsule.id.clone()));
+        if capsule_exists(&tx, &capsule.id)? {
+            return Err(StoreError::DuplicateId(capsule.id));
         }
 
-        let now_str = format_iso8601(now)?;
         tx.execute(
             "INSERT INTO capsule (
                 id, title, description, acceptance_json, scope_json, base_ref,
@@ -137,19 +187,19 @@ impl Store {
             ],
         )?;
 
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, NULL, 'system', 'capsule_created', ?3)",
-            params![
-                now_str,
-                capsule.id,
-                json::to_string(&CreatedPayload {
-                    acceptance: &capsule.acceptance,
-                    scope_prefixes: &capsule.scope_prefixes,
-                    base_ref: &capsule.base_ref,
-                    depends_on: &capsule.depends_on,
-                })?,
-            ],
+        insert_event(
+            &tx,
+            &now_str,
+            &capsule.id,
+            None,
+            "system",
+            "capsule_created",
+            &json::to_value(CreatedPayload {
+                acceptance: &capsule.acceptance,
+                scope_prefixes: &capsule.scope_prefixes,
+                base_ref: &capsule.base_ref,
+                depends_on: &capsule.depends_on,
+            })?,
         )?;
 
         tx.commit()?;
@@ -161,67 +211,81 @@ impl Store {
     /// contract is bound to any future `verified_sha` (DESIGN.md §5/§6), so
     /// only pre-claim mutation is safe. `None` fields are unchanged.
     pub fn amend(&mut self, req: AmendRequest) -> Result<Capsule> {
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        // Destructure the request up front so each Optional field is owned
+        // and can be moved (rather than cloned twice) into its SQL value
+        // and its diff entry below.
+        let AmendRequest {
+            capsule_id,
+            title,
+            description,
+            acceptance,
+            scope_prefixes,
+            base_ref,
+        } = req;
+
+        let (_, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
         let status_str: String = tx
             .query_row(
                 "SELECT status FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
+                params![&capsule_id],
                 |r| r.get(0),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+            .or_not_found(&capsule_id)?;
         let status = parse_status(&status_str);
         if status != Status::Planned {
-            return Err(StoreError::NotAmendable(
-                req.capsule_id.clone(),
-                status_to_str(status),
-            ));
+            return Err(StoreError::NotAmendable(capsule_id, status.as_wire_str()));
         }
 
         let mut sets: Vec<String> = Vec::new();
         let mut vals: Vec<rusqlite::types::Value> = Vec::new();
         let mut diff = json::Map::new();
 
-        if let Some(title) = &req.title {
-            sets.push(format!("title = ?{}", vals.len() + 1));
-            vals.push(title.clone().into());
-            diff.insert("title".into(), json::Value::String(title.clone()));
+        // Placeholder index is always `vals.len() + 1` (one-based, matching
+        // what the just-pushed value will become). Centralized so the six
+        // call sites can't drift on the +1 bookkeeping.
+        let push_col = |sets: &mut Vec<String>,
+                        vals: &mut Vec<rusqlite::types::Value>,
+                        col: &str,
+                        val: rusqlite::types::Value| {
+            sets.push(format!("{col} = ?{}", vals.len() + 1));
+            vals.push(val);
+        };
+
+        if let Some(title) = title {
+            push_col(&mut sets, &mut vals, "title", title.clone().into());
+            diff.insert("title".into(), json::Value::String(title));
         }
-        if let Some(desc) = &req.description {
-            sets.push(format!("description = ?{}", vals.len() + 1));
-            vals.push(desc.clone().into());
-            diff.insert("description".into(), json::Value::String(desc.clone()));
+        if let Some(desc) = description {
+            push_col(&mut sets, &mut vals, "description", desc.clone().into());
+            diff.insert("description".into(), json::Value::String(desc));
         }
-        if let Some(acc) = &req.acceptance {
-            let s = json::to_string(acc)?;
-            sets.push(format!("acceptance_json = ?{}", vals.len() + 1));
-            vals.push(s.clone().into());
-            diff.insert("acceptance".into(), json::from_str(&s)?);
+        if let Some(acc) = acceptance {
+            // Build the diff Value directly from the typed struct via
+            // `to_value` instead of re-parsing the SQL JSON string with
+            // `from_str`. Keep the SQL bytes from `to_string` to avoid
+            // changing the stored representation.
+            push_col(&mut sets, &mut vals, "acceptance_json", json::to_string(&acc)?.into());
+            diff.insert("acceptance".into(), json::to_value(acc)?);
         }
-        if let Some(scope) = &req.scope_prefixes {
-            let s = json::to_string(scope)?;
-            sets.push(format!("scope_json = ?{}", vals.len() + 1));
-            vals.push(s.clone().into());
-            diff.insert("scope_prefixes".into(), json::from_str(&s)?);
+        if let Some(scope) = scope_prefixes {
+            push_col(&mut sets, &mut vals, "scope_json", json::to_string(&scope)?.into());
+            diff.insert("scope_prefixes".into(), json::to_value(scope)?);
         }
-        if let Some(base_ref) = &req.base_ref {
-            sets.push(format!("base_ref = ?{}", vals.len() + 1));
-            vals.push(base_ref.clone().into());
-            diff.insert("base_ref".into(), json::Value::String(base_ref.clone()));
+        if let Some(base_ref) = base_ref {
+            push_col(&mut sets, &mut vals, "base_ref", base_ref.clone().into());
+            diff.insert("base_ref".into(), json::Value::String(base_ref));
         }
 
         if sets.is_empty() {
             tx.commit()?;
-            return self.get_capsule(&req.capsule_id);
+            return self.get_capsule(&capsule_id);
         }
 
-        sets.push(format!("updated_at = ?{}", vals.len() + 1));
-        vals.push(now_str.clone().into());
+        push_col(&mut sets, &mut vals, "updated_at", now_str.clone().into());
         let where_idx = vals.len() + 1;
-        vals.push(req.capsule_id.clone().into());
+        vals.push(capsule_id.clone().into());
         let sql = format!(
             "UPDATE capsule SET {} WHERE id = ?{}",
             sets.join(", "),
@@ -231,17 +295,17 @@ impl Store {
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
         tx.execute(&sql, params_slice.as_slice())?;
 
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, NULL, 'operator', 'capsule_amended', ?3)",
-            params![
-                now_str,
-                req.capsule_id,
-                json::Value::Object(diff).to_string()
-            ],
+        insert_event(
+            &tx,
+            &now_str,
+            &capsule_id,
+            None,
+            "operator",
+            "capsule_amended",
+            &json::Value::Object(diff),
         )?;
         tx.commit()?;
-        self.get_capsule(&req.capsule_id)
+        self.get_capsule(&capsule_id)
     }
 
     pub fn list_capsules(&mut self, filter: ListFilter) -> Result<Vec<Capsule>> {
@@ -249,43 +313,31 @@ impl Store {
         let tx = self.conn.transaction()?;
         reclaim_expired_in_tx(&tx, now)?;
 
-        let mut q = String::from(
-            "SELECT id, title, description, acceptance_json, scope_json, base_ref,
-                    depends_on_json, status, active_attempt, verification_json,
-                    pending_land_json, landing_json, created_at, updated_at
-             FROM capsule",
-        );
-        let mut conds: Vec<String> = vec![];
-        if let Some(s) = filter.status {
-            conds.push(format!("status = '{}'", status_to_str(s)));
-        }
-        if !conds.is_empty() {
-            q.push_str(" WHERE ");
-            q.push_str(&conds.join(" AND "));
-        }
-        q.push_str(" ORDER BY created_at ASC");
+        // SELECT shape varies only by the optional `status` filter; bind the
+        // status as a SQL parameter rather than splicing the wire-string into
+        // the query text. Even though `Status::as_wire_str()` returns one of a
+        // closed set of safe `&'static str` literals (no injection vector), a
+        // parameterized query keeps the SQL discipline uniform with every other
+        // site in this file.
+        let status_wire: Option<&'static str> = filter.status.map(Status::as_wire_str);
+        let q = if status_wire.is_some() {
+            format!(
+                "{} WHERE status = ?1 ORDER BY created_at ASC",
+                RowCapsule::SELECT_BASE
+            )
+        } else {
+            format!("{} ORDER BY created_at ASC", RowCapsule::SELECT_BASE)
+        };
 
         let mut stmt = tx.prepare(&q)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(RowCapsule {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    description: r.get(2)?,
-                    acceptance_json: r.get(3)?,
-                    scope_json: r.get(4)?,
-                    base_ref: r.get(5)?,
-                    depends_on_json: r.get(6)?,
-                    status: r.get(7)?,
-                    active_attempt: r.get(8)?,
-                    verification_json: r.get(9)?,
-                    pending_land_json: r.get(10)?,
-                    landing_json: r.get(11)?,
-                    created_at: r.get(12)?,
-                    updated_at: r.get(13)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = match status_wire {
+            Some(s) => stmt
+                .query_map(params![s], RowCapsule::from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], RowCapsule::from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         drop(stmt);
 
         let mut capsules: Vec<Capsule> = rows
@@ -317,19 +369,10 @@ impl Store {
                 if !c.depends_on.iter().all(|d| landed_ids.contains(d)) {
                     return false;
                 }
-                for (other_id, other_scope) in &in_flight_scopes {
-                    if other_id == &c.id {
-                        continue;
-                    }
-                    for a in &c.scope_prefixes {
-                        for b in other_scope {
-                            if a.overlaps(b) {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
+                !in_flight_scopes.iter().any(|(other_id, other_scope)| {
+                    other_id != &c.id
+                        && CanonicalPath::any_overlap(&c.scope_prefixes, other_scope)
+                })
             });
         }
 
@@ -346,11 +389,15 @@ impl Store {
     pub fn claim(&mut self, req: ClaimRequest) -> Result<capsule_core::Attempt> {
         use capsule_core::{Attempt, AttemptOutcome, Lease};
 
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
-        let lease_ttl = time::Duration::seconds(req.lease_ttl_sec as i64);
-        let expires = now + lease_ttl;
-        let expires_str = format_iso8601(expires)?;
+        // Validate base_sha format up-front. The value flows into
+        // `git worktree add -b <branch> <path> <base_sha>` (capsule-cli's
+        // worktree isolation) and into the LandPush prior-base computation,
+        // so garbage here surfaces as an opaque git failure later. Catch it
+        // at the protocol boundary alongside the verified_sha check in attest.
+        capsule_core::sha::validate(&req.base_sha)?;
+
+        let (now, now_str) = now_pair()?;
+        let expires = checked_lease_expiry(now, req.lease_ttl_sec)?;
 
         let tx = self.conn.transaction()?;
 
@@ -372,40 +419,36 @@ impl Store {
                 params![req.capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+            .or_not_found(&req.capsule_id)?;
 
         if pending.is_some() {
-            return Err(StoreError::PendingLandFrozen);
+            return Err(StoreError::PendingLandFrozen(req.capsule_id));
         }
 
         let status = parse_status(&status_str);
         if status != Status::Planned {
-            return Err(StoreError::NotClaimable(
-                req.capsule_id.clone(),
-                status_to_str(status),
-            ));
+            return Err(StoreError::wrong_status(req.capsule_id, "claim", status));
         }
 
-        // §7.1.1 step 3: deps must be landed.
-        let depends_on: Vec<String> = json::from_str(&depends_on_json)?;
-        if !depends_on.is_empty() {
-            let mut unmet = vec![];
-            for dep in &depends_on {
-                let s: Option<String> = tx
-                    .query_row(
-                        "SELECT status FROM capsule WHERE id = ?1",
-                        params![dep],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if s.as_deref() != Some("landed") {
-                    unmet.push(dep.clone());
-                }
-            }
-            if !unmet.is_empty() {
-                return Err(StoreError::UnmetDeps(req.capsule_id.clone(), unmet));
-            }
+        // §7.1.1 step 3: deps must be landed. One query against the existing
+        // depends_on_json blob via `json_each(?)` — single bind, no SQLite
+        // variable-limit ceiling, and the prior per-dep round-trips collapse.
+        // LEFT JOIN + WHERE c.id IS NULL returns deps that either don't exist
+        // OR aren't landed (same as the old per-row `Option<String>` ⇒ None
+        // branch). Order preserved via `j.key` (json_each emits 0-based array
+        // indices), so `UnmetDeps`'s Vec retains the input order.
+        let mut stmt = tx.prepare(
+            "SELECT j.value FROM json_each(?1) j
+             LEFT JOIN capsule c ON c.id = j.value AND c.status = 'landed'
+             WHERE c.id IS NULL
+             ORDER BY j.key",
+        )?;
+        let unmet: Vec<String> = stmt
+            .query_map(params![depends_on_json], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        if !unmet.is_empty() {
+            return Err(StoreError::UnmetDeps(req.capsule_id, unmet));
         }
 
         // §7.1.1 step 4: scope-overlap check vs other in-flight capsules.
@@ -422,12 +465,8 @@ impl Store {
         drop(stmt);
         for (other_id, other_scope_json) in rows {
             let other: Vec<CanonicalPath> = json::from_str(&other_scope_json)?;
-            for a in &our_scope {
-                for b in &other {
-                    if a.overlaps(b) {
-                        return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
-                    }
-                }
+            if CanonicalPath::any_overlap(&our_scope, &other) {
+                return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
             }
         }
 
@@ -470,19 +509,24 @@ impl Store {
             params![next_id, now_str, req.capsule_id],
         )?;
 
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, ?3, ?4, 'attempt_claimed',
-                     json_object('session_id', ?4, 'base_sha', ?5,
-                                 'lease_expires_at', ?6))",
-            params![
-                now_str,
-                req.capsule_id,
-                next_id,
-                req.session_id,
-                req.base_sha,
-                expires_str,
-            ],
+        // DESIGN.md §6 attempt_claimed payload: {attempt_id, session_id,
+        // base_sha, lease}. `attempt_id` also appears as the event row's
+        // attempt_id column so the audit log can be filtered without
+        // parsing JSON.
+        let claimed_payload = json::json!({
+            "attempt_id": next_id,
+            "session_id": req.session_id,
+            "base_sha": req.base_sha,
+            "lease": lease,
+        });
+        insert_event(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            Some(next_id),
+            &req.session_id,
+            "attempt_claimed",
+            &claimed_payload,
         )?;
 
         tx.commit()?;
@@ -504,10 +548,15 @@ impl Store {
     /// Attest: record verification, transition active → accepted iff exit_code matches.
     /// See DESIGN.md §7.1.0.
     pub fn attest(&mut self, req: AttestRequest) -> Result<AttestAck> {
-        use capsule_core::{Lease, Verification};
+        use capsule_core::Verification;
 
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        // Validate verified_sha format up-front. The DB CHECK constraints
+        // can't express "40 lowercase hex" and the value flows through to
+        // `git push <sha>:refs/heads/...` at land time, where a malformed
+        // sha surfaces as an opaque push failure. Catch it here.
+        capsule_core::sha::validate(&req.verified_sha)?;
+
+        let (now, now_str) = now_pair()?;
 
         let tx = self.conn.transaction()?;
 
@@ -517,30 +566,15 @@ impl Store {
                 params![req.capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+            .or_not_found(&req.capsule_id)?;
 
         let status = parse_status(&status_str);
         if status != Status::Active {
-            return Err(StoreError::NotClaimable(
-                req.capsule_id.clone(),
-                status_to_str(status),
-            ));
+            return Err(StoreError::wrong_status(req.capsule_id, "attest", status));
         }
         let aid = active_attempt.expect("active ⇒ active_attempt set");
 
-        let lease_json: String = tx.query_row(
-            "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-            params![req.capsule_id, aid],
-            |r| r.get(0),
-        )?;
-        let lease: Lease = json::from_str(&lease_json)?;
-        if lease.session_id != req.session_id {
-            return Err(StoreError::CrossSession);
-        }
-        if now > lease.expires_at {
-            return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
-        }
+        load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
         let acceptance: Acceptance = json::from_str(&acceptance_json)?;
         let verification = Verification {
@@ -566,7 +600,7 @@ impl Store {
             "UPDATE capsule SET verification_json=?1, status=?2, updated_at=?3 WHERE id=?4",
             params![
                 verification_json,
-                status_to_str(new_status),
+                new_status.as_wire_str(),
                 now_str,
                 req.capsule_id,
             ],
@@ -575,16 +609,26 @@ impl Store {
             "UPDATE attempt SET tip_sha=?1 WHERE capsule_id=?2 AND attempt_id=?3",
             params![req.verified_sha, req.capsule_id, aid],
         )?;
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, ?3, ?4, 'attempt_attested', ?5)",
-            params![
-                now_str,
-                req.capsule_id,
-                aid,
-                req.session_id,
-                verification_json
-            ],
+        // DESIGN.md §6 attempt_attested payload: {verified_sha, exit_code,
+        // command, log_ref, duration_ms} — the run inputs/outputs. The event
+        // row's at/actor/attempt_id columns carry what DESIGN's Verification
+        // struct §5 calls at/attestor/attempt_id, so they are not duplicated
+        // in the payload.
+        let event_payload = json::json!({
+            "verified_sha": verification.verified_sha,
+            "exit_code": verification.exit_code,
+            "command": verification.command,
+            "log_ref": verification.log_ref,
+            "duration_ms": verification.duration_ms,
+        });
+        insert_event(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            Some(aid),
+            &req.session_id,
+            "attempt_attested",
+            &event_payload,
         )?;
 
         tx.commit()?;
@@ -599,57 +643,51 @@ impl Store {
     pub fn heartbeat(&mut self, req: HeartbeatRequest) -> Result<HeartbeatAck> {
         use capsule_core::Lease;
 
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (now, now_str) = now_pair()?;
 
         let tx = self.conn.transaction()?;
 
-        let (status_str, active_attempt, pending): (String, Option<i64>, Option<String>) = tx
+        // pending_land_json intentionally not read: §7.2 says heartbeats are
+        // not required while pending_land != null, but we don't reject them
+        // either — they're a no-op against an effective lease that won't
+        // expire. So no need to branch on the freeze flag.
+        let (status_str, active_attempt): (String, Option<i64>) = tx
             .query_row(
-                "SELECT status, active_attempt, pending_land_json FROM capsule WHERE id = ?1",
+                "SELECT status, active_attempt FROM capsule WHERE id = ?1",
                 params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+            .or_not_found(&req.capsule_id)?;
 
         // Heartbeat is allowed during active OR accepted (lease retained, §3.3).
+        // Explicit match (not `matches!`) so adding a `Status` variant forces
+        // compile-time review of whether the lease window includes it — same
+        // exhaustive-classification discipline as `Status::is_terminal`.
         let status = parse_status(&status_str);
-        if !matches!(status, Status::Active | Status::Accepted) {
-            return Err(StoreError::NotClaimable(
-                req.capsule_id.clone(),
-                status_to_str(status),
-            ));
+        match status {
+            Status::Active | Status::Accepted => {}
+            Status::Planned | Status::Landed | Status::Abandoned => {
+                return Err(StoreError::wrong_status(
+                    req.capsule_id,
+                    "heartbeat",
+                    status,
+                ));
+            }
         }
-        let aid = active_attempt.ok_or_else(|| {
-            StoreError::NotClaimable(req.capsule_id.clone(), status_to_str(status))
-        })?;
-        // Allowed even with pending_land set — §7.2 says heartbeats not required
-        // while pending_land != null, but we don't reject them either; they're
-        // a no-op against an effective lease that won't expire.
-        let _ = pending;
+        // Mirrors `attest`: status ∈ {active, accepted} ⇒ active_attempt is
+        // Some (DESIGN.md §3.3 invariant). None here ⇒ DB corruption, panic.
+        let aid = active_attempt.expect("active|accepted ⇒ active_attempt set");
 
-        let lease_json: String = tx.query_row(
-            "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-            params![req.capsule_id, aid],
-            |r| r.get(0),
-        )?;
-        let lease: Lease = json::from_str(&lease_json)?;
+        let lease = load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
-        if lease.session_id != req.session_id {
-            return Err(StoreError::CrossSession);
-        }
-        if now > lease.expires_at {
-            return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
-        }
-
-        let new_expires = now + time::Duration::seconds(lease.ttl_sec as i64);
+        // Defense-in-depth: lease_json is not schema-enforced, so a corrupt or
+        // legacy row could carry a TTL outside i64::MAX or whose addition to
+        // `now` overflows OffsetDateTime. Surface the same clean error claim
+        // does instead of wrapping silently or panicking.
+        let new_expires = checked_lease_expiry(now, lease.ttl_sec)?;
         let new_lease = Lease {
-            owner: lease.owner,
-            session_id: lease.session_id,
-            acquired_at: lease.acquired_at,
             expires_at: new_expires,
-            ttl_sec: lease.ttl_sec,
+            ..lease
         };
         let new_lease_json = json::to_string(&new_lease)?;
 
@@ -683,40 +721,34 @@ impl Store {
     /// reconciler to repair (§7.1.2 reconciler decision tree). Until then,
     /// the capsule is reclaim-frozen (§7.2).
     pub fn land(&mut self, req: LandRequest) -> Result<LandAck> {
-        use capsule_core::Lease;
         use capsule_git::{land_push, ls_remote_branch, LandOutcome as GitOutcome};
 
         // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
         // We need this for both the PendingLand record and the eventual
         // Landing.advanced_base_ref computation. If the remote moves between
         // here and step 3, the atomic push will reject as base_ref_moved.
-        let (base_ref, witness_branch, verified_sha) = {
-            let cap = self.get_capsule(&req.capsule_id)?;
-            let v = cap
-                .verification
-                .as_ref()
-                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
-            let aid = cap
-                .active_attempt
-                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
-            let att = cap
-                .attempts
-                .iter()
-                .find(|a| a.id == aid)
-                .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
-            (
+        // Collapse the three "missing landable state" checks into one: any of
+        // missing verification, missing active_attempt, or active_attempt not
+        // in attempts list maps to the same `NotLandable` error. Single
+        // clone of `req.capsule_id` for the error path.
+        let cap = self.get_capsule(&req.capsule_id)?;
+        let landable = cap.active_attempt_record().and_then(|att| {
+            let v = cap.verification.as_ref()?;
+            Some((
                 cap.base_ref.clone(),
                 att.witness_branch.clone(),
                 v.verified_sha.clone(),
-            )
-        };
+            ))
+        });
+        let (base_ref, witness_branch, verified_sha) =
+            landable.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
         // ---- Step 2: write PendingLand under preconditions. ----
         let attempt_id: i64;
+        let pending_json: String;
         let pending = {
-            let now = OffsetDateTime::now_utc();
-            let now_str = format_iso8601(now)?;
+            let (now, now_str) = now_pair()?;
             let tx = self.conn.transaction()?;
 
             let (status_str, active_attempt, pending_land_json, verification_json): (
@@ -731,43 +763,30 @@ impl Store {
                     params![req.capsule_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
-                .optional()?
-                .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+                .or_not_found(&req.capsule_id)?;
 
             if pending_land_json.is_some() {
-                return Err(StoreError::PendingLandFrozen);
+                return Err(StoreError::PendingLandFrozen(req.capsule_id.clone()));
             }
             let status = parse_status(&status_str);
             if status != Status::Accepted {
-                return Err(StoreError::NotClaimable(
-                    req.capsule_id.clone(),
-                    status_to_str(status),
-                ));
+                return Err(StoreError::wrong_status(req.capsule_id, "land", status));
             }
-            let aid =
-                active_attempt.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            // status=Accepted ⇒ active_attempt is Some and verification_json is
+            // set (DESIGN §3.3 + §7.1.1: attest is the only path into Accepted
+            // and writes both atomically). None here ⇒ DB corruption; mirrors
+            // attest/heartbeat's invariant assertions.
+            let aid = active_attempt.expect("accepted ⇒ active_attempt set");
             attempt_id = aid;
-            let v_json =
-                verification_json.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+            let v_json = verification_json.expect("accepted ⇒ verification set");
             let v: Verification = json::from_str(&v_json)?;
             // Re-bind verified_sha from the in-tx read (defense-in-depth: no
             // gap between read and PendingLand write).
             if v.verified_sha != verified_sha {
-                return Err(StoreError::NotLandable(req.capsule_id.clone()));
+                return Err(StoreError::NotLandable(req.capsule_id));
             }
 
-            let lease_json: String = tx.query_row(
-                "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-                params![req.capsule_id, aid],
-                |r| r.get(0),
-            )?;
-            let lease: Lease = json::from_str(&lease_json)?;
-            if lease.session_id != req.session_id {
-                return Err(StoreError::CrossSession);
-            }
-            if now > lease.expires_at {
-                return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
-            }
+            load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
             let pending = PendingLand {
                 at: now,
@@ -777,16 +796,25 @@ impl Store {
                 witness_branch: witness_branch.clone(),
                 lander: req.lander.clone(),
             };
-            let pending_json = json::to_string(&pending)?;
+            // Build the canonical Value once; the String form serializes the
+            // SQL `pending_land_json` column AND is compared in step 3's CAS,
+            // and the same Value goes to the event payload — so both paths
+            // see identical bytes by construction.
+            let pending_value = json::to_value(&pending)?;
+            pending_json = pending_value.to_string();
 
             tx.execute(
                 "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
                 params![pending_json, now_str, req.capsule_id],
             )?;
-            tx.execute(
-                "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, 'pending_land_committed', ?5)",
-                params![now_str, req.capsule_id, aid, req.lander, pending_json],
+            insert_event(
+                &tx,
+                &now_str,
+                &req.capsule_id,
+                Some(aid),
+                &req.lander,
+                "pending_land_committed",
+                &pending_value,
             )?;
             tx.commit()?;
             pending
@@ -799,96 +827,61 @@ impl Store {
             &base_ref,
             &witness_branch,
             &verified_sha,
-            &prior_base_sha,
         )?;
 
         // ---- Step 4: synchronous reconcile from outcome. ----
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (now, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
+
+        // CAS: re-read pending_land_json in tx. If it has been mutated since
+        // step 2 (concurrent reconcile / force_unfreeze finalized this same
+        // pending), abort. Mirrors `reconcile_inner` (§7.1.2 / §7.2). The
+        // observable git state has already been recorded by the winner.
+        let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
+        if cur_pending.as_deref() != Some(pending_json.as_str()) {
+            tx.commit()?;
+            return Err(StoreError::LandRaceLost(req.capsule_id));
+        }
 
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = verified_sha != prior_base_sha;
                 let landing = Landing {
                     at: now,
-                    landed_sha: verified_sha.clone(),
+                    landed_sha: verified_sha,
                     prior_base_sha: pending.prior_base_sha.clone(),
                     landed_by: req.lander.clone(),
                     attempt_id: pending.attempt_id,
-                    witness_branch: pending.witness_branch.clone(),
+                    witness_branch: pending.witness_branch,
                     advanced_base_ref,
                 };
-                let landing_json = json::to_string(&landing)?;
-
-                tx.execute(
-                    "UPDATE capsule
-                        SET status='landed',
-                            landing_json=?1,
-                            pending_land_json=NULL,
-                            updated_at=?2
-                      WHERE id=?3",
-                    params![landing_json, now_str, req.capsule_id],
-                )?;
-                tx.execute(
-                    "UPDATE attempt SET outcome='landed', closed_at=?1
-                      WHERE capsule_id=?2 AND attempt_id=?3",
-                    params![now_str, req.capsule_id, attempt_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
-                    params![
-                        now_str,
-                        req.capsule_id,
-                        attempt_id,
-                        req.lander,
-                        landing_json
-                    ],
-                )?;
+                finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 LandOutcome::Landed { landing }
             }
             GitOutcome::BaseRefMoved => {
-                tx.execute(
-                    "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
-                    params![now_str, req.capsule_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
-                             json_object('reason', 'base_ref_moved', 'by', ?4))",
-                    params![now_str, req.capsule_id, attempt_id, req.lander],
+                clear_pending_land(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id),
+                    &req.lander,
+                    PendingLandClearedReason::BaseRefMoved,
                 )?;
                 LandOutcome::BaseRefMoved
             }
             GitOutcome::WitnessOidMismatch => {
-                tx.execute(
-                    "UPDATE capsule
-                        SET status='abandoned',
-                            pending_land_json=NULL,
-                            updated_at=?1
-                      WHERE id=?2",
-                    params![now_str, req.capsule_id],
-                )?;
-                tx.execute(
-                    "UPDATE attempt SET outcome='abandoned', closed_at=?1
-                      WHERE capsule_id=?2 AND attempt_id=?3",
-                    params![now_str, req.capsule_id, attempt_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'operational_incident',
-                             json_object('kind', 'witness_oid_mismatch',
-                                         'witness_branch', ?5,
-                                         'verified_sha', ?6))",
-                    params![
-                        now_str,
-                        req.capsule_id,
-                        attempt_id,
-                        req.lander,
-                        witness_branch,
-                        verified_sha,
-                    ],
+                abandon_on_witness_mismatch(&tx, &req.capsule_id, attempt_id, &now_str)?;
+                emit_operational_incident(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id),
+                    &req.lander,
+                    OperationalIncidentKind::WitnessOidMismatch,
+                    json::json!({
+                        "witness_branch": witness_branch,
+                        "verified_sha": verified_sha,
+                    }),
                 )?;
                 LandOutcome::WitnessOidMismatch
             }
@@ -897,17 +890,25 @@ impl Store {
                 // and witness_oid_mismatch are). Treat as transient: clear
                 // pending_land so the caller can retry without manual unfreeze;
                 // bubble the stderr up as an error.
-                tx.execute(
-                    "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
-                    params![now_str, req.capsule_id],
+                clear_pending_land(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id),
+                    &req.lander,
+                    PendingLandClearedReason::OtherFailure,
                 )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
-                             json_object('reason', 'other_failure',
-                                         'stderr', ?5,
-                                         'by', ?4))",
-                    params![now_str, req.capsule_id, attempt_id, req.lander, stderr],
+                // DESIGN §6 keeps `pending_land_cleared` slim ({reason, by}); push
+                // stderr out to a paired `operational_incident` so operators
+                // still have the diagnostic.
+                emit_operational_incident(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id),
+                    &req.lander,
+                    OperationalIncidentKind::LandOtherFailure,
+                    json::json!({ "stderr": stderr }),
                 )?;
                 tx.commit()?;
                 return Err(StoreError::LandOtherFailure(stderr));
@@ -921,10 +922,7 @@ impl Store {
     /// Voluntarily release a capsule. Single DB tx. Refused if pending_land
     /// is set (operator must use force-unfreeze first). See DESIGN.md §6.
     pub fn abandon(&mut self, req: AbandonRequest) -> Result<()> {
-        use capsule_core::Lease;
-
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (_, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
         let (status_str, active_attempt, pending): (String, Option<i64>, Option<String>) = tx
@@ -933,35 +931,34 @@ impl Store {
                 params![req.capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+            .or_not_found(&req.capsule_id)?;
 
         if pending.is_some() {
-            return Err(StoreError::PendingLandFrozen);
+            return Err(StoreError::PendingLandFrozen(req.capsule_id));
         }
         let status = parse_status(&status_str);
-        if matches!(status, Status::Landed | Status::Abandoned) {
+        if status.is_terminal() {
             return Err(StoreError::Terminal(
-                req.capsule_id.clone(),
-                status_to_str(status),
+                req.capsule_id,
+                status.as_wire_str(),
             ));
         }
 
         // If a lease is held, the abandoning session must own it.
+        // Do NOT use `load_live_lease_for_session` here: self-abandon must
+        // work after lease expiry — that's the worker's recovery path when
+        // it has lost its grip on the heartbeat (DESIGN.md §3.3).
         if let Some(aid) = active_attempt {
-            let lease_json: String = tx.query_row(
-                "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-                params![req.capsule_id, aid],
-                |r| r.get(0),
-            )?;
-            let lease: Lease = json::from_str(&lease_json)?;
+            let lease = load_lease(&tx, &req.capsule_id, aid)?;
             if lease.session_id != req.session_id {
                 return Err(StoreError::CrossSession);
             }
-            tx.execute(
-                "UPDATE attempt SET outcome='abandoned', closed_at=?1
-                  WHERE capsule_id=?2 AND attempt_id=?3",
-                params![now_str, req.capsule_id, aid],
+            close_attempt(
+                &tx,
+                &req.capsule_id,
+                aid,
+                capsule_core::AttemptOutcome::Abandoned,
+                &now_str,
             )?;
         }
 
@@ -973,17 +970,15 @@ impl Store {
               WHERE id=?2",
             params![now_str, req.capsule_id],
         )?;
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, ?3, ?4, 'capsule_abandoned',
-                     json_object('reason', ?5))",
-            params![
-                now_str,
-                req.capsule_id,
-                active_attempt,
-                req.session_id,
-                req.reason
-            ],
+        let payload = json::json!({ "reason": req.reason });
+        insert_event(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            active_attempt,
+            &req.session_id,
+            "capsule_abandoned",
+            &payload,
         )?;
         tx.commit()?;
         Ok(())
@@ -994,26 +989,25 @@ impl Store {
     /// Returns `true` if a lease was reclaimed; `false` for no-op.
     pub fn reclaim(&mut self, capsule_id: &str) -> Result<bool> {
         let now = OffsetDateTime::now_utc();
+        let tx = self.conn.transaction()?;
 
-        let pending: Option<String> = self
-            .conn
+        // Read the target capsule's status + freeze flag inside the tx so the
+        // freeze check and reclaim share one snapshot. Matches `claim` /
+        // `abandon`; closes the pre-tx → in-tx window where a concurrent land
+        // could set pending_land between our freeze check and the sweep
+        // (sweep would correctly skip the frozen capsule, but `reclaim` would
+        // return `Ok(false)` instead of `PendingLandFrozen`).
+        let (before_status, pending): (String, Option<String>) = tx
             .query_row(
-                "SELECT pending_land_json FROM capsule WHERE id = ?1",
+                "SELECT status, pending_land_json FROM capsule WHERE id = ?1",
                 params![capsule_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(capsule_id.into()))?;
+            .or_not_found(capsule_id)?;
         if pending.is_some() {
-            return Err(StoreError::PendingLandFrozen);
+            return Err(StoreError::PendingLandFrozen(capsule_id.into()));
         }
 
-        let before_status: String = self.conn.query_row(
-            "SELECT status FROM capsule WHERE id = ?1",
-            params![capsule_id],
-            |r| r.get(0),
-        )?;
-        let tx = self.conn.transaction()?;
         reclaim_expired_in_tx(&tx, now)?;
         let after_status: String = tx.query_row(
             "SELECT status FROM capsule WHERE id = ?1",
@@ -1028,66 +1022,40 @@ impl Store {
     /// check (DESIGN.md §7.1.3). No-op on terminal capsules. Idempotent if
     /// the edge already exists.
     pub fn add_dep(&mut self, req: DepRequest) -> Result<()> {
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (_, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
-        let (status_str, deps_json): (String, String) = tx
-            .query_row(
-                "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
-
-        let status = parse_status(&status_str);
-        if matches!(status, Status::Landed | Status::Abandoned) {
+        let Some(mut deps) = load_deps_for_mutation(&tx, &req.capsule_id)? else {
             return Ok(()); // §7.1.3 explicit no-op on terminal
+        };
+
+        if !capsule_exists(&tx, &req.depends_on)? {
+            return Err(StoreError::DepNotFound(req.depends_on));
         }
 
-        let target_exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM capsule WHERE id = ?1",
-                params![req.depends_on],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !target_exists {
-            return Err(StoreError::DepNotFound(req.depends_on.clone()));
-        }
-
-        let mut deps: Vec<String> = json::from_str(&deps_json)?;
         if deps.contains(&req.depends_on) {
             return Ok(());
         }
-        if req.depends_on == req.capsule_id {
-            return Err(StoreError::DependencyCycle(
-                req.capsule_id.clone(),
-                req.depends_on,
-            ));
-        }
         // Cycle check: BFS from `depends_on` over depends_on edges; if we
-        // reach `capsule_id`, adding the edge would close a cycle.
+        // reach `capsule_id`, adding the edge would close a cycle. Self-dep
+        // is the reflexive `reachable(x, x) == true` case — see `reachable`'s
+        // doc-comment.
         if reachable(&tx, &req.depends_on, &req.capsule_id)? {
             return Err(StoreError::DependencyCycle(
-                req.capsule_id.clone(),
+                req.capsule_id,
                 req.depends_on,
             ));
         }
         deps.push(req.depends_on.clone());
         let new_json = json::to_string(&deps)?;
 
-        tx.execute(
-            "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
-            params![new_json, now_str, req.capsule_id],
-        )?;
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, NULL, 'system', 'dep_added',
-                     json_object('depends_on', ?3))",
-            params![now_str, req.capsule_id, req.depends_on],
+        persist_dep_change(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            &new_json,
+            "dependency_added",
+            &req.depends_on,
         )?;
         tx.commit()?;
         Ok(())
@@ -1096,25 +1064,13 @@ impl Store {
     /// Remove a dependency edge. DB-atomic. No-op on terminal capsules or if
     /// the edge does not exist (DESIGN.md §7.1.3).
     pub fn remove_dep(&mut self, req: DepRequest) -> Result<()> {
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (_, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
-        let (status_str, deps_json): (String, String) = tx
-            .query_row(
-                "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        let Some(mut deps) = load_deps_for_mutation(&tx, &req.capsule_id)? else {
+            return Ok(()); // §7.1.3 explicit no-op on terminal
+        };
 
-        let status = parse_status(&status_str);
-        if matches!(status, Status::Landed | Status::Abandoned) {
-            return Ok(());
-        }
-
-        let mut deps: Vec<String> = json::from_str(&deps_json)?;
         let before = deps.len();
         deps.retain(|d| d != &req.depends_on);
         if deps.len() == before {
@@ -1122,15 +1078,13 @@ impl Store {
         }
         let new_json = json::to_string(&deps)?;
 
-        tx.execute(
-            "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
-            params![new_json, now_str, req.capsule_id],
-        )?;
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, NULL, 'system', 'dep_removed',
-                     json_object('depends_on', ?3))",
-            params![now_str, req.capsule_id, req.depends_on],
+        persist_dep_change(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            &new_json,
+            "dependency_removed",
+            &req.depends_on,
         )?;
         tx.commit()?;
         Ok(())
@@ -1149,45 +1103,61 @@ impl Store {
     }
 
     /// Operator escape hatch (DESIGN.md §7.1.2). Same decision tree as
-    /// `reconcile`, but emits a mandatory `operational_incident` event and
-    /// requires the operator to assert `lander_confirmed_dead`.
+    /// `reconcile`, but emits a mandatory `force_unfreeze_invoked` event
+    /// (DESIGN §6) and requires the operator to assert `lander_confirmed_dead`.
     pub fn force_unfreeze(&mut self, req: ForceUnfreezeRequest) -> Result<ReconcileOutcome> {
         if !req.lander_confirmed_dead {
-            return Err(StoreError::LandOtherFailure(
-                "force-unfreeze requires --lander-confirmed-dead".into(),
-            ));
+            return Err(StoreError::ForceUnfreezeNotConfirmed);
         }
-        let operator = Some(req.operator.clone());
         self.reconcile_inner(
             ReconcileRequest {
                 capsule_id: req.capsule_id,
                 remote: req.remote,
             },
-            operator,
+            Some((req.operator, req.reason)),
         )
     }
 
     fn reconcile_inner(
         &mut self,
         req: ReconcileRequest,
-        operator: Option<String>,
+        operator: Option<(String, String)>,
     ) -> Result<ReconcileOutcome> {
         use capsule_git::ls_remote_branch;
 
-        let now = OffsetDateTime::now_utc();
-        let now_str = format_iso8601(now)?;
+        let (now, now_str) = now_pair()?;
 
         // Outside-tx read of pending_land. We snapshot the JSON for CAS.
-        let pending_json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT pending_land_json FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        let pending_json = load_pending_land_json(&self.conn, &req.capsule_id)?;
         let Some(snapshot_json) = pending_json else {
+            // Reconciler is a no-op when nothing is frozen (DESIGN §7.1.2 —
+            // reconciler scope is gated on pending_land != null), so no
+            // reconciler_ran event. But if an operator invoked force-unfreeze
+            // on a non-frozen capsule, we still record the operator action
+            // so the audit log captures the attempt.
+            if let Some((op, reason)) = operator.as_ref() {
+                let tx = self.conn.transaction()?;
+                // Re-check inside tx: a concurrent lander could have set
+                // pending_land between the outside read and now. If it did,
+                // the snapshot we'd audit (`null`) is stale — return CasLost
+                // and let the operator retry rather than emit a misleading
+                // `not_frozen` audit row.
+                let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
+                if cur_pending.is_some() {
+                    tx.commit()?;
+                    return Ok(ReconcileOutcome::CasLost);
+                }
+                emit_force_unfreeze_invoked(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    op,
+                    reason,
+                    None,
+                    ReconcileOutcome::NotFrozen,
+                )?;
+                tx.commit()?;
+            }
             return Ok(ReconcileOutcome::NotFrozen);
         };
         let pending: PendingLand = json::from_str(&snapshot_json)?;
@@ -1197,174 +1167,155 @@ impl Store {
         let witness_state = if witness_sha == capsule_git::ZERO_OID {
             WitnessState::Absent
         } else if witness_sha == pending.verified_sha {
-            WitnessState::AtVerifiedSha
+            WitnessState::AtVerifiedSha(witness_sha)
         } else {
             WitnessState::Different(witness_sha)
         };
 
-        let actor = operator.clone().unwrap_or_else(|| "reconciler".into());
+        let actor = operator
+            .as_ref()
+            .map(|(op, _)| op.clone())
+            .unwrap_or_else(|| "reconciler".into());
+        // SQLite INTEGER is i64; AttemptId is u64. Hoisted before the CAS
+        // check so reconciler_ran on the CasLost path can bind it too.
+        let attempt_id_i64 = pending.attempt_id as i64;
+        let witness_state_json = witness_remote_state_json(&witness_state);
 
         let tx = self.conn.transaction()?;
         // CAS: re-read pending_land in tx. If it has been mutated since the
         // outside read, abort with a no-op (another reconciler/lander won).
-        let cur_pending: Option<String> = tx
-            .query_row(
-                "SELECT pending_land_json FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(req.capsule_id.clone()))?;
+        let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
         if cur_pending.as_deref() != Some(snapshot_json.as_str()) {
+            // DESIGN §6 reconciler_ran: emit on every reconciler invocation
+            // that reached the witness ls-remote, including CAS-lost no-ops.
+            emit_reconciler_ran(
+                &tx,
+                &now_str,
+                &req.capsule_id,
+                Some(attempt_id_i64),
+                &actor,
+                ReconcileOutcome::CasLost,
+                &witness_state_json,
+            )?;
+            if let Some((op, reason)) = operator.as_ref() {
+                emit_force_unfreeze_invoked(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    op,
+                    reason,
+                    Some(&pending),
+                    ReconcileOutcome::CasLost,
+                )?;
+            }
             tx.commit()?;
             return Ok(ReconcileOutcome::CasLost);
         }
 
         let outcome = match witness_state {
-            WitnessState::AtVerifiedSha => {
+            WitnessState::AtVerifiedSha(observed_sha) => {
                 // Push ran before crash. Reconstruct Landing from PendingLand.
+                // Use the *observed* sha (== pending.verified_sha by the
+                // equality check that built this variant) so the data flow
+                // matches the branch's claim rather than reconstructing from
+                // PendingLand.
                 let landing = Landing {
                     at: now,
-                    landed_sha: pending.verified_sha.clone(),
+                    landed_sha: observed_sha,
                     prior_base_sha: pending.prior_base_sha.clone(),
                     landed_by: actor.clone(),
                     attempt_id: pending.attempt_id,
                     witness_branch: pending.witness_branch.clone(),
                     advanced_base_ref: pending.verified_sha != pending.prior_base_sha,
                 };
-                let landing_json = json::to_string(&landing)?;
-                tx.execute(
-                    "UPDATE capsule
-                        SET status='landed',
-                            landing_json=?1,
-                            pending_land_json=NULL,
-                            updated_at=?2
-                      WHERE id=?3",
-                    params![landing_json, now_str, req.capsule_id],
-                )?;
-                tx.execute(
-                    "UPDATE attempt SET outcome='landed', closed_at=?1
-                      WHERE capsule_id=?2 AND attempt_id=?3",
-                    params![now_str, req.capsule_id, pending.attempt_id as i64],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'capsule_landed', ?5)",
-                    params![
-                        now_str,
-                        req.capsule_id,
-                        pending.attempt_id as i64,
-                        actor,
-                        landing_json
-                    ],
-                )?;
-                if operator.is_some() {
-                    tx.execute(
-                        "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                         VALUES (?1, ?2, ?3, ?4, 'operational_incident',
-                                 json_object('kind', 'force_unfreeze',
-                                             'resolution', 'reconciled_landed'))",
-                        params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
-                    )?;
-                }
+                finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 ReconcileOutcome::Landed
             }
             WitnessState::Different(found_sha) => {
-                tx.execute(
-                    "UPDATE capsule
-                        SET status='abandoned',
-                            pending_land_json=NULL,
-                            updated_at=?1
-                      WHERE id=?2",
-                    params![now_str, req.capsule_id],
-                )?;
-                tx.execute(
-                    "UPDATE attempt SET outcome='abandoned', closed_at=?1
-                      WHERE capsule_id=?2 AND attempt_id=?3",
-                    params![now_str, req.capsule_id, pending.attempt_id as i64],
-                )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'operational_incident',
-                             json_object('kind', 'witness_oid_mismatch',
-                                         'witness_branch', ?5,
-                                         'expected_sha', ?6,
-                                         'found_sha', ?7,
-                                         'by', ?4))",
-                    params![
-                        now_str,
-                        req.capsule_id,
-                        pending.attempt_id as i64,
-                        actor,
-                        pending.witness_branch,
-                        pending.verified_sha,
-                        found_sha,
-                    ],
+                abandon_on_witness_mismatch(&tx, &req.capsule_id, attempt_id_i64, &now_str)?;
+                emit_operational_incident(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id_i64),
+                    &actor,
+                    OperationalIncidentKind::WitnessOidMismatch,
+                    json::json!({
+                        "witness_branch": pending.witness_branch,
+                        "expected_sha": pending.verified_sha,
+                        "found_sha": found_sha,
+                    }),
                 )?;
                 ReconcileOutcome::Abandoned
             }
             WitnessState::Absent => {
-                tx.execute(
-                    "UPDATE capsule
-                        SET pending_land_json=NULL,
-                            updated_at=?1
-                      WHERE id=?2",
-                    params![now_str, req.capsule_id],
+                clear_pending_land(
+                    &tx,
+                    &now_str,
+                    &req.capsule_id,
+                    Some(attempt_id_i64),
+                    &actor,
+                    PendingLandClearedReason::WitnessAbsent,
                 )?;
-                tx.execute(
-                    "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, 'pending_land_cleared',
-                             json_object('reason', 'witness_absent', 'by', ?4))",
-                    params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
-                )?;
-                if operator.is_some() {
-                    tx.execute(
-                        "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-                         VALUES (?1, ?2, ?3, ?4, 'operational_incident',
-                                 json_object('kind', 'force_unfreeze',
-                                             'resolution', 'cleared_witness_absent'))",
-                        params![now_str, req.capsule_id, pending.attempt_id as i64, actor],
-                    )?;
-                }
                 ReconcileOutcome::Cleared
             }
         };
+
+        emit_reconciler_ran(
+            &tx,
+            &now_str,
+            &req.capsule_id,
+            Some(attempt_id_i64),
+            &actor,
+            outcome,
+            &witness_state_json,
+        )?;
+        if let Some((op, reason)) = operator.as_ref() {
+            emit_force_unfreeze_invoked(
+                &tx,
+                &now_str,
+                &req.capsule_id,
+                op,
+                reason,
+                Some(&pending),
+                outcome,
+            )?;
+        }
 
         tx.commit()?;
         Ok(outcome)
     }
 
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
-        let row: RowCapsule = self
-            .conn
+        // Snapshot the parent row + the per-attempt rows inside one
+        // SQLite read transaction so a concurrent writer can't slip a
+        // commit between the two reads. Without this wrap, the parent
+        // read and the attempt read run as independent statements that
+        // each pick their own snapshot — a writer (e.g. `claim`)
+        // committing in between yields a Capsule whose two halves were
+        // observed at different points in time. The two halves remain
+        // consistent within a write (claim updates parent.active_attempt
+        // and inserts the attempt row in one tx), but the rehydration
+        // can mix a pre-write parent with post-write attempts (or vice
+        // versa) and emit a struct that never existed atomically in the
+        // store. `list_capsules` is already snapshotted via its own
+        // `transaction()`; this brings the single-capsule read path to
+        // parity.
+        //
+        // `unchecked_transaction` accepts `&self.conn`. The "unchecked"
+        // refers to compile-time borrow tracking, not runtime safety —
+        // SQLite still rejects nested transactions on the same conn.
+        // `Transaction`'s `Drop` rolls back on scope exit, which is the
+        // right semantics for this read-only tx; no `commit()` needed.
+        let tx = self.conn.unchecked_transaction()?;
+        let row: RowCapsule = tx
             .query_row(
-                "SELECT id, title, description, acceptance_json, scope_json, base_ref,
-                        depends_on_json, status, active_attempt, verification_json,
-                        pending_land_json, landing_json, created_at, updated_at
-                 FROM capsule WHERE id = ?1",
+                &format!("{} WHERE id = ?1", RowCapsule::SELECT_BASE),
                 params![id],
-                |r| {
-                    Ok(RowCapsule {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        description: r.get(2)?,
-                        acceptance_json: r.get(3)?,
-                        scope_json: r.get(4)?,
-                        base_ref: r.get(5)?,
-                        depends_on_json: r.get(6)?,
-                        status: r.get(7)?,
-                        active_attempt: r.get(8)?,
-                        verification_json: r.get(9)?,
-                        pending_land_json: r.get(10)?,
-                        landing_json: r.get(11)?,
-                        created_at: r.get(12)?,
-                        updated_at: r.get(13)?,
-                    })
-                },
+                RowCapsule::from_row,
             )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-        row.into_capsule(&self.conn)
+            .or_not_found(id)?;
+        row.into_capsule(&tx)
     }
 }
 
@@ -1500,14 +1451,16 @@ pub struct ForceUnfreezeRequest {
     pub remote: String,
     /// Operator identity, recorded as the actor on emitted events.
     pub operator: String,
+    /// Free-text justification — DESIGN §6 force_unfreeze_invoked payload
+    /// requires it for the audit trail.
+    pub reason: String,
     /// Operator must confirm the lander process is dead/unresponsive
     /// before bypassing the reconciler. Without this flag the call is
     /// rejected (DESIGN.md §7.1.2 force-unfreeze precondition).
     pub lander_confirmed_dead: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileOutcome {
     /// `pending_land` was null — nothing to do.
     NotFrozen,
@@ -1522,10 +1475,149 @@ pub enum ReconcileOutcome {
     Cleared,
 }
 
+impl ReconcileOutcome {
+    /// Stable wire string for event payloads. Mirrors `Status::as_wire_str` /
+    /// `AttemptOutcome::as_wire_str`: the explicit `match` ensures any new
+    /// variant forces a compile-time review of the wire format, where a
+    /// `serde(rename_all = "snake_case")` derive would silently coin a name.
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::NotFrozen => "not_frozen",
+            Self::CasLost => "cas_lost",
+            Self::Landed => "landed",
+            Self::Abandoned => "abandoned",
+            Self::Cleared => "cleared",
+        }
+    }
+}
+
 enum WitnessState {
     Absent,
-    AtVerifiedSha,
+    /// Carries the observed sha (== `pending.verified_sha` by construction)
+    /// so audit rows can record it without re-joining to `PendingLand`.
+    AtVerifiedSha(String),
     Different(String),
+}
+
+/// Stable JSON shape for `witness_remote_state` in the `reconciler_ran`
+/// event payload (DESIGN §6). Tagged so consumers can switch on `state`.
+fn witness_remote_state_json(s: &WitnessState) -> json::Value {
+    match s {
+        WitnessState::Absent => json::json!({ "state": "absent" }),
+        WitnessState::AtVerifiedSha(sha) => {
+            json::json!({ "state": "at_verified_sha", "sha": sha })
+        }
+        WitnessState::Different(sha) => json::json!({ "state": "different", "sha": sha }),
+    }
+}
+
+/// Emit `force_unfreeze_invoked` (DESIGN §6 line 172) with the four spec
+/// keys: `{operator, reason, snapshot, post_action_outcome}`. `snapshot`
+/// is `None` when the operator invoked force-unfreeze on a capsule with
+/// no `pending_land` (NotFrozen path) — the audit row records the
+/// attempt without a frozen state to point at.
+fn emit_force_unfreeze_invoked(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    operator: &str,
+    reason: &str,
+    snapshot: Option<&PendingLand>,
+    outcome: ReconcileOutcome,
+) -> Result<()> {
+    let payload = json::json!({
+        "operator": operator,
+        "reason": reason,
+        "snapshot": snapshot,
+        "post_action_outcome": outcome.as_wire_str(),
+    });
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        snapshot.map(|s| s.attempt_id as i64),
+        operator,
+        "force_unfreeze_invoked",
+        &payload,
+    )
+}
+
+/// Emit a `reconciler_ran` event with the canonical
+/// `{decision, witness_remote_state}` payload (DESIGN.md §6). Both branches in
+/// `reconcile_inner` (CAS-lost no-op and final outcome) emit the same shape;
+/// the helper keeps the two payloads structurally identical so a future
+/// payload-key tweak lands in one place.
+fn emit_reconciler_ran(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    attempt_id: Option<i64>,
+    actor: &str,
+    decision: ReconcileOutcome,
+    witness_remote_state: &json::Value,
+) -> Result<()> {
+    let payload = json::json!({
+        "decision": decision.as_wire_str(),
+        "witness_remote_state": witness_remote_state,
+    });
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        attempt_id,
+        actor,
+        "reconciler_ran",
+        &payload,
+    )
+}
+
+/// Wire-string vocabulary for `operational_incident.kind` (DESIGN.md §6).
+/// Closed enum (not `&str`) so the canonical kind names are discoverable in
+/// one place and a typo can't silently coexist alongside the real ones.
+#[derive(Clone, Copy)]
+enum OperationalIncidentKind {
+    WitnessOidMismatch,
+    LandOtherFailure,
+}
+
+impl OperationalIncidentKind {
+    const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::WitnessOidMismatch => "witness_oid_mismatch",
+            Self::LandOtherFailure => "land_other_failure",
+        }
+    }
+}
+
+/// Emit an `operational_incident` event with the canonical `{kind, detail}`
+/// payload (DESIGN.md §6). Centralizes the wrapper shape so call sites can
+/// pass just the per-incident `detail` object — pre-extraction, three sites
+/// (land's WitnessOidMismatch + OtherFailure, reconcile's WitnessState::Different)
+/// each open-coded the wrapper, and a regression once flattened the keys
+/// (the pin test in `reconcile_witness_different_records_design_compliant_payload`
+/// caught it).
+fn emit_operational_incident(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    attempt_id: Option<i64>,
+    actor: &str,
+    kind: OperationalIncidentKind,
+    detail: json::Value,
+) -> Result<()> {
+    let payload = json::json!({
+        "kind": kind.as_wire_str(),
+        "detail": detail,
+    });
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        attempt_id,
+        actor,
+        "operational_incident",
+        &payload,
+    )
 }
 
 /// Sweep expired leases (DESIGN.md §3.3, §7.2). Run inside any tx that may
@@ -1566,10 +1658,12 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
             continue;
         }
 
-        tx.execute(
-            "UPDATE attempt SET outcome='expired', closed_at=?1
-             WHERE capsule_id=?2 AND attempt_id=?3",
-            params![now_str, capsule_id, attempt_id],
+        close_attempt(
+            tx,
+            &capsule_id,
+            attempt_id,
+            capsule_core::AttemptOutcome::Expired,
+            &now_str,
         )?;
         tx.execute(
             "UPDATE capsule
@@ -1580,25 +1674,111 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
               WHERE id=?2",
             params![now_str, capsule_id],
         )?;
-        tx.execute(
-            "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
-             VALUES (?1, ?2, ?3, 'system', 'attempt_expired',
-                     json_object('lease_expires_at', ?4, 'session_id', ?5))",
-            params![
-                now_str,
-                capsule_id,
-                attempt_id,
-                format_iso8601(lease.expires_at)?,
-                lease.session_id,
-            ],
+        // DESIGN.md §6 attempt_expired payload: {at, prior_lease_expires_at}.
+        let payload = json::json!({
+            "at": now_str,
+            "prior_lease_expires_at": format_iso8601(lease.expires_at)?,
+        });
+        insert_event(
+            tx,
+            &now_str,
+            &capsule_id,
+            Some(attempt_id),
+            "system",
+            "attempt_expired",
+            &payload,
         )?;
     }
 
     Ok(())
 }
 
+/// Load and deserialize the `Lease` for one attempt. Underlying loader for
+/// `load_live_lease_for_session` (which `attest` / `heartbeat` / `land`
+/// compose with) and called directly by `abandon` (which must remain callable
+/// on an expired lease). Centralized so the SQL and the JSON-shape contract
+/// live in one place.
+fn load_lease(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+) -> Result<capsule_core::Lease> {
+    let lease_json: String = tx.query_row(
+        "SELECT lease_json FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        params![capsule_id, attempt_id],
+        |r| r.get(0),
+    )?;
+    Ok(json::from_str(&lease_json)?)
+}
+
+/// Load the lease and verify the caller owns it (matching `session_id`) AND
+/// it has not expired. Used by `attest` / `heartbeat` / `land` — the
+/// operations whose preconditions require a live lease in the calling session.
+/// `abandon` deliberately calls `load_lease` directly with only an inline
+/// session-match check, since it must remain callable on an expired lease so
+/// the worker can self-abandon.
+fn load_live_lease_for_session(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+    session_id: &str,
+    now: OffsetDateTime,
+) -> Result<capsule_core::Lease> {
+    let lease = load_lease(tx, capsule_id, attempt_id)?;
+    if lease.session_id != session_id {
+        return Err(StoreError::CrossSession);
+    }
+    if now > lease.expires_at {
+        return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
+    }
+    Ok(lease)
+}
+
+/// Read `pending_land_json` for a capsule. Returns `Ok(None)` when the column
+/// is NULL, `Err(NotFound)` if the capsule does not exist. Used by every CAS
+/// site that snapshots or re-reads the pending-land flag — `land` step 4 and
+/// `reconcile_inner` (DESIGN.md §7.1.2). Accepts `&Connection` so that
+/// `&Transaction` (which derefs to `&Connection`) callers work without
+/// per-shape duplication.
+fn load_pending_land_json(
+    conn: &rusqlite::Connection,
+    capsule_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT pending_land_json FROM capsule WHERE id = ?1",
+        params![capsule_id],
+        |r| r.get(0),
+    )
+    .or_not_found(capsule_id)
+}
+
+/// Shared preamble for `add_dep`/`remove_dep`: load `depends_on_json` and
+/// short-circuit on terminal capsules. Returns:
+/// - `Err(NotFound)` if the capsule does not exist;
+/// - `Ok(None)` if the capsule is in a terminal state (§7.1.3 no-op signal);
+/// - `Ok(Some(deps))` otherwise — caller mutates and writes back.
+fn load_deps_for_mutation(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+) -> Result<Option<Vec<String>>> {
+    let (status_str, deps_json): (String, String) = tx
+        .query_row(
+            "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
+            params![capsule_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .or_not_found(capsule_id)?;
+    if parse_status(&status_str).is_terminal() {
+        return Ok(None);
+    }
+    Ok(Some(json::from_str(&deps_json)?))
+}
+
 /// BFS over the `depends_on` graph from `from` looking for `target`.
-/// Used by `add_dep` for cycle rejection (DESIGN.md §7.1.3).
+/// Used by `add_dep` for cycle rejection (DESIGN.md §7.1.3). Reachability is
+/// reflexive: `reachable(tx, x, x)` returns true (the graph-theory definition
+/// — `add_dep` relies on this so that the self-dep case is not a separate
+/// branch). Preserve this when refactoring.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<String> = HashSet::new();
@@ -1643,9 +1823,9 @@ fn exit_codes_match(expect: &capsule_core::ExpectExit, got: &capsule_core::ExitC
 #[derive(serde::Serialize)]
 struct CreatedPayload<'a> {
     acceptance: &'a Acceptance,
-    scope_prefixes: &'a Vec<CanonicalPath>,
+    scope_prefixes: &'a [CanonicalPath],
     base_ref: &'a str,
-    depends_on: &'a Vec<CapsuleId>,
+    depends_on: &'a [CapsuleId],
 }
 
 struct RowCapsule {
@@ -1666,44 +1846,36 @@ struct RowCapsule {
 }
 
 impl RowCapsule {
-    fn into_capsule(self, conn: &Connection) -> Result<Capsule> {
-        let mut attempts = vec![];
-        let mut stmt = conn.prepare(
-            "SELECT attempt_id, lease_json, branch, witness_branch, base_sha, tip_sha,
-                    last_heartbeat, outcome, opened_at, closed_at
-             FROM attempt WHERE capsule_id = ?1 ORDER BY attempt_id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![self.id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, lease_json, branch, wb, base_sha, tip_sha, hb, outcome, opened, closed) in rows {
-            attempts.push(capsule_core::Attempt {
-                id: id as u64,
-                lease: json::from_str(&lease_json)?,
-                branch,
-                witness_branch: wb,
-                base_sha,
-                tip_sha,
-                last_heartbeat: parse_iso8601(&hb),
-                outcome: parse_outcome(&outcome),
-                opened_at: parse_iso8601(&opened),
-                closed_at: closed.map(|s| parse_iso8601(&s)),
-            });
-        }
+    /// Single source of truth for the capsule SELECT — both `list_capsules`
+    /// (no WHERE) and `get_capsule` (`WHERE id = ?1`) start here. Drift between
+    /// the column list and `from_row`'s positional `r.get(N)` calls would
+    /// silently corrupt one of the two paths.
+    const SELECT_BASE: &'static str = "SELECT id, title, description, acceptance_json, scope_json, base_ref,
+                depends_on_json, status, active_attempt, verification_json,
+                pending_land_json, landing_json, created_at, updated_at
+         FROM capsule";
 
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            description: r.get(2)?,
+            acceptance_json: r.get(3)?,
+            scope_json: r.get(4)?,
+            base_ref: r.get(5)?,
+            depends_on_json: r.get(6)?,
+            status: r.get(7)?,
+            active_attempt: r.get(8)?,
+            verification_json: r.get(9)?,
+            pending_land_json: r.get(10)?,
+            landing_json: r.get(11)?,
+            created_at: r.get(12)?,
+            updated_at: r.get(13)?,
+        })
+    }
+
+    fn into_capsule(self, conn: &Connection) -> Result<Capsule> {
+        let attempts = load_attempts_for_capsule(conn, &self.id)?;
         Ok(Capsule {
             id: self.id,
             title: self.title,
@@ -1730,41 +1902,101 @@ impl RowCapsule {
     }
 }
 
-fn status_to_str(s: Status) -> &'static str {
-    match s {
-        Status::Planned => "planned",
-        Status::Active => "active",
-        Status::Accepted => "accepted",
-        Status::Landed => "landed",
-        Status::Abandoned => "abandoned",
-    }
+/// Load all attempts for one capsule, ordered by `attempt_id ASC`. Single
+/// source of truth for the SELECT column list against `attempt`; drift between
+/// the column list and the `Attempt` field assignments would silently corrupt
+/// rehydration. Sibling of `RowCapsule::SELECT_BASE` / `RowCapsule::from_row`.
+///
+/// The two-pass shape (collect raw tuples first, then build `Attempt`) is
+/// deliberate: the closure passed to `query_map` returns `rusqlite::Result`,
+/// but `json::from_str` and `parse_iso8601` produce other error types — so
+/// the JSON/ISO-8601 decode lives outside the closure.
+fn load_attempts_for_capsule(
+    conn: &Connection,
+    capsule_id: &str,
+) -> Result<Vec<capsule_core::Attempt>> {
+    let mut stmt = conn.prepare(
+        "SELECT attempt_id, lease_json, branch, witness_branch, base_sha, tip_sha,
+                last_heartbeat, outcome, opened_at, closed_at
+         FROM attempt WHERE capsule_id = ?1 ORDER BY attempt_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![capsule_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(id, lease_json, branch, wb, base_sha, tip_sha, hb, outcome, opened, closed)| {
+            Ok(capsule_core::Attempt {
+                id: id as u64,
+                lease: json::from_str(&lease_json)?,
+                branch,
+                witness_branch: wb,
+                base_sha,
+                tip_sha,
+                last_heartbeat: parse_iso8601(&hb),
+                outcome: parse_outcome(&outcome),
+                opened_at: parse_iso8601(&opened),
+                closed_at: closed.map(|s| parse_iso8601(&s)),
+            })
+        })
+        .collect()
+}
+
+// Wire string round-trips live on the enum (capsule_core::model). The SQL CHECK
+// constraints on `capsule.status` and `attempt.outcome` enforce membership, so
+// a parse failure here ⇒ DB corruption (or migration mismatch) — panic with
+// the offending value to surface it loudly. These helpers exist so callers
+// don't have to write `.unwrap_or_else(...)` at every read site.
+
+fn parse_wire<T>(kind: &str, value: &str, parse: impl FnOnce(&str) -> Option<T>) -> T {
+    parse(value).unwrap_or_else(|| panic!("unknown {kind} in DB: {value}"))
 }
 
 fn parse_status(s: &str) -> Status {
-    match s {
-        "planned" => Status::Planned,
-        "active" => Status::Active,
-        "accepted" => Status::Accepted,
-        "landed" => Status::Landed,
-        "abandoned" => Status::Abandoned,
-        other => panic!("unknown status in DB: {other}"),
-    }
+    parse_wire("status", s, Status::from_wire)
 }
 
 fn parse_outcome(s: &str) -> capsule_core::AttemptOutcome {
-    use capsule_core::AttemptOutcome::*;
-    match s {
-        "in_flight" => InFlight,
-        "released" => Released,
-        "expired" => Expired,
-        "abandoned" => Abandoned,
-        "landed" => Landed,
-        other => panic!("unknown attempt outcome in DB: {other}"),
-    }
+    parse_wire("attempt outcome", s, capsule_core::AttemptOutcome::from_wire)
 }
 
 fn format_iso8601(t: OffsetDateTime) -> Result<String> {
     Ok(t.format(&time::format_description::well_known::Iso8601::DEFAULT)?)
+}
+
+/// One `now_utc()` reading and its ISO-8601 form for DB writes. Use when a
+/// mutation needs both the in-memory `OffsetDateTime` (e.g. for `Lease`
+/// fields, in-tx lease checks) and the string bound into `updated_at` / event
+/// rows, so both values come from the same clock read. Sites that need only
+/// the string discard with `let (_, now_str) = now_pair()?;`. Sites that need
+/// only the instant should call `OffsetDateTime::now_utc()` directly — the
+/// helper's centralized format pass is wasted there.
+fn now_pair() -> Result<(OffsetDateTime, String)> {
+    let now = OffsetDateTime::now_utc();
+    let now_str = format_iso8601(now)?;
+    Ok((now, now_str))
+}
+
+/// `now + ttl_sec`, rejecting both u64→i64 wrap and OffsetDateTime overflow as
+/// `InvalidLeaseTtl`. Pre-fix `claim` and `heartbeat` cast u64→i64 unchecked,
+/// then added without `checked_add` — pathological TTLs either wrapped to a
+/// negative Duration (lease born expired) or panicked in the time crate.
+fn checked_lease_expiry(now: OffsetDateTime, ttl_sec: u64) -> Result<OffsetDateTime> {
+    let ttl_i64 = i64::try_from(ttl_sec).map_err(|_| StoreError::InvalidLeaseTtl(ttl_sec))?;
+    now.checked_add(time::Duration::seconds(ttl_i64))
+        .ok_or(StoreError::InvalidLeaseTtl(ttl_sec))
 }
 
 fn parse_iso8601(s: &str) -> OffsetDateTime {
@@ -1772,9 +2004,232 @@ fn parse_iso8601(s: &str) -> OffsetDateTime {
         .expect("DB stored a non-iso8601 timestamp")
 }
 
+/// True iff a row with this id exists in `capsule`. `id` is the primary key,
+/// so this is an indexed lookup. (Distinct from `capsule_core::id::validate`,
+/// which is a syntactic check on the id string.)
+fn capsule_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool> {
+    let exists: Option<bool> = tx
+        .query_row("SELECT 1 FROM capsule WHERE id = ?1", params![id], |_| {
+            Ok(true)
+        })
+        .optional()?;
+    Ok(exists.unwrap_or(false))
+}
+
+/// Persist a dependency-edge change: write the new `depends_on_json` and
+/// emit a `dependency_added`/`dependency_removed` event with payload
+/// `{dep_id}` (DESIGN.md §6 event taxonomy). Both `add_dep` and `remove_dep`
+/// share this tail (DESIGN.md §7.1.3); the head — load, mutate, early-return
+/// on no-op — stays per-method since the predicates differ.
+fn persist_dep_change(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    deps_json: &str,
+    event_kind: &str,
+    dep_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
+        params![deps_json, now_str, capsule_id],
+    )?;
+    let payload = json::json!({ "dep_id": dep_id });
+    insert_event(tx, now_str, capsule_id, None, "system", event_kind, &payload)?;
+    Ok(())
+}
+
+/// Apply the DESIGN §7.1.2 landed-state transition atomically: persist
+/// `landing` and clear `pending_land_json`, close the active attempt with
+/// `Landed`, and emit the canonical `capsule_landed` event with the landing
+/// JSON. Used by `land` step 4 (`GitOutcome::Advanced` / `NoOp` arms) and
+/// `reconcile_inner` (`WitnessState::AtVerifiedSha`); both branches construct
+/// a `Landing` from slightly different sources (live push outcome vs. crash
+/// recovery from `PendingLand`) but the persistence shape is identical, and
+/// the event payload IS the landing JSON.
+fn finalize_landed(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    landing: &Landing,
+    now_str: &str,
+) -> Result<()> {
+    let landing_value = json::to_value(landing)?;
+    let landing_json = landing_value.to_string();
+    let attempt_id = landing.attempt_id as i64;
+    tx.execute(
+        "UPDATE capsule
+            SET status='landed',
+                landing_json=?1,
+                pending_land_json=NULL,
+                updated_at=?2
+          WHERE id=?3",
+        params![landing_json, now_str, capsule_id],
+    )?;
+    close_attempt(
+        tx,
+        capsule_id,
+        attempt_id,
+        capsule_core::AttemptOutcome::Landed,
+        now_str,
+    )?;
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        Some(attempt_id),
+        &landing.landed_by,
+        "capsule_landed",
+        &landing_value,
+    )
+}
+
+/// Abandon a capsule whose witness ref disagrees with the snapshot — used by
+/// `land` step 4 (`WitnessOidMismatch`) and `reconcile_inner`
+/// (`WitnessState::Different`). Both paths must atomically: flip status to
+/// `abandoned`, clear `pending_land_json` (no longer frozen), and close the
+/// active attempt with `Abandoned`. Distinct from `abandon`, which clears
+/// `active_attempt` instead — that path has no pending_land.
+fn abandon_on_witness_mismatch(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+    now_str: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE capsule
+            SET status='abandoned',
+                pending_land_json=NULL,
+                updated_at=?1
+          WHERE id=?2",
+        params![now_str, capsule_id],
+    )?;
+    close_attempt(
+        tx,
+        capsule_id,
+        attempt_id,
+        capsule_core::AttemptOutcome::Abandoned,
+        now_str,
+    )
+}
+
+/// Mark an attempt terminal by setting `outcome` and `closed_at`. Caller
+/// must pass a terminal `AttemptOutcome` (`Landed`/`Abandoned`/`Expired`);
+/// `closed_at` is meaningless for `InFlight`/`Released`.
+fn close_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+    outcome: capsule_core::AttemptOutcome,
+    now_str: &str,
+) -> Result<()> {
+    debug_assert!(
+        outcome.is_terminal(),
+        "close_attempt called with non-terminal outcome {outcome:?}",
+    );
+    tx.execute(
+        "UPDATE attempt SET outcome=?1, closed_at=?2
+         WHERE capsule_id=?3 AND attempt_id=?4",
+        params![outcome.as_wire_str(), now_str, capsule_id, attempt_id],
+    )?;
+    Ok(())
+}
+
+/// Wire-string vocabulary for `pending_land_cleared.reason` (DESIGN.md §6).
+/// Closed enum (not `&str`) so the canonical reasons are discoverable in one
+/// place and a typo can't silently coexist with the wire-pinned vocabulary.
+/// Mirrors the `OperationalIncidentKind` precedent in this file.
+#[derive(Clone, Copy)]
+enum PendingLandClearedReason {
+    BaseRefMoved,
+    OtherFailure,
+    WitnessAbsent,
+}
+
+impl PendingLandClearedReason {
+    const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::BaseRefMoved => "base_ref_moved",
+            Self::OtherFailure => "other_failure",
+            Self::WitnessAbsent => "witness_absent",
+        }
+    }
+}
+
+/// Clear `pending_land_json` and emit the matching `pending_land_cleared`
+/// audit event with the canonical `{reason, by}` payload (DESIGN.md §6) in
+/// one step. Used by every site that drops a pending entry without
+/// finalizing a Landing — `land`'s BaseRefMoved and OtherFailure arms
+/// (DESIGN.md §7.1.2) and `reconcile_inner`'s WitnessAbsent arm. The three
+/// sites previously open-coded the (UPDATE + emit) pair, which risked one
+/// site clearing without auditing on a future edit. Audit is the invariant:
+/// there is no caller that clears without emitting. `by` stays in the JSON
+/// payload for the on-wire shape DESIGN §6 pins, even though it duplicates
+/// the event row's `actor` column.
+fn clear_pending_land(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    attempt_id: Option<i64>,
+    by: &str,
+    reason: PendingLandClearedReason,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
+        params![now_str, capsule_id],
+    )?;
+    let payload = json::json!({
+        "reason": reason.as_wire_str(),
+        "by": by,
+    });
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        attempt_id,
+        by,
+        "pending_land_cleared",
+        &payload,
+    )
+}
+
+/// Serialize the event payload and append it to the `event` table.
+///
+/// Takes a `&json::Value` (not `&str`, not `&impl Serialize`) so that an
+/// already-stringified JSON String cannot be passed in by mistake — that would
+/// double-encode the audit row (`"\"...\""` instead of `{...}`). The type
+/// system enforces shape, not provenance: don't `from_str` already-rendered
+/// JSON just to satisfy the type — convert from the typed source via
+/// `json::to_value(&t)?` so the conversion is visible.
+///
+/// Note on bytes: payloads built from typed structs via `to_value` round-trip
+/// through `Value::Object` (BTreeMap-sorted keys with default `serde_json`),
+/// so the on-wire key order is alphabetical, not struct declaration order.
+/// DESIGN.md §6 pins payload shape, not byte order; consumers parse via
+/// `from_str` and are order-agnostic.
+fn insert_event(
+    tx: &rusqlite::Transaction<'_>,
+    at: &str,
+    capsule_id: &str,
+    attempt_id: Option<i64>,
+    actor: &str,
+    kind: &str,
+    payload: &json::Value,
+) -> Result<()> {
+    let payload_json = json::to_string(payload)?;
+    tx.execute(
+        "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![at, capsule_id, attempt_id, actor, kind, payload_json],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic 40-hex sha for tests that don't push to a real remote.
+    /// Real tests against a bare repo build their own via git rev-parse.
+    const FAKE_SHA: &str = "1111111111111111111111111111111111111111";
 
     fn tmp_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
@@ -1782,6 +2237,35 @@ mod tests {
         let s = Store::open(&path).unwrap();
         std::mem::forget(dir);
         s
+    }
+
+    /// Read the unique `event.payload_json` row matching `(capsule_id, kind)`,
+    /// parsed as `json::Value`. Asserts exactly one match — pre-extraction the
+    /// open-coded sites used `query_row`, which silently returns the first row
+    /// when duplicates exist; that would mask a regression where the same event
+    /// fires twice. The DESIGN §6 pin tests all expect a single emission, so
+    /// the cardinality assert encodes that intent. Tests with legitimate
+    /// multi-emission scenarios should query directly so order is explicit.
+    fn read_event_payload(s: &Store, capsule_id: &str, kind: &str) -> json::Value {
+        let payloads: Vec<String> = s
+            .conn
+            .prepare(
+                "SELECT payload_json FROM event
+                 WHERE capsule_id = ?1 AND kind = ?2
+                 ORDER BY rowid
+                 LIMIT 2",
+            )
+            .unwrap()
+            .query_map(params![capsule_id, kind], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "expected exactly one {kind} event for capsule {capsule_id}",
+        );
+        json::from_str(&payloads[0]).unwrap()
     }
 
     #[test]
@@ -1793,32 +2277,151 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_outcome_wire_table_pinned() {
+        // Pin (variant, wire) for `ReconcileOutcome::as_wire_str`. The strings
+        // surface in the `reconciler_ran` event payload (DESIGN §6) and in the
+        // `--json` output of `capsule reconcile` / `capsule force-unfreeze` —
+        // external consumers (event readers, agents, scripts) lock on the
+        // exact spelling, so a typo or rename in one variant could ship
+        // unnoticed. Mirrors the `status_wire_table_pinned` pattern.
+        let cases = [
+            (ReconcileOutcome::NotFrozen, "not_frozen"),
+            (ReconcileOutcome::CasLost, "cas_lost"),
+            (ReconcileOutcome::Landed, "landed"),
+            (ReconcileOutcome::Abandoned, "abandoned"),
+            (ReconcileOutcome::Cleared, "cleared"),
+        ];
+        for (v, wire) in cases {
+            assert_eq!(v.as_wire_str(), wire);
+        }
+    }
+
+    #[test]
+    fn operational_incident_kind_wire_table_pinned() {
+        // Pin (variant, wire) for `OperationalIncidentKind::as_wire_str`.
+        // Surfaces as the `kind` field of the `operational_incident` event
+        // (DESIGN §6) — operator dashboards and audit consumers key on these
+        // strings.
+        let cases = [
+            (
+                OperationalIncidentKind::WitnessOidMismatch,
+                "witness_oid_mismatch",
+            ),
+            (
+                OperationalIncidentKind::LandOtherFailure,
+                "land_other_failure",
+            ),
+        ];
+        for (v, wire) in cases {
+            assert_eq!(v.as_wire_str(), wire);
+        }
+    }
+
+    #[test]
+    fn pending_land_cleared_reason_wire_table_pinned() {
+        // Pin (variant, wire) for `PendingLandClearedReason::as_wire_str`.
+        // Surfaces as the `reason` field of the `pending_land_cleared` event
+        // (DESIGN §6).
+        let cases = [
+            (PendingLandClearedReason::BaseRefMoved, "base_ref_moved"),
+            (PendingLandClearedReason::OtherFailure, "other_failure"),
+            (PendingLandClearedReason::WitnessAbsent, "witness_absent"),
+        ];
+        for (v, wire) in cases {
+            assert_eq!(v.as_wire_str(), wire);
+        }
+    }
+
+    #[test]
     fn create_and_get() {
         let mut s = tmp_store();
-        let c = s
-            .create_capsule(NewCapsule {
-                id: "abc".into(),
-                title: "t".into(),
-                description: "d".into(),
-                acceptance: Acceptance {
-                    run: "true".into(),
-                    expect_exit: capsule_core::ExpectExit::Code(0),
-                    cwd: None,
-                    timeout_sec: None,
-                },
-                scope_prefixes: vec![CanonicalPath::new("src/api").unwrap()],
-                base_ref: "main".into(),
-                depends_on: vec![],
-            })
-            .unwrap();
+        let c = make_capsule(&mut s, "abc", "src/api");
         assert_eq!(c.status, Status::Planned);
         let got = s.get_capsule("abc").unwrap();
         assert_eq!(got.id, "abc");
         assert_eq!(got.scope_prefixes.len(), 1);
     }
 
-    fn make_capsule(s: &mut Store, id: &str, scope: &str) {
-        s.create_capsule(NewCapsule {
+    #[test]
+    fn attempt_claimed_event_payload_matches_design_spec() {
+        // DESIGN.md §6 attempt_claimed payload: {attempt_id, session_id,
+        // base_sha, lease}. Pin the keys so a future refactor can't silently
+        // drop back to the pre-fix `lease_expires_at` shape.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let v = read_event_payload(&s, "x", "attempt_claimed");
+        assert!(v.get("attempt_id").is_some(), "missing attempt_id");
+        assert_eq!(v["session_id"], "sess1");
+        assert!(v.get("base_sha").is_some(), "missing base_sha");
+        let lease = v.get("lease").expect("missing lease object");
+        assert!(lease.is_object(), "lease must be a JSON object, not a scalar");
+        assert!(lease.get("expires_at").is_some());
+        assert!(lease.get("ttl_sec").is_some());
+        assert!(v.get("lease_expires_at").is_none(), "old key must not return");
+    }
+
+    #[test]
+    fn attempt_attested_event_payload_matches_design_spec() {
+        // DESIGN.md §6 attempt_attested payload: {verified_sha, exit_code,
+        // command, log_ref, duration_ms}. The full Verification struct (with
+        // at/attestor/attempt_id) lives in capsule.verification_json — those
+        // three would duplicate the event row's at/actor/attempt_id columns.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 7,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let v = read_event_payload(&s, "x", "attempt_attested");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["command", "duration_ms", "exit_code", "log_ref", "verified_sha"]
+        );
+        assert_eq!(v["verified_sha"], FAKE_SHA);
+        assert_eq!(v["duration_ms"], 7);
+        assert_eq!(v["command"], "true");
+        // ExitCode is `#[serde(untagged)]`: Code(0) → JSON number 0.
+        assert_eq!(v["exit_code"], 0);
+    }
+
+    #[test]
+    fn attempt_attested_event_payload_serializes_sentinel_exit_code() {
+        // Pin the other arm of `ExitCode`: Sentinel("timeout") → JSON string.
+        // Untagged-enum stability matters because the event payload is the
+        // wire format readers depend on.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "sleep 999".into(),
+            exit_code: capsule_core::ExitCode::Sentinel("timeout".into()),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let v = read_event_payload(&s, "x", "attempt_attested");
+        assert_eq!(v["exit_code"], "timeout");
+    }
+
+    /// Build a `NewCapsule` with sensible test defaults: title="t", description="d",
+    /// acceptance=`true` (exit 0), base_ref="main", no deps. Caller mutates fields
+    /// post-build for non-default scenarios (e.g. setting `depends_on`).
+    fn new_capsule_args(id: &str, scope: &str) -> NewCapsule {
+        NewCapsule {
             id: id.into(),
             title: "t".into(),
             description: "d".into(),
@@ -1831,17 +2434,24 @@ mod tests {
             scope_prefixes: vec![CanonicalPath::new(scope).unwrap()],
             base_ref: "main".into(),
             depends_on: vec![],
-        })
-        .unwrap();
+        }
+    }
+
+    fn make_capsule(s: &mut Store, id: &str, scope: &str) -> Capsule {
+        s.create_capsule(new_capsule_args(id, scope)).unwrap()
     }
 
     fn claim_req(id: &str, sess: &str) -> ClaimRequest {
+        claim_req_with_ttl(id, sess, 300)
+    }
+
+    fn claim_req_with_ttl(id: &str, sess: &str, ttl_sec: u64) -> ClaimRequest {
         ClaimRequest {
             capsule_id: id.into(),
             owner: "o".into(),
             session_id: sess.into(),
-            lease_ttl_sec: 300,
-            base_sha: "deadbeef".into(),
+            lease_ttl_sec: ttl_sec,
+            base_sha: FAKE_SHA.into(),
         }
     }
 
@@ -1865,7 +2475,7 @@ mod tests {
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
         let err = s.claim(claim_req("x", "sess2")).unwrap_err();
-        assert!(matches!(err, StoreError::NotClaimable(_, _)));
+        assert!(matches!(err, StoreError::WrongStatus { op: "claim", .. }));
     }
 
     #[test]
@@ -1904,7 +2514,7 @@ mod tests {
             .attest(AttestRequest {
                 capsule_id: "x".into(),
                 session_id: "sess1".into(),
-                verified_sha: "abc".into(),
+                verified_sha: FAKE_SHA.into(),
                 command: "true".into(),
                 exit_code: capsule_core::ExitCode::Code(0),
                 duration_ms: 100,
@@ -1927,7 +2537,7 @@ mod tests {
             .attest(AttestRequest {
                 capsule_id: "x".into(),
                 session_id: "sess1".into(),
-                verified_sha: "abc".into(),
+                verified_sha: FAKE_SHA.into(),
                 command: "false".into(),
                 exit_code: capsule_core::ExitCode::Code(1),
                 duration_ms: 50,
@@ -1946,7 +2556,7 @@ mod tests {
         let req = AttestRequest {
             capsule_id: "x".into(),
             session_id: "sess1".into(),
-            verified_sha: "abc".into(),
+            verified_sha: FAKE_SHA.into(),
             command: "true".into(),
             exit_code: capsule_core::ExitCode::Code(0),
             duration_ms: 100,
@@ -1954,7 +2564,53 @@ mod tests {
         };
         s.attest(req.clone()).unwrap();
         let err = s.attest(req).unwrap_err();
-        assert!(matches!(err, StoreError::NotClaimable(_, _)));
+        assert!(matches!(err, StoreError::WrongStatus { op: "attest", .. }));
+    }
+
+    #[test]
+    fn attest_rejects_malformed_verified_sha() {
+        // Garbage `verified_sha` should fail at the protocol boundary (here),
+        // not later as an opaque `git push <garbage>:refs/heads/...` failure.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let err = s
+            .attest(AttestRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                verified_sha: "abc".into(),
+                command: "true".into(),
+                exit_code: capsule_core::ExitCode::Code(0),
+                duration_ms: 1,
+                log_ref: "file:///dev/null".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidSha(_)),
+            "expected InvalidSha, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn claim_rejects_malformed_base_sha() {
+        // Symmetric with attest: base_sha flows into `git worktree add ... <sha>`
+        // (capsule-cli isolation) and into LandPush prior-base computation.
+        // Reject at the protocol boundary.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let err = s
+            .claim(ClaimRequest {
+                capsule_id: "x".into(),
+                owner: "o".into(),
+                session_id: "sess1".into(),
+                lease_ttl_sec: 300,
+                base_sha: "deadbeef".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidSha(_)),
+            "expected InvalidSha, got: {err:?}"
+        );
     }
 
     #[test]
@@ -1971,14 +2627,57 @@ mod tests {
         assert!(matches!(err, StoreError::CrossSession));
     }
 
-    fn claim_req_with_ttl(id: &str, sess: &str, ttl_sec: u64) -> ClaimRequest {
-        ClaimRequest {
-            capsule_id: id.into(),
-            owner: "o".into(),
-            session_id: sess.into(),
-            lease_ttl_sec: ttl_sec,
-            base_sha: "deadbeef".into(),
+    #[test]
+    fn cross_session_outranks_expired_lease() {
+        // Pin precedence: a wrong-session caller whose lease has ALSO expired
+        // must see CrossSession, not LeaseExpired. They don't own the lease,
+        // period — the expiry is irrelevant context, and leaking it would let
+        // a foreign session probe lease state. Heartbeat is the cleanest
+        // probe: it does not run reclaim before loading the lease, so status
+        // stays `active` and the load_live_lease_for_session check order is
+        // exercised end-to-end.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let err = s
+            .heartbeat(HeartbeatRequest {
+                capsule_id: "x".into(),
+                session_id: "wrong".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::CrossSession),
+            "expected CrossSession, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn claim_rejects_out_of_range_lease_ttl() {
+        // Pre-fix, `req.lease_ttl_sec as i64` wrapped for ttl > i64::MAX,
+        // producing a negative time::Duration → expires_at < now → lease
+        // born already-expired. Must surface as a clean error.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let mut req = claim_req("x", "sess1");
+        req.lease_ttl_sec = u64::MAX;
+        match s.claim(req) {
+            Err(StoreError::InvalidLeaseTtl(t)) => assert_eq!(t, u64::MAX),
+            other => panic!("expected InvalidLeaseTtl, got {other:?}"),
         }
+        // Just past i64::MAX — still rejected.
+        let mut req = claim_req("x", "sess1");
+        req.lease_ttl_sec = (i64::MAX as u64) + 1;
+        assert!(matches!(s.claim(req), Err(StoreError::InvalidLeaseTtl(_))));
+        // i64::MAX seconds fits in Duration but overflows `now + duration` —
+        // surfaces as InvalidLeaseTtl, not a panic.
+        let mut req = claim_req("x", "sess1");
+        req.lease_ttl_sec = i64::MAX as u64;
+        assert!(matches!(s.claim(req), Err(StoreError::InvalidLeaseTtl(_))));
+        // A sane TTL works.
+        let mut req = claim_req("x", "sess1");
+        req.lease_ttl_sec = 3600;
+        assert!(s.claim(req).is_ok());
     }
 
     #[test]
@@ -1990,7 +2689,7 @@ mod tests {
         s.attest(AttestRequest {
             capsule_id: "x".into(),
             session_id: "sess1".into(),
-            verified_sha: "abc".into(),
+            verified_sha: FAKE_SHA.into(),
             command: "true".into(),
             exit_code: capsule_core::ExitCode::Code(0),
             duration_ms: 1,
@@ -2009,6 +2708,15 @@ mod tests {
         // Attempt itself is closed with outcome=expired.
         assert_eq!(c.attempts.len(), 1);
         assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Expired);
+
+        // DESIGN.md §6 attempt_expired payload: {at, prior_lease_expires_at}.
+        // Pin both spec keys present, the old `lease_expires_at` and code-only
+        // `session_id` extras absent, and no other keys leak in.
+        let v = read_event_payload(&s, "x", "attempt_expired");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["at", "prior_lease_expires_at"]);
     }
 
     #[test]
@@ -2048,24 +2756,49 @@ mod tests {
     }
 
     #[test]
+    fn claim_unmet_deps_preserve_input_order() {
+        // Pin the contract: `UnmetDeps`'s Vec follows the capsule's
+        // depends_on order, even when SQLite is free to return rows in
+        // any order. Regression-guards the json_each + ORDER BY j.key
+        // refactor.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        make_capsule(&mut s, "c", "src/c");
+        let mut child = new_capsule_args("child", "src/child");
+        // Deliberate non-alphabetical input order to detect any sorting drift.
+        child.depends_on = vec!["c".into(), "a".into(), "b".into()];
+        s.create_capsule(child).unwrap();
+
+        let err = s.claim(claim_req("child", "sess1")).unwrap_err();
+        match err {
+            StoreError::UnmetDeps(_, deps) => assert_eq!(deps, vec!["c", "a", "b"]),
+            other => panic!("expected UnmetDeps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_unmet_deps_includes_missing_ids() {
+        // A dep id that does not resolve to any capsule must be reported as
+        // unmet (matches the prior `Option<String> ⇒ None` branch).
+        let mut s = tmp_store();
+        let mut child = new_capsule_args("child", "src/child");
+        child.depends_on = vec!["ghost".into()];
+        s.create_capsule(child).unwrap();
+        let err = s.claim(claim_req("child", "sess1")).unwrap_err();
+        match err {
+            StoreError::UnmetDeps(_, deps) => assert_eq!(deps, vec!["ghost"]),
+            other => panic!("expected UnmetDeps, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn list_filter_available_excludes_unmet_deps() {
         let mut s = tmp_store();
         make_capsule(&mut s, "dep", "src/dep");
-        s.create_capsule(NewCapsule {
-            id: "child".into(),
-            title: "t".into(),
-            description: "d".into(),
-            acceptance: Acceptance {
-                run: "true".into(),
-                expect_exit: capsule_core::ExpectExit::Code(0),
-                cwd: None,
-                timeout_sec: None,
-            },
-            scope_prefixes: vec![CanonicalPath::new("src/child").unwrap()],
-            base_ref: "main".into(),
-            depends_on: vec!["dep".into()],
-        })
-        .unwrap();
+        let mut child = new_capsule_args("child", "src/child");
+        child.depends_on = vec!["dep".into()];
+        s.create_capsule(child).unwrap();
 
         let avail = s
             .list_capsules(ListFilter {
@@ -2076,6 +2809,42 @@ mod tests {
         let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
         // `dep` is planned with no deps → eligible. `child` deps unmet → excluded.
         assert_eq!(ids, vec!["dep"]);
+    }
+
+    #[test]
+    fn list_filter_status_pins_bound_arm() {
+        // Pin the `WHERE status = ?1` SQL arm of list_capsules. The other
+        // list_filter_* tests use `..Default::default()` which leaves
+        // `status` as `None` and exercises only the unbound arm.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "p1", "src/p1");
+        make_capsule(&mut s, "p2", "src/p2");
+        // Move p1 to abandoned via a claim+abandon round-trip; p2 stays planned.
+        s.claim(claim_req("p1", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "p1".into(),
+            session_id: "sess1".into(),
+            reason: "test".into(),
+        })
+        .unwrap();
+
+        let planned = s
+            .list_capsules(ListFilter {
+                status: Some(Status::Planned),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = planned.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["p2"]);
+
+        let abandoned = s
+            .list_capsules(ListFilter {
+                status: Some(Status::Abandoned),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = abandoned.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["p1"]);
     }
 
     #[test]
@@ -2097,20 +2866,7 @@ mod tests {
     fn create_rejects_invalid_id() {
         let mut s = tmp_store();
         let err = s
-            .create_capsule(NewCapsule {
-                id: "bad/id".into(),
-                title: "t".into(),
-                description: "d".into(),
-                acceptance: Acceptance {
-                    run: "true".into(),
-                    expect_exit: capsule_core::ExpectExit::Code(0),
-                    cwd: None,
-                    timeout_sec: None,
-                },
-                scope_prefixes: vec![CanonicalPath::new("a").unwrap()],
-                base_ref: "main".into(),
-                depends_on: vec![],
-            })
+            .create_capsule(new_capsule_args("bad/id", "a"))
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidId(_, _)));
     }
@@ -2118,20 +2874,7 @@ mod tests {
     #[test]
     fn duplicate_id_rejected() {
         let mut s = tmp_store();
-        let nc = NewCapsule {
-            id: "x".into(),
-            title: "t".into(),
-            description: "d".into(),
-            acceptance: Acceptance {
-                run: "true".into(),
-                expect_exit: capsule_core::ExpectExit::Code(0),
-                cwd: None,
-                timeout_sec: None,
-            },
-            scope_prefixes: vec![CanonicalPath::new("a").unwrap()],
-            base_ref: "main".into(),
-            depends_on: vec![],
-        };
+        let nc = new_capsule_args("x", "a");
         s.create_capsule(nc.clone()).unwrap();
         let err = s.create_capsule(nc).unwrap_err();
         assert!(matches!(err, StoreError::DuplicateId(_)));
@@ -2236,7 +2979,7 @@ mod tests {
             capsule_id: "x".into(),
             title: Some("new title".into()),
             description: Some("new desc".into()),
-            acceptance: Some(new_acc.clone()),
+            acceptance: Some(new_acc),
             scope_prefixes: Some(vec![CanonicalPath::new("webapp/src").unwrap()]),
             base_ref: Some("develop".into()),
         })
@@ -2535,22 +3278,19 @@ mod tests {
         (dir, bare, work, verified_sha)
     }
 
-    fn land_setup_capsule(s: &mut Store, id: &str) {
-        s.create_capsule(NewCapsule {
-            id: id.into(),
-            title: "t".into(),
-            description: "d".into(),
-            acceptance: Acceptance {
-                run: "true".into(),
-                expect_exit: capsule_core::ExpectExit::Code(0),
-                cwd: None,
-                timeout_sec: None,
-            },
-            scope_prefixes: vec![CanonicalPath::new("feature.txt").unwrap()],
-            base_ref: "main".into(),
-            depends_on: vec![],
+    /// Standard "exit 0" attest used by every land/reconcile/force test.
+    /// Returns the ack so callers can assert on it; current callers ignore it.
+    fn attest_pass(s: &mut Store, id: &str, verified_sha: &str) -> AttestAck {
+        s.attest(AttestRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            verified_sha: verified_sha.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
         })
-        .unwrap();
+        .unwrap()
     }
 
     #[test]
@@ -2558,18 +3298,9 @@ mod tests {
         let id = "land1";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
 
         let ack = s
             .land(LandRequest {
@@ -2577,7 +3308,7 @@ mod tests {
                 session_id: "sess1".into(),
                 lander: "test-lander".into(),
                 remote: bare.to_str().unwrap().into(),
-                repo_dir: work.clone(),
+                repo_dir: work,
             })
             .unwrap();
 
@@ -2587,7 +3318,9 @@ mod tests {
                 assert!(landing.advanced_base_ref);
                 assert_eq!(landing.witness_branch, format!("capsule-witness/{id}/a1"));
             }
-            other => panic!("expected Landed, got {other:?}"),
+            other @ (LandOutcome::BaseRefMoved | LandOutcome::WitnessOidMismatch) => {
+                panic!("expected Landed, got {other:?}")
+            }
         }
 
         // Bare repo should now have main at verified_sha + the witness branch.
@@ -2615,18 +3348,9 @@ mod tests {
         let id = "land2";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
         s.land(LandRequest {
             capsule_id: id.into(),
             session_id: "sess1".into(),
@@ -2636,17 +3360,24 @@ mod tests {
         })
         .unwrap();
 
-        // Second land — capsule is now `landed`, so we expect NotClaimable.
+        // Second land — capsule is now `landed`, so we expect WrongStatus.
         let err = s
             .land(LandRequest {
                 capsule_id: id.into(),
                 session_id: "sess1".into(),
                 lander: "test-lander".into(),
                 remote: bare.to_str().unwrap().into(),
-                repo_dir: work.clone(),
+                repo_dir: work,
             })
             .unwrap_err();
-        assert!(matches!(err, StoreError::NotClaimable(_, "landed")));
+        assert!(matches!(
+            err,
+            StoreError::WrongStatus {
+                op: "land",
+                current_status: "landed",
+                ..
+            }
+        ));
     }
 
     // ---- reconciler / force-unfreeze tests ----
@@ -2656,7 +3387,7 @@ mod tests {
     /// of band, leaving status=accepted with pending_land set.
     #[allow(clippy::too_many_arguments)]
     fn simulate_land_crash(
-        s: &mut Store,
+        s: &Store,
         id: &str,
         verified_sha: &str,
         prior_base_sha: &str,
@@ -2692,7 +3423,6 @@ mod tests {
                 "main",
                 &pending.witness_branch,
                 verified_sha,
-                prior_base_sha,
             )
             .unwrap();
             assert!(matches!(
@@ -2732,20 +3462,11 @@ mod tests {
         let id = "rec1";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
-        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, true, None);
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, true, None);
 
         let outcome = s
             .reconcile(ReconcileRequest {
@@ -2759,6 +3480,20 @@ mod tests {
         assert!(c.landing.is_some());
         assert!(c.pending_land.is_none());
         assert_eq!(c.landing.as_ref().unwrap().landed_by, "reconciler");
+
+        // DESIGN.md §6 reconciler_ran: {decision, witness_remote_state}.
+        // Pin emission + payload shape for the Landed outcome.
+        let v = read_event_payload(&s, id, "reconciler_ran");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["decision", "witness_remote_state"]);
+        assert_eq!(v["decision"], "landed");
+        assert_eq!(v["witness_remote_state"]["state"], "at_verified_sha");
+        // Pin sha presence so audit rows stay self-contained without
+        // requiring readers to re-join PendingLand to learn what the
+        // observed witness sha was.
+        assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
     #[test]
@@ -2767,20 +3502,11 @@ mod tests {
         let id = "rec2";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
-        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, false, None);
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
 
         let outcome = s
             .reconcile(ReconcileRequest {
@@ -2792,6 +3518,28 @@ mod tests {
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Accepted);
         assert!(c.pending_land.is_none());
+
+        // DESIGN.md §6 pending_land_cleared payload: {reason, by}. Pin shape
+        // so non-spec extras (like `stderr`) cannot creep back in. Also pin
+        // payload.by == event.actor so the two cannot silently drift apart —
+        // `by` is duplicate of the row column per DESIGN, but only useful if
+        // it stays consistent.
+        let (payload, actor): (String, String) = s
+            .conn
+            .query_row(
+                "SELECT payload_json, actor FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_cleared'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let v: json::Value = json::from_str(&payload).unwrap();
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["by", "reason"]);
+        assert_eq!(v["reason"], "witness_absent");
+        assert_eq!(v["by"], actor);
     }
 
     #[test]
@@ -2800,18 +3548,9 @@ mod tests {
         let id = "rec3";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
         // Push a *different* commit at the witness ref.
         std::fs::write(work.join("noise.txt"), "noise\n").unwrap();
@@ -2819,7 +3558,7 @@ mod tests {
         git(&work, &["commit", "-m", "noise"]);
         let other_sha = git(&work, &["rev-parse", "HEAD"]);
         simulate_land_crash(
-            &mut s,
+            &s,
             id,
             &verified_sha,
             &prior,
@@ -2839,6 +3578,58 @@ mod tests {
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Abandoned);
         assert!(c.pending_land.is_none());
+
+        // DESIGN.md §6 operational_incident payload: {kind, detail}.
+        // Pin the wrapper shape — pre-fix code emitted flat
+        // {kind, witness_branch, expected_sha, found_sha, by}.
+        let v = read_event_payload(&s, id, "operational_incident");
+        assert_eq!(v["kind"], "witness_oid_mismatch");
+        let detail = v.get("detail").expect("missing detail wrapper");
+        assert!(detail.is_object(), "detail must be a JSON object");
+        assert!(detail.get("witness_branch").is_some());
+        assert!(detail.get("expected_sha").is_some());
+        assert_eq!(detail["found_sha"], other_sha);
+        // Old flat keys must not return at top level.
+        assert!(v.get("witness_branch").is_none());
+        assert!(v.get("found_sha").is_none());
+    }
+
+    #[test]
+    fn force_unfreeze_on_non_frozen_capsule_audits_operator_action() {
+        // Operator invokes force-unfreeze on a capsule with no pending_land.
+        // Returns NotFrozen but still emits force_unfreeze_invoked so the
+        // audit log captures the attempt. snapshot=null in the payload.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let outcome = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: "x".into(),
+                remote: "/dev/null".into(),
+                operator: "operator-jane".into(),
+                reason: "thought it was stuck".into(),
+                lander_confirmed_dead: true,
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::NotFrozen);
+
+        let v = read_event_payload(&s, "x", "force_unfreeze_invoked");
+        assert_eq!(v["operator"], "operator-jane");
+        assert_eq!(v["reason"], "thought it was stuck");
+        assert_eq!(v["post_action_outcome"], "not_frozen");
+        assert!(v["snapshot"].is_null(), "snapshot must be null when nothing was frozen");
+
+        // No reconciler_ran for the no-op reconcile path (reconciler scope is
+        // gated on pending_land != null per DESIGN §7.1.2).
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'reconciler_ran'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -2850,10 +3641,11 @@ mod tests {
                 capsule_id: "x".into(),
                 remote: "/dev/null".into(),
                 operator: "op".into(),
+                reason: "test".into(),
                 lander_confirmed_dead: false,
             })
             .unwrap_err();
-        assert!(matches!(err, StoreError::LandOtherFailure(_)));
+        assert!(matches!(err, StoreError::ForceUnfreezeNotConfirmed));
     }
 
     #[test]
@@ -2861,26 +3653,18 @@ mod tests {
         let id = "force1";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
-        land_setup_capsule(&mut s, id);
+        make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
-        s.attest(AttestRequest {
-            capsule_id: id.into(),
-            session_id: "sess1".into(),
-            verified_sha: verified_sha.clone(),
-            command: "true".into(),
-            exit_code: capsule_core::ExitCode::Code(0),
-            duration_ms: 1,
-            log_ref: "file:///dev/null".into(),
-        })
-        .unwrap();
+        attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
-        simulate_land_crash(&mut s, id, &verified_sha, &prior, &bare, &work, true, None);
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, true, None);
 
         let outcome = s
             .force_unfreeze(ForceUnfreezeRequest {
                 capsule_id: id.into(),
                 remote: bare.to_str().unwrap().into(),
                 operator: "operator-jane".into(),
+                reason: "lander pid 12345 unresponsive >30m".into(),
                 lander_confirmed_dead: true,
             })
             .unwrap();
@@ -2888,5 +3672,32 @@ mod tests {
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Landed);
         assert_eq!(c.landing.as_ref().unwrap().landed_by, "operator-jane");
+
+        // DESIGN.md §6 force_unfreeze_invoked payload:
+        // {operator, reason, snapshot, post_action_outcome}.
+        let (payload, actor): (String, String) = s
+            .conn
+            .query_row(
+                "SELECT payload_json, actor FROM event
+                 WHERE capsule_id = ?1 AND kind = 'force_unfreeze_invoked'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let v: json::Value = json::from_str(&payload).unwrap();
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["operator", "post_action_outcome", "reason", "snapshot"]
+        );
+        assert_eq!(v["operator"], "operator-jane");
+        assert_eq!(v["operator"], actor); // actor row column carries the same id
+        assert_eq!(v["reason"], "lander pid 12345 unresponsive >30m");
+        assert_eq!(v["post_action_outcome"], "landed");
+        // snapshot is the parsed PendingLand JSON — pin a key the operator
+        // would actually reference when investigating.
+        assert!(v["snapshot"]["witness_branch"].is_string());
     }
 }

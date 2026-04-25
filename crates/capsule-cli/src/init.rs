@@ -131,9 +131,8 @@ fn maybe_update_gitignore(
     if no_gitignore {
         return Ok((None, Some("--no-gitignore".to_string())));
     }
-    let worktree = match worktree {
-        Some(w) => w,
-        None => return Ok((None, Some("not inside a git worktree".to_string()))),
+    let Some(worktree) = worktree else {
+        return Ok((None, Some("not inside a git worktree".to_string())));
     };
 
     // Canonicalize both sides so symlink-y tmpdirs (e.g. `/var/...` → `/private/var/...` on
@@ -243,7 +242,7 @@ mod tests {
         let store = tmp.path().join(".capsule");
 
         let _ = run_at(tmp.path(), store.clone(), false).unwrap();
-        let r2 = run_at(tmp.path(), store.clone(), false).unwrap();
+        let r2 = run_at(tmp.path(), store, false).unwrap();
 
         assert!(r2.gitignore_updated.is_none());
         assert_eq!(r2.gitignore_skipped.as_deref(), Some("already present"));
@@ -258,7 +257,7 @@ mod tests {
         git_init(tmp.path());
         let store = tmp.path().join(".capsule");
 
-        let r = run_at(tmp.path(), store.clone(), true).unwrap();
+        let r = run_at(tmp.path(), store, true).unwrap();
 
         assert!(r.gitignore_updated.is_none());
         assert_eq!(r.gitignore_skipped.as_deref(), Some("--no-gitignore"));
@@ -293,7 +292,7 @@ mod tests {
         git_init(tmp.path());
         let store = tmp.path().join("work/my-capsule");
 
-        let r = run_at(tmp.path(), store.clone(), false).unwrap();
+        let r = run_at(tmp.path(), store, false).unwrap();
 
         assert!(r.gitignore_updated.is_some());
         let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();

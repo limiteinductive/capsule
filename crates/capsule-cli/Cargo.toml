@@ -23,6 +23,7 @@ time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

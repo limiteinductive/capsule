@@ -39,7 +39,7 @@ Store tests shell out to real `git`, so `git` must be on PATH. They're hermetic 
 ## Architecture — the load-bearing parts
 
 ### Store is the single writer, SQLite is the log
-`capsule-store::Store` is the only thing that mutates capsule state. Every state transition is one DB transaction; crash-safety comes from the transaction boundary. The schema (v1, `crates/capsule-store/src/schema.rs`) denormalizes the aggregate: `capsule` row carries `acceptance_json`, `scope_json`, `verification_json`, `pending_land_json`, `landing_json` inline; `attempt` rows are normalized; `event` is the append-only audit log. Migrations are linearly numbered — add a new entry to `MIGRATIONS`, bump `SCHEMA_VERSION`.
+`capsule-store::Store` is the only thing that mutates capsule state. Every state transition is one DB transaction; crash-safety comes from the transaction boundary. The schema (v1, `crates/capsule-store/src/schema.rs`) denormalizes the aggregate: `capsule` row carries `acceptance_json`, `scope_json`, `verification_json`, `pending_land_json`, `landing_json` inline; `attempt` rows are normalized; `event` is the append-only audit log. Migrations are linearly numbered — append a new entry to `MIGRATIONS`; `SCHEMA_VERSION` is derived from `MIGRATIONS.len()` and tracks automatically.
 
 WAL + `foreign_keys=ON` + `synchronous=NORMAL` are set in `Store::open`.
 

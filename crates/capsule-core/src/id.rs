@@ -19,6 +19,8 @@ pub enum IdError {
     EdgeDot,
     #[error("capsule id contains '..'")]
     DoubleDot,
+    #[error("capsule id ends with '.lock' (forbidden in git ref components)")]
+    LockSuffix,
 }
 
 pub fn validate(id: &str) -> Result<(), IdError> {
@@ -33,6 +35,13 @@ pub fn validate(id: &str) -> Result<(), IdError> {
     }
     if id.contains("..") {
         return Err(IdError::DoubleDot);
+    }
+    // Git ref-name rule: no slash-separated component may end with ".lock".
+    // Capsule id is one such component (`refs/heads/capsules/<id>/a<N>`), so
+    // a `.lock` suffix here would surface as an opaque push failure at land
+    // time. Reject up-front. Verified with `git check-ref-format`.
+    if id.ends_with(".lock") {
+        return Err(IdError::LockSuffix);
     }
     for (i, b) in id.bytes().enumerate() {
         let ok = b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.';
@@ -85,5 +94,25 @@ mod tests {
     #[test]
     fn unicode_rejected() {
         assert!(matches!(validate("café"), Err(IdError::InvalidChar(_))));
+    }
+
+    #[test]
+    fn lock_suffix_rejected() {
+        // Verified: `git check-ref-format refs/heads/capsules/foo.lock/a1`
+        // exits non-zero (per-component .lock-suffix is forbidden).
+        assert_eq!(validate("foo.lock"), Err(IdError::LockSuffix));
+        assert_eq!(validate("a.lock"), Err(IdError::LockSuffix));
+    }
+
+    #[test]
+    fn locks_plural_ok() {
+        // Only the exact ".lock" suffix is banned; ".locks" is fine.
+        validate("foo.locks").unwrap();
+    }
+
+    #[test]
+    fn lock_substring_in_middle_ok() {
+        // `.lock` only matters at the end of the component.
+        validate("foo.lock.bar").unwrap();
     }
 }

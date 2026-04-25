@@ -35,15 +35,24 @@ pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    if s.trim().is_empty() {
-        return Ok(ZERO_OID.to_string());
+    parse_ls_remote_stdout(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure parser/validator for `git ls-remote --heads` stdout. Empty stdout →
+/// `ZERO_OID`; otherwise the first whitespace-delimited token must be a valid
+/// 40-char lowercase hex sha. Validated at the wire boundary so garbage here
+/// (e.g. a corrupt remote response) cannot flow into Store::land's
+/// `pre_push_base_sha` and silently corrupt the §7.1.2 dance.
+fn parse_ls_remote_stdout(stdout: &str) -> Result<String> {
+    match stdout.split_whitespace().next() {
+        None => Ok(ZERO_OID.to_string()),
+        Some(sha) => {
+            capsule_core::sha::validate(sha).map_err(|e| {
+                GitError::Parse(format!("ls-remote returned non-sha token {sha:?}: {e}"))
+            })?;
+            Ok(sha.to_string())
+        }
     }
-    let sha = s
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| GitError::Parse(s.to_string()))?;
-    Ok(sha.to_string())
 }
 
 /// Outcome of an atomic multi-ref land push (DESIGN.md §7.1.2 step 3).
@@ -51,7 +60,10 @@ pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
 pub enum LandOutcome {
     /// Push accepted; `base_ref` advanced (or was created from ZERO_OID),
     /// witness branch created or already at verified_sha.
-    Advanced { base_ref_created: bool, witness_created: bool },
+    Advanced {
+        base_ref_created: bool,
+        witness_created: bool,
+    },
     /// Both refs already at verified_sha — fully idempotent re-run.
     NoOp,
     /// Witness ref existed at a different sha than expected null.
@@ -78,16 +90,15 @@ pub enum LandOutcome {
 /// must have `verified_sha` in its object database (typically the lander's
 /// clone of the remote, which has fetched/received the worker's commits).
 ///
-/// The `expected_prior_base_sha` argument is informational — it lets the
-/// caller compute `Landing.advanced_base_ref`. The atomic push uses git's
-/// own FF check on `base_ref`, not the `expected_prior_base_sha`.
+/// Note: the atomic push uses git's own FF check on `base_ref`, so the
+/// `prior_base_sha` is not needed here — the caller already records it in
+/// `PendingLand` and uses it later to compute `Landing.advanced_base_ref`.
 pub fn land_push(
     repo_dir: &std::path::Path,
     remote: &str,
     base_ref: &str,
     witness_branch: &str,
     verified_sha: &str,
-    _expected_prior_base_sha: &str,
 ) -> Result<LandOutcome> {
     let force_with_lease = format!("--force-with-lease=refs/heads/{witness_branch}:");
     let base_refspec = format!("{verified_sha}:refs/heads/{base_ref}");
@@ -112,43 +123,44 @@ pub fn land_push(
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let code = out.status.code().unwrap_or(-1);
 
-    if out.status.success() {
-        // Parse porcelain output. Lines beginning with status flags:
-        //   ' ' fast-forward, '+' forced, '-' deleted, '*' new, '!' rejected, '=' up to date
-        // We expect two ref lines (base + witness).
-        let mut base_created = false;
-        let mut witness_created = false;
-        let mut any_change = false;
-        for line in stdout.lines() {
-            // porcelain format:  "<flag> <from>:<to>  <summary>"
-            // lines start with one of " +-*!=" (then space)
-            if line.starts_with("To ") || line.is_empty() {
-                continue;
-            }
-            let flag = line.chars().next().unwrap_or(' ');
-            // identify which ref this line is about
-            let is_base = line.contains(&format!("refs/heads/{base_ref}"))
-                && !line.contains("witness");
-            let is_witness = line.contains(witness_branch);
-            match flag {
-                '*' => {
-                    any_change = true;
-                    if is_base {
-                        base_created = true;
-                    } else if is_witness {
-                        witness_created = true;
-                    }
-                }
-                ' ' | '+' => {
-                    any_change = true;
-                }
-                '=' => {
-                    // up-to-date — no change for this ref
-                }
-                _ => {}
-            }
-        }
-        if any_change {
+    classify_push(
+        &stdout,
+        &stderr,
+        out.status.success(),
+        code,
+        base_ref,
+        witness_branch,
+    )
+}
+
+/// Classify a `git push --atomic --porcelain --force-with-lease` invocation
+/// from its stdout/stderr/status. Pure function; testable.
+///
+/// Porcelain ref-line format: `<flag>\t<src>:<dst>\t<summary>` with flag ∈
+/// `[ +-*!=]`. CRITICAL: with `--porcelain`, git emits `[rejected] (stale
+/// info)` and `[rejected] (fetch first)` on **stdout**, not stderr — stderr
+/// only carries the bare "failed to push some refs" line plus user hints. So
+/// failure classification must read stdout. Witness `(stale info)` always
+/// outranks base non-FF, since a witness OID mismatch is a §3.1 protection
+/// leak (operational incident) while a non-FF base is benign caller-rebase.
+fn classify_push(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    code: i32,
+    base_ref: &str,
+    witness_branch: &str,
+) -> Result<LandOutcome> {
+    let base_dst = format!("refs/heads/{base_ref}");
+    let witness_dst = format!("refs/heads/{witness_branch}");
+    let lines: Vec<RefLine<'_>> = stdout.lines().filter_map(parse_ref_line).collect();
+    let witness = lines.iter().find(|l| l.dst == witness_dst);
+    let base = lines.iter().find(|l| l.dst == base_dst);
+
+    if success {
+        let (base_created, base_changed) = ref_change(base);
+        let (witness_created, witness_changed) = ref_change(witness);
+        if base_changed || witness_changed {
             Ok(LandOutcome::Advanced {
                 base_ref_created: base_created,
                 witness_created,
@@ -157,9 +169,18 @@ pub fn land_push(
             Ok(LandOutcome::NoOp)
         }
     } else {
-        // Distinguish witness lease failure from non-FF base.
-        // git surfaces lease failure as "stale info" and non-FF as "non-fast-forward"
-        // or "fetch first" / "rejected" depending on version.
+        // Witness `(stale info)` ALWAYS wins — protection leak per DESIGN §3.1.
+        if rejected_with(witness, "stale info") {
+            return Ok(LandOutcome::WitnessOidMismatch);
+        }
+        // Then base non-FF.
+        if rejected_with(base, "fetch first")
+            || rejected_with(base, "non-fast-forward")
+            || rejected_with(base, "non-fast forward")
+        {
+            return Ok(LandOutcome::BaseRefMoved);
+        }
+        // Fallback to stderr scan for older git or unparsed cases.
         if stderr.contains("stale info") {
             Ok(LandOutcome::WitnessOidMismatch)
         } else if stderr.contains("non-fast-forward")
@@ -168,11 +189,50 @@ pub fn land_push(
         {
             Ok(LandOutcome::BaseRefMoved)
         } else if code != 0 {
-            Ok(LandOutcome::OtherFailure { stderr })
+            Ok(LandOutcome::OtherFailure {
+                stderr: stderr.to_string(),
+            })
         } else {
-            Err(GitError::Failed { code, stderr })
+            Err(GitError::Failed {
+                code,
+                stderr: stderr.to_string(),
+            })
         }
     }
+}
+
+#[derive(Debug)]
+struct RefLine<'a> {
+    flag: char,
+    dst: &'a str,
+    summary: &'a str,
+}
+
+fn parse_ref_line(line: &str) -> Option<RefLine<'_>> {
+    if line.is_empty() || line.starts_with("To ") || line.starts_with("Done") {
+        return None;
+    }
+    // `<flag>\t<src>:<dst>\t<summary>` — porcelain uses TAB separators.
+    let mut parts = line.splitn(3, '\t');
+    let flag_field = parts.next()?;
+    let refspec = parts.next()?;
+    let summary = parts.next().unwrap_or("");
+    let flag = flag_field.chars().next()?;
+    let dst = refspec.split_once(':').map_or(refspec, |(_, d)| d);
+    Some(RefLine { flag, dst, summary })
+}
+
+/// (created, changed). `*` = new ref, `' '` = FF, `'+'` = forced update.
+fn ref_change(line: Option<&RefLine<'_>>) -> (bool, bool) {
+    match line.map(|l| l.flag) {
+        Some('*') => (true, true),
+        Some(' ' | '+') => (false, true),
+        _ => (false, false),
+    }
+}
+
+fn rejected_with(line: Option<&RefLine<'_>>, needle: &str) -> bool {
+    line.is_some_and(|l| l.flag == '!' && l.summary.contains(needle))
 }
 
 #[cfg(test)]
@@ -184,5 +244,142 @@ mod tests {
         // Smoke test against a clearly-bogus remote — git will fail or return empty.
         // We only assert the API shape (ZERO_OID len = 40).
         assert_eq!(ZERO_OID.len(), 40);
+    }
+
+    #[test]
+    fn parse_ls_remote_empty_returns_zero_oid() {
+        assert_eq!(parse_ls_remote_stdout("").unwrap(), ZERO_OID);
+        assert_eq!(parse_ls_remote_stdout("   \n\t").unwrap(), ZERO_OID);
+    }
+
+    #[test]
+    fn parse_ls_remote_valid_sha() {
+        let stdout = "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n";
+        assert_eq!(
+            parse_ls_remote_stdout(stdout).unwrap(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_rejects_non_sha_token() {
+        // E.g. a misconfigured proxy injected an HTML error page or git emitted
+        // a warning before the sha. Garbage must surface as Parse, not flow on.
+        let stdout = "not-a-sha\trefs/heads/main\n";
+        // Non-target arm names every other `GitError` variant explicitly so a
+        // future variant added to `GitError` forces compile-time review here
+        // (mirrors the iter 109 fix on `ExitCode` in capsule-core::model).
+        match parse_ls_remote_stdout(stdout) {
+            Err(GitError::Parse(msg)) => assert!(msg.contains("not-a-sha"), "msg: {msg}"),
+            other @ (Ok(_) | Err(GitError::Io(_)) | Err(GitError::Failed { .. })) => {
+                panic!("expected Parse error, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_ls_remote_rejects_uppercase_sha() {
+        let stdout = "0123456789ABCDEF0123456789abcdef01234567\trefs/heads/main\n";
+        assert!(matches!(
+            parse_ls_remote_stdout(stdout),
+            Err(GitError::Parse(_))
+        ));
+    }
+
+    // Empirical transcripts captured from `git push --porcelain` against a
+    // real remote (git 2.x). Tab-separated, as porcelain emits.
+    const STALE_INFO_STDOUT: &str = "To /tmp/remote.git\n!\trefs/heads/witness:refs/heads/witness\t[rejected] (stale info)\nDone\n";
+    const STALE_INFO_STDERR: &str = "error: failed to push some refs to '/tmp/remote.git'\n";
+    const FETCH_FIRST_STDOUT: &str =
+        "To /tmp/remote.git\n!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n";
+    const FETCH_FIRST_STDERR: &str = "error: failed to push some refs to '/tmp/remote.git'\nhint: Updates were rejected ...\n";
+    const ADVANCED_STDOUT: &str =
+        "To /tmp/remote.git\n \trefs/heads/x:refs/heads/main\t<sha>..<sha>\n*\trefs/heads/x:refs/heads/capsule-witness/foo/a1\t[new branch]\nDone\n";
+    const NOOP_STDOUT: &str = "To /tmp/remote.git\n=\trefs/heads/x:refs/heads/main\t[up to date]\n=\trefs/heads/x:refs/heads/capsule-witness/foo/a1\t[up to date]\nDone\n";
+
+    #[test]
+    fn classifies_witness_stale_info_from_stdout() {
+        let r = classify_push(
+            STALE_INFO_STDOUT,
+            STALE_INFO_STDERR,
+            false,
+            1,
+            "main",
+            "witness",
+        )
+        .unwrap();
+        assert_eq!(r, LandOutcome::WitnessOidMismatch);
+    }
+
+    #[test]
+    fn classifies_base_non_ff_from_stdout() {
+        let r = classify_push(
+            FETCH_FIRST_STDOUT,
+            FETCH_FIRST_STDERR,
+            false,
+            1,
+            "main",
+            "capsule-witness/foo/a1",
+        )
+        .unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
+    #[test]
+    fn witness_stale_outranks_base_non_ff() {
+        // Synthesized: with --atomic, a witness stale-info would still appear
+        // even when base also failed. Witness wins (protection leak).
+        let stdout = "To /tmp/remote.git\n\
+            !\tHEAD:refs/heads/main\t[rejected] (fetch first)\n\
+            !\trefs/heads/w:refs/heads/capsule-witness/foo/a1\t[rejected] (stale info)\n\
+            Done\n";
+        let r = classify_push(stdout, "", false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::WitnessOidMismatch);
+    }
+
+    #[test]
+    fn classifies_advanced() {
+        let r = classify_push(
+            ADVANCED_STDOUT,
+            "",
+            true,
+            0,
+            "main",
+            "capsule-witness/foo/a1",
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            LandOutcome::Advanced {
+                base_ref_created: false,
+                witness_created: true,
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_noop() {
+        let r = classify_push(NOOP_STDOUT, "", true, 0, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::NoOp);
+    }
+
+    #[test]
+    fn other_failure_when_unrecognized() {
+        let r = classify_push(
+            "To /tmp/remote.git\nDone\n",
+            "fatal: unable to access 'https://...': could not resolve host\n",
+            false,
+            128,
+            "main",
+            "w",
+        )
+        .unwrap();
+        match r {
+            LandOutcome::OtherFailure { stderr } => assert!(stderr.contains("resolve host")),
+            other @ (LandOutcome::Advanced { .. }
+            | LandOutcome::NoOp
+            | LandOutcome::WitnessOidMismatch
+            | LandOutcome::BaseRefMoved) => panic!("expected OtherFailure, got {other:?}"),
+        }
     }
 }

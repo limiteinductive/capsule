@@ -4,13 +4,15 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
-    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
-    HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
+    self, AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest,
+    ForceUnfreezeRequest, HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
+    Store,
 };
 use clap::{Parser, Subcommand};
 use time::format_description::well_known::Rfc3339;
 
 mod init;
+mod worktree;
 
 #[derive(Parser)]
 #[command(
@@ -139,9 +141,25 @@ struct WorkArgs {
     capsule_id: String,
     #[arg(long, env = "CAPSULE_SESSION")]
     session: String,
+    /// Working-tree isolation mode. `worktree` materializes a per-attempt git
+    /// worktree on the attempt branch and chdirs the child into it. After
+    /// `--isolate=worktree` starts the worktree, run `git sparse-checkout set
+    /// <prefixes>` inside it to minimize the on-disk read scope.
+    #[arg(long, value_enum, default_value_t = IsolateMode::None)]
+    isolate: IsolateMode,
+    /// Override worktree path. Default: `<capsule_dir>/worktrees/<id>-a<N>`.
+    /// Only meaningful with `--isolate=worktree`.
+    #[arg(long = "worktree-dir")]
+    worktree_dir: Option<PathBuf>,
     /// Command + args after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     cmd: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum IsolateMode {
+    None,
+    Worktree,
 }
 
 #[derive(clap::Args)]
@@ -173,7 +191,9 @@ struct AttestArgs {
     verified_sha: String,
     #[arg(long)]
     command: String,
-    /// Either an integer or the literal string "timeout".
+    /// Either an integer exit code or a sentinel string (e.g. "timeout",
+    /// "killed:SIGKILL"). Anything that does not parse as `i32` is treated
+    /// as a sentinel verbatim (DESIGN §5).
     #[arg(long = "exit-code")]
     exit_code: String,
     #[arg(long = "duration-ms")]
@@ -215,6 +235,9 @@ struct ForceUnfreezeArgs {
     /// Operator identity, audited on every emitted incident event.
     #[arg(long)]
     operator: String,
+    /// Free-text justification — recorded in `force_unfreeze_invoked`.
+    #[arg(long)]
+    reason: String,
     /// Operator MUST confirm the lander is dead/unresponsive.
     #[arg(long = "lander-confirmed-dead")]
     lander_confirmed_dead: bool,
@@ -257,14 +280,17 @@ struct ListArgs {
 }
 
 fn parse_status_arg(s: &str) -> std::result::Result<Status, String> {
-    match s {
-        "planned" => Ok(Status::Planned),
-        "active" => Ok(Status::Active),
-        "accepted" => Ok(Status::Accepted),
-        "landed" => Ok(Status::Landed),
-        "abandoned" => Ok(Status::Abandoned),
-        other => Err(format!("unknown status: {other}")),
-    }
+    Status::from_wire(s).ok_or_else(|| format!("unknown status: {s}"))
+}
+
+/// Canonicalize a CLI path arg, formatting errors uniformly across flags.
+fn parse_canonical_path(flag: &str, s: &str) -> Result<CanonicalPath> {
+    CanonicalPath::new(s).map_err(|e| anyhow::anyhow!("invalid --{flag} {s:?}: {e}"))
+}
+
+/// Canonicalize repeated `--scope` args (used by `create` and `amend`).
+fn canonicalize_scope_args(scope: &[String]) -> Result<Vec<CanonicalPath>> {
+    scope.iter().map(|s| parse_canonical_path("scope", s)).collect()
 }
 
 fn store_dir(arg: Option<PathBuf>) -> PathBuf {
@@ -274,6 +300,29 @@ fn store_dir(arg: Option<PathBuf>) -> PathBuf {
 fn open_store(dir: &Path) -> Result<Store> {
     let db = dir.join("state.db");
     Store::open(&db).with_context(|| format!("opening store at {}", db.display()))
+}
+
+/// Stdout for fire-and-forget mutations that succeed silently — `--json` emits
+/// `{"ok": true}` (the agent-facing ack), bare invocation prints `label`.
+/// Used by abandon/add-dep/remove-dep where the only useful signal is "no
+/// error"; the actual state change is observable via `status` / `list`.
+fn print_ok(json: bool, label: &str) {
+    if json {
+        println!("{}", serde_json::json!({"ok": true}));
+    } else {
+        println!("{label}");
+    }
+}
+
+/// Pretty-print a serde value to stdout. Used for `--json` arms where the
+/// payload is a typed core/store struct (capsules, attempts, outcomes, init
+/// reports); the inline-`json!` arms (`print_ok`, reclaim's `{reclaimed}`)
+/// stay literal because their shape is already trivial. Centralizes the
+/// `to_string_pretty` call so a future switch to a stable formatter (e.g.
+/// canonical key ordering for diffability) is one edit.
+fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -290,11 +339,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Init(args) => {
             let report = init::run(init::InitOpts {
-                dir: dir.clone(),
+                dir,
                 no_gitignore: args.no_gitignore,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!("initialized capsule store at {}", report.dir.display());
                 if let Some(p) = &report.gitignore_updated {
@@ -315,13 +364,7 @@ fn main() -> Result<()> {
         }
         Cmd::Create(args) => {
             let mut store = open_store(&dir)?;
-            let scope_prefixes = args
-                .scope
-                .iter()
-                .map(|s| {
-                    CanonicalPath::new(s).map_err(|e| anyhow::anyhow!("invalid --scope {s:?}: {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let scope_prefixes = canonicalize_scope_args(&args.scope)?;
 
             let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -341,12 +384,12 @@ fn main() -> Result<()> {
             })?;
 
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&capsule)?);
+                print_json(&capsule)?;
             } else {
                 println!(
                     "{}\t{}\t{}",
                     capsule.id,
-                    status_str(capsule.status),
+                    capsule.status.as_wire_str(),
                     capsule.title
                 );
             }
@@ -356,10 +399,7 @@ fn main() -> Result<()> {
             let scope_overlaps = args
                 .scope_overlaps
                 .as_deref()
-                .map(|s| {
-                    CanonicalPath::new(s)
-                        .map_err(|e| anyhow::anyhow!("invalid --scope-overlaps {s:?}: {e}"))
-                })
+                .map(|s| parse_canonical_path("scope-overlaps", s))
                 .transpose()?;
             let capsules = store.list_capsules(ListFilter {
                 status: args.status,
@@ -368,28 +408,15 @@ fn main() -> Result<()> {
             })?;
             if cli.json {
                 if args.full {
-                    println!("{}", serde_json::to_string_pretty(&capsules)?);
+                    print_json(&capsules)?;
                 } else {
                     let summaries: Vec<CapsuleSummary<'_>> =
                         capsules.iter().map(CapsuleSummary::from).collect();
-                    println!("{}", serde_json::to_string_pretty(&summaries)?);
+                    print_json(&summaries)?;
                 }
             } else {
-                for c in capsules {
-                    let scope = c
-                        .scope_prefixes
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    println!(
-                        "{}\t{}\t{}\t[{}]\t{}",
-                        c.id,
-                        status_str(c.status),
-                        c.base_ref,
-                        scope,
-                        c.title
-                    );
+                for c in &capsules {
+                    print_capsule_summary_line(c);
                 }
             }
         }
@@ -417,15 +444,7 @@ fn main() -> Result<()> {
             let scope_prefixes = if args.scope.is_empty() {
                 None
             } else {
-                let v = args
-                    .scope
-                    .iter()
-                    .map(|s| {
-                        CanonicalPath::new(s)
-                            .map_err(|e| anyhow::anyhow!("invalid --scope {s:?}: {e}"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Some(v)
+                Some(canonicalize_scope_args(&args.scope)?)
             };
             let capsule = store.amend(AmendRequest {
                 capsule_id: args.capsule_id,
@@ -436,7 +455,7 @@ fn main() -> Result<()> {
                 base_ref: args.base_ref,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&capsule)?);
+                print_json(&capsule)?;
             } else {
                 println!("amended\t{}\t{}", capsule.id, capsule.title);
             }
@@ -445,7 +464,7 @@ fn main() -> Result<()> {
             let store = open_store(&dir)?;
             let capsule = store.get_capsule(&args.capsule_id)?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&capsule)?);
+                print_json(&capsule)?;
             } else {
                 print_status(&capsule);
             }
@@ -460,7 +479,7 @@ fn main() -> Result<()> {
                 base_sha: args.base_sha,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&attempt)?);
+                print_json(&attempt)?;
             } else {
                 println!(
                     "claimed\tsession={}\tattempt={}\tbranch={}\twitness={}\tlease_expires={}",
@@ -487,33 +506,29 @@ fn main() -> Result<()> {
                 session_id: args.session,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&ack)?);
+                print_json(&ack)?;
             } else {
                 println!("lease_expires={}", fmt_ts(ack.lease_expires_at));
             }
         }
         Cmd::Attest(args) => {
             let mut store = open_store(&dir)?;
-            let exit_code = match args.exit_code.parse::<i32>() {
-                Ok(n) => capsule_core::ExitCode::Code(n),
-                Err(_) => capsule_core::ExitCode::Sentinel(args.exit_code),
-            };
             let ack = store.attest(AttestRequest {
                 capsule_id: args.capsule_id,
                 session_id: args.session,
                 verified_sha: args.verified_sha,
                 command: args.command,
-                exit_code,
+                exit_code: args.exit_code.into(),
                 duration_ms: args.duration_ms,
                 log_ref: args.log_ref,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&ack)?);
+                print_json(&ack)?;
             } else {
                 println!(
                     "attested\taccepted={}\tstatus={}",
                     ack.accepted,
-                    status_str(ack.new_status)
+                    ack.new_status.as_wire_str()
                 );
             }
         }
@@ -531,7 +546,7 @@ fn main() -> Result<()> {
                 repo_dir,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&ack)?);
+                print_json(&ack)?;
             } else {
                 match &ack.outcome {
                     capsule_store::LandOutcome::Landed { landing } => println!(
@@ -554,11 +569,7 @@ fn main() -> Result<()> {
                 session_id: args.session,
                 reason: args.reason,
             })?;
-            if cli.json {
-                println!("{}", serde_json::json!({"ok": true}));
-            } else {
-                println!("abandoned");
-            }
+            print_ok(cli.json, "abandoned");
         }
         Cmd::Reclaim(args) => {
             let mut store = open_store(&dir)?;
@@ -577,11 +588,7 @@ fn main() -> Result<()> {
                 capsule_id: args.capsule_id,
                 depends_on: args.depends_on,
             })?;
-            if cli.json {
-                println!("{}", serde_json::json!({"ok": true}));
-            } else {
-                println!("dep-added");
-            }
+            print_ok(cli.json, "dep-added");
         }
         Cmd::RemoveDep(args) => {
             let mut store = open_store(&dir)?;
@@ -589,11 +596,7 @@ fn main() -> Result<()> {
                 capsule_id: args.capsule_id,
                 depends_on: args.depends_on,
             })?;
-            if cli.json {
-                println!("{}", serde_json::json!({"ok": true}));
-            } else {
-                println!("dep-removed");
-            }
+            print_ok(cli.json, "dep-removed");
         }
         Cmd::Reconcile(args) => {
             let mut store = open_store(&dir)?;
@@ -602,9 +605,9 @@ fn main() -> Result<()> {
                 remote: args.remote,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                print_json(&outcome.as_wire_str())?;
             } else {
-                println!("reconcile\toutcome={outcome:?}");
+                println!("reconcile\toutcome={}", outcome.as_wire_str());
             }
         }
         Cmd::ForceUnfreeze(args) => {
@@ -613,12 +616,13 @@ fn main() -> Result<()> {
                 capsule_id: args.capsule_id,
                 remote: args.remote,
                 operator: args.operator,
+                reason: args.reason,
                 lander_confirmed_dead: args.lander_confirmed_dead,
             })?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                print_json(&outcome.as_wire_str())?;
             } else {
-                println!("force-unfreeze\toutcome={outcome:?}");
+                println!("force-unfreeze\toutcome={}", outcome.as_wire_str());
             }
         }
         Cmd::DeployVerify => {
@@ -632,9 +636,11 @@ fn main() -> Result<()> {
 /// second SQLite connection (WAL makes same-process dual connections safe), and
 /// forward the child's exit code. No custom signal handlers — terminal signals
 /// reach the child through process-group propagation; the heartbeat thread
-/// stops on the `AtomicBool` after child exit.
+/// shuts down when the parent drops `stop_tx` (the `recv_timeout` returns
+/// `Disconnected` immediately).
 fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -642,15 +648,17 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     // Pre-flight: confirm active attempt exists for this session, read ttl.
     let pre = open_store(dir)?;
     let capsule = pre.get_capsule(&args.capsule_id)?;
-    let active_id = capsule
-        .active_attempt
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("capsule has no active attempt; run `capsule claim`"))?;
-    let attempt = capsule
-        .attempts
-        .iter()
-        .find(|a| &a.id == active_id)
-        .ok_or_else(|| anyhow::anyhow!("active_attempt not found in attempts"))?;
+    let attempt = capsule.active_attempt_record().ok_or_else(|| {
+        // Distinguish "no active attempt" (claimable) from "active_attempt
+        // points at a row that does not exist" (corrupt state). The latter
+        // is unreachable in well-formed state, but `claim` cannot repair it,
+        // so a "run claim" hint would be actively misleading.
+        if let Some(aid) = capsule.active_attempt {
+            anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
+        } else {
+            anyhow::anyhow!("capsule has no active attempt; run `capsule claim`")
+        }
+    })?;
     if attempt.lease.session_id != args.session {
         anyhow::bail!(
             "session mismatch: active attempt session is {}",
@@ -658,104 +666,180 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
         );
     }
     let ttl = attempt.lease.ttl_sec.max(3);
+    let attempt_branch = attempt.branch.clone();
+    let attempt_base_sha = attempt.base_sha.clone();
+    let attempt_num = attempt.id;
     drop(pre);
 
-    let stop = Arc::new(AtomicBool::new(false));
+    // Materialize worktree if requested. Held for the child's lifetime via
+    // `_isolate` (drops the runtime flock on scope exit).
+    let isolate_state = if args.isolate == IsolateMode::Worktree {
+        Some(worktree::setup(
+            dir,
+            &args.capsule_id,
+            &attempt_branch,
+            &attempt_base_sha,
+            attempt_num,
+            args.worktree_dir.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    // Heartbeat once before spawning the child: fails fast on already-expired
+    // or cross-session leases (worktree setup may have consumed TTL), and
+    // refreshes expiry so the first thread tick has full headroom.
+    {
+        let mut hb = open_store(dir)?;
+        hb.heartbeat(HeartbeatRequest {
+            capsule_id: args.capsule_id.clone(),
+            session_id: args.session.clone(),
+        })
+        .context("pre-spawn heartbeat (lease lost before child started)")?;
+    }
+
+    // Shutdown signaled by dropping `stop_tx` in the parent: the heartbeat
+    // thread's `recv_timeout` returns `Disconnected` immediately, eliminating
+    // the prior 200ms polling tick (and shaving up to that much off shutdown
+    // latency on child exit).
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    // F8: lease lost mid-run → flag set, child not killed, parent exits non-zero.
+    // Stays an `AtomicBool` because the parent reads it after `join`; the channel
+    // only carries the shutdown edge.
+    let lease_lost = Arc::new(AtomicBool::new(false));
     let dir_hb = dir.to_path_buf();
     let capsule_id_hb = args.capsule_id.clone();
     let session_hb = args.session.clone();
-    let stop_hb = Arc::clone(&stop);
+    let lease_lost_hb = Arc::clone(&lease_lost);
 
     let hb_thread = thread::spawn(move || -> Result<()> {
         let mut store = open_store(&dir_hb)?;
-        let interval = Duration::from_secs(ttl / 3);
-        while !stop_hb.load(Ordering::SeqCst) {
+        // Clamp at 1s. With ttl < 3, naive `ttl/3` is 0 → the recv_timeout
+        // returns immediately → heartbeat fires in a tight loop hammering the
+        // DB. Tests use tiny TTLs (e.g. ttl=1) and an agent fronting `capsule
+        // work` may pass any value; defend at the consumer rather than
+        // rejecting at claim.
+        let interval = Duration::from_secs((ttl / 3).max(1));
+        loop {
             // Sleep first so we don't double-heartbeat immediately after claim.
-            let mut slept = Duration::ZERO;
-            let tick = Duration::from_millis(200);
-            while slept < interval && !stop_hb.load(Ordering::SeqCst) {
-                thread::sleep(tick);
-                slept += tick;
+            // Drop of the sender is the canonical shutdown signal; no site
+            // sends, so `Ok(())` is unreachable by construction. If a future
+            // contributor adds `stop_tx.send(())`, the `unreachable!` will
+            // surface that the control contract changed.
+            match stop_rx.recv_timeout(interval) {
+                Ok(()) => unreachable!(
+                    "heartbeat shutdown is signaled by dropping the sender, not sending"
+                ),
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(RecvTimeoutError::Timeout) => {}
             }
-            if stop_hb.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Err(e) = store.heartbeat(HeartbeatRequest {
+            match store.heartbeat(HeartbeatRequest {
                 capsule_id: capsule_id_hb.clone(),
                 session_id: session_hb.clone(),
             }) {
-                eprintln!("capsule work: heartbeat failed: {e}");
-                break;
+                Ok(_) => {}
+                Err(
+                    e @ (capsule_store::StoreError::CrossSession
+                    | capsule_store::StoreError::LeaseExpired(_)),
+                ) => {
+                    eprintln!(
+                        "capsule work: lease lost ({e}); attest will fail. Finish or cancel \
+                         the child and re-claim."
+                    );
+                    lease_lost_hb.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("capsule work: heartbeat failed: {e}");
+                    return Ok(());
+                }
             }
         }
-        Ok(())
     });
 
     let (first, rest) = args.cmd.split_first().expect("clap required >= 1 arg");
-    let status = std::process::Command::new(first).args(rest).status();
+    let mut command = std::process::Command::new(first);
+    command.args(rest);
+    if let Some(s) = &isolate_state {
+        command
+            .current_dir(&s.worktree_path)
+            .env("CAPSULE_DIR", &s.canonical_capsule_dir)
+            .env("CAPSULE_ID", &args.capsule_id)
+            .env("CAPSULE_SESSION", &args.session);
+    }
+    let status = command.status();
 
-    stop.store(true, Ordering::SeqCst);
+    drop(stop_tx); // signals heartbeat thread to wake immediately
     let _ = hb_thread.join();
+    drop(isolate_state); // release runtime flock
 
     match status {
-        Ok(s) => Ok(s.code().unwrap_or_else(|| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                s.signal().map(|sig| 128 + sig).unwrap_or(1)
+        Ok(s) => {
+            let code = s.code().unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    s.signal().map_or(1, |sig| 128 + sig)
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            });
+            // F8: if lease was lost mid-run, force non-zero even on child success.
+            if lease_lost.load(Ordering::SeqCst) && code == 0 {
+                Ok(1)
+            } else {
+                Ok(code)
             }
-            #[cfg(not(unix))]
-            {
-                1
-            }
-        })),
+        }
         Err(e) => Err(anyhow::anyhow!("spawning {first}: {e}")),
     }
 }
 
-fn print_status(c: &Capsule) {
-    let scope = c
-        .scope_prefixes
+fn join_scope(prefixes: &[CanonicalPath]) -> String {
+    prefixes
         .iter()
-        .map(|p| p.as_str())
+        .map(CanonicalPath::as_str)
         .collect::<Vec<_>>()
-        .join(",");
+        .join(",")
+}
+
+/// One-line tab-separated summary used by both `list` (one row per capsule)
+/// and `status` (header for the per-capsule detail block). Textual sibling
+/// of `CapsuleSummary` (the `--json` shape); the two formats serve different
+/// consumers and are not lockstep, but the field set deliberately matches
+/// — keep them in sync when adding columns.
+fn print_capsule_summary_line(c: &Capsule) {
     println!(
         "{}\t{}\t{}\t[{}]\t{}",
         c.id,
-        status_str(c.status),
+        c.status.as_wire_str(),
         c.base_ref,
-        scope,
+        join_scope(&c.scope_prefixes),
         c.title
     );
+}
+
+fn print_status(c: &Capsule) {
+    print_capsule_summary_line(c);
     if !c.depends_on.is_empty() {
         println!("  depends_on: {}", c.depends_on.join(", "));
     }
     for (i, a) in c.attempts.iter().enumerate() {
-        let outcome = match a.outcome {
-            capsule_core::AttemptOutcome::InFlight => "in_flight",
-            capsule_core::AttemptOutcome::Released => "released",
-            capsule_core::AttemptOutcome::Expired => "expired",
-            capsule_core::AttemptOutcome::Abandoned => "abandoned",
-            capsule_core::AttemptOutcome::Landed => "landed",
-        };
         println!(
             "  attempt {}: {}\tsession={}\tbranch={}\tlease_expires={}",
             i + 1,
-            outcome,
+            a.outcome.as_wire_str(),
             a.lease.session_id,
             a.branch,
             fmt_ts(a.lease.expires_at)
         );
     }
     if let Some(v) = &c.verification {
-        let exit = match &v.exit_code {
-            capsule_core::ExitCode::Code(n) => n.to_string(),
-            capsule_core::ExitCode::Sentinel(s) => s.clone(),
-        };
         println!(
             "  verification: exit={}\tverified_sha={}\tdur={}ms",
-            exit, v.verified_sha, v.duration_ms
+            v.exit_code, v.verified_sha, v.duration_ms
         );
     }
     if let Some(p) = &c.pending_land {
@@ -774,16 +858,6 @@ fn print_status(c: &Capsule) {
             fmt_ts(l.at),
             l.advanced_base_ref
         );
-    }
-}
-
-fn status_str(s: Status) -> &'static str {
-    match s {
-        Status::Planned => "planned",
-        Status::Active => "active",
-        Status::Accepted => "accepted",
-        Status::Landed => "landed",
-        Status::Abandoned => "abandoned",
     }
 }
 

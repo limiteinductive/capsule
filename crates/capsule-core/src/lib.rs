@@ -5,5 +5,6 @@
 pub mod id;
 pub mod model;
 pub mod path;
+pub mod sha;
 
 pub use model::*;

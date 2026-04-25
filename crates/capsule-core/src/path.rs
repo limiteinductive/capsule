@@ -33,7 +33,7 @@ impl CanonicalPath {
             return Err(CanonicalizeError::Absolute);
         }
         let parts: Vec<String> = input
-            .split(|c| c == '/' || c == '\\')
+            .split(['/', '\\'])
             .filter(|p| !p.is_empty() && *p != ".")
             .map(|p| p.nfc().collect::<String>())
             .collect();
@@ -50,13 +50,24 @@ impl CanonicalPath {
         &self.0
     }
 
+    /// True iff any pair `(a, b)` in `lhs × rhs` overlaps. Empty inputs return
+    /// false (consistent with `iter().any` on an empty iterator).
+    pub fn any_overlap(lhs: &[Self], rhs: &[Self]) -> bool {
+        lhs.iter().any(|a| rhs.iter().any(|b| a.overlaps(b)))
+    }
+
     /// Path-component-wise prefix overlap. `src/foo` overlaps `src/foo/bar.rs`
     /// (one is a prefix of the other when split on `/`), but not `src/foobar`.
     pub fn overlaps(&self, other: &Self) -> bool {
-        let a: Vec<&str> = self.0.split('/').collect();
-        let b: Vec<&str> = other.0.split('/').collect();
-        let n = a.len().min(b.len());
-        a[..n] == b[..n]
+        // Allocation-free: zip stops at the shorter iterator, so we compare
+        // exactly min(len(a), len(b)) components — equivalent to the explicit
+        // prefix check but without the intermediate `Vec`s. Called per
+        // (in-flight × claimed) scope pair on every `claim`, so the saving
+        // matters at scale.
+        self.0
+            .split('/')
+            .zip(other.0.split('/'))
+            .all(|(a, b)| a == b)
     }
 }
 
@@ -109,6 +120,41 @@ mod tests {
     #[test]
     fn case_sensitive() {
         assert!(!cp("src/Foo").overlaps(&cp("src/foo")));
+    }
+
+    #[test]
+    fn overlap_self_with_self() {
+        // Identity: a path always overlaps itself, regardless of depth.
+        assert!(cp("a").overlaps(&cp("a")));
+        assert!(cp("a/b/c").overlaps(&cp("a/b/c")));
+    }
+
+    #[test]
+    fn overlap_disjoint_at_first_component() {
+        assert!(!cp("a/b").overlaps(&cp("c/d")));
+    }
+
+    #[test]
+    fn any_overlap_detects_cross_list_match() {
+        // Match exists across the lists at non-aligned indices: a[0] overlaps b[1].
+        let a = vec![cp("src/foo"), cp("docs")];
+        let b = vec![cp("tests"), cp("src/foo/bar.rs")];
+        assert!(CanonicalPath::any_overlap(&a, &b));
+    }
+
+    #[test]
+    fn any_overlap_empty_scopes_never_overlap() {
+        let empty: Vec<CanonicalPath> = vec![];
+        assert!(!CanonicalPath::any_overlap(&empty, &empty));
+        assert!(!CanonicalPath::any_overlap(&[cp("src")], &empty));
+        assert!(!CanonicalPath::any_overlap(&empty, &[cp("src")]));
+    }
+
+    #[test]
+    fn any_overlap_disjoint_lists() {
+        let a = vec![cp("src"), cp("docs")];
+        let b = vec![cp("tests"), cp("README.md")];
+        assert!(!CanonicalPath::any_overlap(&a, &b));
     }
 
     #[test]

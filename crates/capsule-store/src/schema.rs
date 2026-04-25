@@ -3,7 +3,10 @@
 
 use rusqlite::{Connection, Result as SqlResult};
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Derived from `MIGRATIONS` so the two cannot drift. Bumping the schema is a
+/// one-step change: append a new entry to `MIGRATIONS` and `SCHEMA_VERSION`
+/// follows.
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 const MIGRATIONS: &[&str] = &[
     // v1: initial schema. Capsule is the aggregate root; attempts and events
@@ -11,7 +14,7 @@ const MIGRATIONS: &[&str] = &[
     // (only one of each per capsule lifetime — verification is locked at
     // accepted, landing is terminal). PendingLand is inline JSON for the
     // crash-recovery transactional invariant in DESIGN.md §7.1.2.
-    r#"
+    r"
     CREATE TABLE IF NOT EXISTS schema_version (
         version INTEGER PRIMARY KEY
     );
@@ -68,7 +71,7 @@ const MIGRATIONS: &[&str] = &[
     );
 
     CREATE INDEX IF NOT EXISTS idx_event_capsule ON event(capsule_id, rowid);
-    "#,
+    ",
 ];
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
@@ -96,4 +99,157 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_records_current_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        let recorded: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn ensure_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        ensure(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, SCHEMA_VERSION);
+    }
+
+    /// Read the live CREATE TABLE SQL for `table_name` from `sqlite_schema`.
+    /// Relies on SQLite preserving the migration's CREATE TABLE statement
+    /// verbatim (modulo comments and whitespace). Used by the CHECK-list
+    /// pin tests as the source of truth.
+    fn live_table_sql(conn: &Connection, table_name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+            [table_name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Extract the single-quoted literal set of a `CHECK (<col> IN (...))`
+    /// clause from a CREATE TABLE statement. Looks for `CHECK (<col> IN`
+    /// and parses literals between the next `(` and matching `)`. Tight
+    /// enough for the v1 schema's hand-written CHECK clauses; extending to
+    /// a CHECK with parens or escaped quotes inside literals would require
+    /// a real parser.
+    fn extract_check_in_list(sql: &str, column: &str) -> std::collections::HashSet<String> {
+        let needle = format!("CHECK ({column} IN");
+        let (_, after) = sql
+            .split_once(&needle)
+            .unwrap_or_else(|| panic!("CHECK ({column} IN ...) not found in:\n{sql}"));
+        let open = after.find('(').expect("IN list open paren");
+        let close = open
+            + after[open..]
+                .find(')')
+                .expect("IN list close paren");
+        after[open + 1..close]
+            .split(',')
+            .map(|tok| {
+                let t = tok.trim();
+                // Each token must be a single-quoted literal; refuse to
+                // silently strip absent quotes so a bare identifier in the
+                // CHECK list (e.g. a typo dropping the quotes) fails loudly
+                // instead of round-tripping through the same trim_matches
+                // as the legitimate quoted form.
+                assert!(
+                    t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2,
+                    "expected single-quoted SQL literal in CHECK IN list, got {t:?}",
+                );
+                t[1..t.len() - 1].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn capsule_status_check_set_equals_status_wire_set() {
+        // The `capsule.status` CHECK constraint enumerates wire strings as
+        // SQL literals (`'planned'`, `'active'`, ...). Pin BOTH directions:
+        // every `Status::as_wire_str` value appears in the CHECK list AND
+        // the CHECK list contains no stale extras. A rename or new variant
+        // that lands without updating both sides would otherwise either
+        // ship a runtime INSERT failure (omission) or silently keep an
+        // accept-list entry that no Rust code emits (extra) — both are
+        // bugs, both are caught here.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        let sql = live_table_sql(&conn, "capsule");
+        let in_list = extract_check_in_list(&sql, "status");
+        let expected: std::collections::HashSet<String> = [
+            capsule_core::Status::Planned,
+            capsule_core::Status::Active,
+            capsule_core::Status::Accepted,
+            capsule_core::Status::Landed,
+            capsule_core::Status::Abandoned,
+        ]
+        .iter()
+        .map(|s| s.as_wire_str().to_string())
+        .collect();
+        assert_eq!(
+            in_list, expected,
+            "capsule.status CHECK list disagrees with Status::as_wire_str set",
+        );
+    }
+
+    #[test]
+    fn attempt_outcome_check_set_equals_outcome_wire_set() {
+        // Mirrors `capsule_status_check_set_equals_status_wire_set` for
+        // `attempt.outcome`.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        let sql = live_table_sql(&conn, "attempt");
+        let in_list = extract_check_in_list(&sql, "outcome");
+        let expected: std::collections::HashSet<String> = [
+            capsule_core::AttemptOutcome::InFlight,
+            capsule_core::AttemptOutcome::Released,
+            capsule_core::AttemptOutcome::Expired,
+            capsule_core::AttemptOutcome::Abandoned,
+            capsule_core::AttemptOutcome::Landed,
+        ]
+        .iter()
+        .map(|o| o.as_wire_str().to_string())
+        .collect();
+        assert_eq!(
+            in_list, expected,
+            "attempt.outcome CHECK list disagrees with AttemptOutcome::as_wire_str set",
+        );
+    }
+
+    #[test]
+    fn extract_check_in_list_parses_quoted_literals() {
+        // Pin the parser shape used by the two CHECK-set tests against
+        // realistic whitespace variations (`'a','b', 'c' ` — leading-space,
+        // no-space, trailing-space) so a future schema reformat doesn't
+        // silently break extraction.
+        let sql = "CREATE TABLE x (\n  c TEXT NOT NULL CHECK (c IN ('a','b', 'c' )),\n  d INT)";
+        let got = extract_check_in_list(sql, "c");
+        let want: std::collections::HashSet<String> =
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected single-quoted SQL literal")]
+    fn extract_check_in_list_rejects_unquoted_token() {
+        // Pin the contract: an IN-list element without enclosing quotes
+        // (e.g. a typo where someone wrote `bare` instead of `'bare'`)
+        // panics rather than silently round-tripping through the
+        // trim/strip path. Without this guard, a malformed CHECK could
+        // produce values that compare equal to the enum wire strings
+        // and pass the set-equality tests.
+        let sql = "CHECK (c IN ('a', bare, 'c'))";
+        let _ = extract_check_in_list(sql, "c");
+    }
 }
