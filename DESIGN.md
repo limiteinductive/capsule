@@ -157,6 +157,7 @@ Event {
 # v12: enumerated. Append-only audit log; never mutated.
 EventKind ∈ {
   capsule_created,                 # payload: {acceptance, scope_prefixes, base_ref, depends_on}
+  capsule_amended,                 # payload: {by, diff}                    (operator pre-claim metadata edit, §7.1.1)
   dependency_added,                # payload: {dep_id}
   dependency_removed,              # payload: {dep_id}
   attempt_claimed,                 # payload: {attempt_id, session_id, base_sha, lease}

@@ -193,7 +193,7 @@ impl Store {
             &capsule.id,
             None,
             "system",
-            "capsule_created",
+            EventKind::CapsuleCreated,
             &json::to_value(CreatedPayload {
                 acceptance: &capsule.acceptance,
                 scope_prefixes: &capsule.scope_prefixes,
@@ -301,7 +301,7 @@ impl Store {
             &capsule_id,
             None,
             "operator",
-            "capsule_amended",
+            EventKind::CapsuleAmended,
             &json::Value::Object(diff),
         )?;
         tx.commit()?;
@@ -525,7 +525,7 @@ impl Store {
             &req.capsule_id,
             Some(next_id),
             &req.session_id,
-            "attempt_claimed",
+            EventKind::AttemptClaimed,
             &claimed_payload,
         )?;
 
@@ -627,7 +627,7 @@ impl Store {
             &req.capsule_id,
             Some(aid),
             &req.session_id,
-            "attempt_attested",
+            EventKind::AttemptAttested,
             &event_payload,
         )?;
 
@@ -813,7 +813,7 @@ impl Store {
                 &req.capsule_id,
                 Some(aid),
                 &req.lander,
-                "pending_land_committed",
+                EventKind::PendingLandCommitted,
                 &pending_value,
             )?;
             tx.commit()?;
@@ -977,7 +977,7 @@ impl Store {
             &req.capsule_id,
             active_attempt,
             &req.session_id,
-            "capsule_abandoned",
+            EventKind::CapsuleAbandoned,
             &payload,
         )?;
         tx.commit()?;
@@ -1054,7 +1054,7 @@ impl Store {
             &now_str,
             &req.capsule_id,
             &new_json,
-            "dependency_added",
+            EventKind::DependencyAdded,
             &req.depends_on,
         )?;
         tx.commit()?;
@@ -1083,7 +1083,7 @@ impl Store {
             &now_str,
             &req.capsule_id,
             &new_json,
-            "dependency_removed",
+            EventKind::DependencyRemoved,
             &req.depends_on,
         )?;
         tx.commit()?;
@@ -1551,7 +1551,7 @@ fn emit_force_unfreeze_invoked(
         capsule_id,
         snapshot.map(|s| s.attempt_id as i64),
         operator,
-        "force_unfreeze_invoked",
+        EventKind::ForceUnfreezeInvoked,
         &payload,
     )
 }
@@ -1580,9 +1580,57 @@ fn emit_reconciler_ran(
         capsule_id,
         attempt_id,
         actor,
-        "reconciler_ran",
+        EventKind::ReconcilerRan,
         &payload,
     )
+}
+
+/// Wire-string vocabulary for `event.kind` (DESIGN.md §6). Closed enum so the
+/// canonical event kinds live in one place — a typo at a callsite (e.g.
+/// `"pendng_land_committed"`) would silently emit a kind no consumer expects.
+/// Mirrors `OperationalIncidentKind::as_wire_str` / `Status::as_wire_str`.
+///
+/// Covers every event kind currently emitted by the store. DESIGN §6 also
+/// forward-declares `attempt_heartbeat` (optional, high-volume) and
+/// `attempt_released` (worker-initiated release); neither is emitted today,
+/// so neither is a variant. Add the variant when the emit site lands.
+#[derive(Clone, Copy)]
+enum EventKind {
+    CapsuleCreated,
+    CapsuleAmended,
+    AttemptClaimed,
+    AttemptAttested,
+    AttemptExpired,
+    PendingLandCommitted,
+    PendingLandCleared,
+    CapsuleLanded,
+    CapsuleAbandoned,
+    DependencyAdded,
+    DependencyRemoved,
+    ForceUnfreezeInvoked,
+    ReconcilerRan,
+    OperationalIncident,
+}
+
+impl EventKind {
+    const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::CapsuleCreated => "capsule_created",
+            Self::CapsuleAmended => "capsule_amended",
+            Self::AttemptClaimed => "attempt_claimed",
+            Self::AttemptAttested => "attempt_attested",
+            Self::AttemptExpired => "attempt_expired",
+            Self::PendingLandCommitted => "pending_land_committed",
+            Self::PendingLandCleared => "pending_land_cleared",
+            Self::CapsuleLanded => "capsule_landed",
+            Self::CapsuleAbandoned => "capsule_abandoned",
+            Self::DependencyAdded => "dependency_added",
+            Self::DependencyRemoved => "dependency_removed",
+            Self::ForceUnfreezeInvoked => "force_unfreeze_invoked",
+            Self::ReconcilerRan => "reconciler_ran",
+            Self::OperationalIncident => "operational_incident",
+        }
+    }
 }
 
 /// Wire-string vocabulary for `operational_incident.kind` (DESIGN.md §6).
@@ -1629,7 +1677,7 @@ fn emit_operational_incident(
         capsule_id,
         attempt_id,
         actor,
-        "operational_incident",
+        EventKind::OperationalIncident,
         &payload,
     )
 }
@@ -1699,7 +1747,7 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
             &capsule_id,
             Some(attempt_id),
             "system",
-            "attempt_expired",
+            EventKind::AttemptExpired,
             &payload,
         )?;
     }
@@ -2044,7 +2092,7 @@ fn persist_dep_change(
     now_str: &str,
     capsule_id: &str,
     deps_json: &str,
-    event_kind: &str,
+    event_kind: EventKind,
     dep_id: &str,
 ) -> Result<()> {
     tx.execute(
@@ -2095,7 +2143,7 @@ fn finalize_landed(
         capsule_id,
         Some(attempt_id),
         &landing.landed_by,
-        "capsule_landed",
+        EventKind::CapsuleLanded,
         &landing_value,
     )
 }
@@ -2204,7 +2252,7 @@ fn clear_pending_land(
         capsule_id,
         attempt_id,
         by,
-        "pending_land_cleared",
+        EventKind::PendingLandCleared,
         &payload,
     )
 }
@@ -2229,14 +2277,14 @@ fn insert_event(
     capsule_id: &str,
     attempt_id: Option<i64>,
     actor: &str,
-    kind: &str,
+    kind: EventKind,
     payload: &json::Value,
 ) -> Result<()> {
     let payload_json = json::to_string(payload)?;
     tx.execute(
         "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![at, capsule_id, attempt_id, actor, kind, payload_json],
+        params![at, capsule_id, attempt_id, actor, kind.as_wire_str(), payload_json],
     )?;
     Ok(())
 }
@@ -2292,6 +2340,37 @@ mod tests {
         let path = dir.path().join("state.db");
         let _ = Store::open(&path).unwrap();
         let _ = Store::open(&path).unwrap();
+    }
+
+    #[test]
+    fn event_kind_wire_table_pinned() {
+        // Pin (variant, wire) for `EventKind::as_wire_str`. The strings are
+        // the audit-event vocabulary currently emitted by the store
+        // (subset of DESIGN §6; the spec also lists `attempt_heartbeat` /
+        // `attempt_released`, neither of which is emitted yet). External
+        // consumers — operators, agent runners, dashboards — key on exact
+        // spelling. A typo here ships unnoticed; centralizing in an enum
+        // makes call sites typo-proof and this test makes the wire format
+        // load-bearing. Mirrors `reconcile_outcome_wire_table_pinned`.
+        let cases = [
+            (EventKind::CapsuleCreated, "capsule_created"),
+            (EventKind::CapsuleAmended, "capsule_amended"),
+            (EventKind::AttemptClaimed, "attempt_claimed"),
+            (EventKind::AttemptAttested, "attempt_attested"),
+            (EventKind::AttemptExpired, "attempt_expired"),
+            (EventKind::PendingLandCommitted, "pending_land_committed"),
+            (EventKind::PendingLandCleared, "pending_land_cleared"),
+            (EventKind::CapsuleLanded, "capsule_landed"),
+            (EventKind::CapsuleAbandoned, "capsule_abandoned"),
+            (EventKind::DependencyAdded, "dependency_added"),
+            (EventKind::DependencyRemoved, "dependency_removed"),
+            (EventKind::ForceUnfreezeInvoked, "force_unfreeze_invoked"),
+            (EventKind::ReconcilerRan, "reconciler_ran"),
+            (EventKind::OperationalIncident, "operational_incident"),
+        ];
+        for (v, wire) in cases {
+            assert_eq!(v.as_wire_str(), wire);
+        }
     }
 
     #[test]
