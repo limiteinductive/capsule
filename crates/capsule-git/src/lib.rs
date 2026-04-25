@@ -21,6 +21,28 @@ pub type Result<T> = std::result::Result<T, GitError>;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
+/// Substrings of git's user-facing error messages that classify_push matches
+/// against to map a push failure to a `LandOutcome`. These are NOT git's own
+/// stable API — they're the canonical client's CLI output. Centralizing them
+/// here so the porcelain stdout branch and the stderr fallback don't drift
+/// independently when adapting to a new git version.
+mod git_reject {
+    /// Reported when `--force-with-lease=ref:` finds the ref non-empty
+    /// (the witness leak case — DESIGN §7.1.2 step 3 / §3.1).
+    pub const STALE_INFO: &str = "stale info";
+    /// Modern git: base_ref is not a fast-forward from verified_sha.
+    pub const FETCH_FIRST: &str = "fetch first";
+    /// Older git: same as FETCH_FIRST. Hyphenated form on stdout porcelain.
+    pub const NON_FAST_FORWARD: &str = "non-fast-forward";
+    /// Older git: same as FETCH_FIRST. Space form (`man git-push`).
+    /// Stdout-only: porcelain emits this; stderr aggregates with
+    /// `UPDATES_REJECTED` instead.
+    pub const NON_FAST_FORWARD_SPACE: &str = "non-fast forward";
+    /// Aggregate stderr line from `git push` when any ref was rejected;
+    /// stderr-only because porcelain emits per-ref reasons on stdout.
+    pub const UPDATES_REJECTED: &str = "Updates were rejected";
+}
+
 /// Read the current sha at `refs/heads/<branch>` on `remote`, or `ZERO_OID` if absent.
 /// Uses `git ls-remote --heads <remote> <branch>`.
 pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
@@ -170,22 +192,22 @@ fn classify_push(
         }
     } else {
         // Witness `(stale info)` ALWAYS wins — protection leak per DESIGN §3.1.
-        if rejected_with(witness, "stale info") {
+        if rejected_with(witness, git_reject::STALE_INFO) {
             return Ok(LandOutcome::WitnessOidMismatch);
         }
         // Then base non-FF.
-        if rejected_with(base, "fetch first")
-            || rejected_with(base, "non-fast-forward")
-            || rejected_with(base, "non-fast forward")
+        if rejected_with(base, git_reject::FETCH_FIRST)
+            || rejected_with(base, git_reject::NON_FAST_FORWARD)
+            || rejected_with(base, git_reject::NON_FAST_FORWARD_SPACE)
         {
             return Ok(LandOutcome::BaseRefMoved);
         }
         // Fallback to stderr scan for older git or unparsed cases.
-        if stderr.contains("stale info") {
+        if stderr.contains(git_reject::STALE_INFO) {
             Ok(LandOutcome::WitnessOidMismatch)
-        } else if stderr.contains("non-fast-forward")
-            || stderr.contains("fetch first")
-            || stderr.contains("Updates were rejected")
+        } else if stderr.contains(git_reject::NON_FAST_FORWARD)
+            || stderr.contains(git_reject::FETCH_FIRST)
+            || stderr.contains(git_reject::UPDATES_REJECTED)
         {
             Ok(LandOutcome::BaseRefMoved)
         } else if code != 0 {
