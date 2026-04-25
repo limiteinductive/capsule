@@ -190,36 +190,45 @@ fn classify_push(
         } else {
             Ok(LandOutcome::NoOp)
         }
+    } else if witness_protection_leak(witness) {
+        Ok(LandOutcome::WitnessOidMismatch)
+    } else if base_non_fast_forward(base) {
+        Ok(LandOutcome::BaseRefMoved)
     } else {
-        // Witness `(stale info)` ALWAYS wins — protection leak per DESIGN §3.1.
-        if rejected_with(witness, git_reject::STALE_INFO) {
-            return Ok(LandOutcome::WitnessOidMismatch);
-        }
-        // Then base non-FF.
-        if rejected_with(base, git_reject::FETCH_FIRST)
-            || rejected_with(base, git_reject::NON_FAST_FORWARD)
-            || rejected_with(base, git_reject::NON_FAST_FORWARD_SPACE)
-        {
-            return Ok(LandOutcome::BaseRefMoved);
-        }
-        // Fallback to stderr scan for older git or unparsed cases.
-        if stderr.contains(git_reject::STALE_INFO) {
-            Ok(LandOutcome::WitnessOidMismatch)
-        } else if stderr.contains(git_reject::NON_FAST_FORWARD)
-            || stderr.contains(git_reject::FETCH_FIRST)
-            || stderr.contains(git_reject::UPDATES_REJECTED)
-        {
-            Ok(LandOutcome::BaseRefMoved)
-        } else if code != 0 {
-            Ok(LandOutcome::OtherFailure {
-                stderr: stderr.to_string(),
-            })
-        } else {
-            Err(GitError::Failed {
-                code,
-                stderr: stderr.to_string(),
-            })
-        }
+        classify_failure_from_stderr(stderr, code)
+    }
+}
+
+fn witness_protection_leak(witness: Option<&RefLine<'_>>) -> bool {
+    rejected_with(witness, git_reject::STALE_INFO)
+}
+
+fn base_non_fast_forward(base: Option<&RefLine<'_>>) -> bool {
+    rejected_with(base, git_reject::FETCH_FIRST)
+        || rejected_with(base, git_reject::NON_FAST_FORWARD)
+        || rejected_with(base, git_reject::NON_FAST_FORWARD_SPACE)
+}
+
+/// Stderr-only fallback when porcelain stdout did not carry per-ref reasons
+/// (older git, unrecognized output). Same precedence as the stdout path:
+/// witness leak outranks base non-FF.
+fn classify_failure_from_stderr(stderr: &str, code: i32) -> Result<LandOutcome> {
+    if stderr.contains(git_reject::STALE_INFO) {
+        Ok(LandOutcome::WitnessOidMismatch)
+    } else if stderr.contains(git_reject::NON_FAST_FORWARD)
+        || stderr.contains(git_reject::FETCH_FIRST)
+        || stderr.contains(git_reject::UPDATES_REJECTED)
+    {
+        Ok(LandOutcome::BaseRefMoved)
+    } else if code != 0 {
+        Ok(LandOutcome::OtherFailure {
+            stderr: stderr.to_string(),
+        })
+    } else {
+        Err(GitError::Failed {
+            code,
+            stderr: stderr.to_string(),
+        })
     }
 }
 
@@ -230,11 +239,12 @@ struct RefLine<'a> {
     summary: &'a str,
 }
 
+/// Parse one porcelain line: `<flag>\t<src>:<dst>\t<summary>`. Header lines
+/// (`To <remote>`, `Done`) and blanks return None.
 fn parse_ref_line(line: &str) -> Option<RefLine<'_>> {
     if line.is_empty() || line.starts_with("To ") || line.starts_with("Done") {
         return None;
     }
-    // `<flag>\t<src>:<dst>\t<summary>` — porcelain uses TAB separators.
     let mut parts = line.splitn(3, '\t');
     let flag_field = parts.next()?;
     let refspec = parts.next()?;
