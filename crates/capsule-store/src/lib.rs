@@ -1499,15 +1499,29 @@ enum WitnessState {
     Different(String),
 }
 
+impl WitnessState {
+    /// Stable wire string for the `state` discriminant in the
+    /// `witness_remote_state` payload (DESIGN §6 `reconciler_ran`). Mirrors
+    /// `ReconcileOutcome::as_wire_str` — explicit `match` so a new variant
+    /// forces compile-time review of the wire format.
+    const fn state_wire_str(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::AtVerifiedSha(_) => "at_verified_sha",
+            Self::Different(_) => "different",
+        }
+    }
+}
+
 /// Stable JSON shape for `witness_remote_state` in the `reconciler_ran`
 /// event payload (DESIGN §6). Tagged so consumers can switch on `state`.
 fn witness_remote_state_json(s: &WitnessState) -> json::Value {
+    let state = s.state_wire_str();
     match s {
-        WitnessState::Absent => json::json!({ "state": "absent" }),
-        WitnessState::AtVerifiedSha(sha) => {
-            json::json!({ "state": "at_verified_sha", "sha": sha })
+        WitnessState::Absent => json::json!({ "state": state }),
+        WitnessState::AtVerifiedSha(sha) | WitnessState::Different(sha) => {
+            json::json!({ "state": state, "sha": sha })
         }
-        WitnessState::Different(sha) => json::json!({ "state": "different", "sha": sha }),
     }
 }
 
@@ -2334,6 +2348,36 @@ mod tests {
         for (v, wire) in cases {
             assert_eq!(v.as_wire_str(), wire);
         }
+    }
+
+    #[test]
+    fn witness_state_wire_table_pinned() {
+        // Pin (variant, wire) for `WitnessState::state_wire_str`. The strings
+        // surface as the `state` field of `witness_remote_state` in the
+        // `reconciler_ran` event payload (DESIGN §6) — operator dashboards
+        // and audit consumers key on these. Mirrors the
+        // `reconcile_outcome_wire_table_pinned` pattern.
+        let cases = [
+            (WitnessState::Absent, "absent"),
+            (WitnessState::AtVerifiedSha("dead".into()), "at_verified_sha"),
+            (WitnessState::Different("beef".into()), "different"),
+        ];
+        for (v, wire) in &cases {
+            assert_eq!(v.state_wire_str(), *wire);
+        }
+        // Pin payload shape too (sha field present iff state carries one).
+        assert_eq!(
+            witness_remote_state_json(&WitnessState::Absent),
+            json::json!({ "state": "absent" })
+        );
+        assert_eq!(
+            witness_remote_state_json(&WitnessState::AtVerifiedSha("aa".into())),
+            json::json!({ "state": "at_verified_sha", "sha": "aa" })
+        );
+        assert_eq!(
+            witness_remote_state_json(&WitnessState::Different("bb".into())),
+            json::json!({ "state": "different", "sha": "bb" })
+        );
     }
 
     #[test]
