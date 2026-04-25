@@ -123,6 +123,22 @@ impl StoreError {
             current_status: current.as_wire_str(),
         }
     }
+
+    /// Build a `Terminal` from a typed `Status`, snapping its wire form once.
+    /// Same rationale as `wrong_status`: the variant's `&'static str` field is
+    /// the public wire format, but every internal callsite should hand off a
+    /// typed `Status` so a future caller can't silently pass an unrelated
+    /// literal (`"frozen"`, `"done"`) that would compile but ship a bogus
+    /// error message.
+    fn terminal(capsule_id: CapsuleId, status: Status) -> Self {
+        Self::Terminal(capsule_id, status.as_wire_str())
+    }
+
+    /// Build a `NotAmendable` from a typed `Status`. See `terminal` for the
+    /// rationale; same discipline applied to amend's status guard.
+    fn not_amendable(capsule_id: CapsuleId, status: Status) -> Self {
+        Self::NotAmendable(capsule_id, status.as_wire_str())
+    }
 }
 
 /// Map `rusqlite::Error::QueryReturnedNoRows` to `StoreError::NotFound(id)`,
@@ -238,9 +254,6 @@ impl Store {
     /// contract is bound to any future `verified_sha` (DESIGN.md §5/§6), so
     /// only pre-claim mutation is safe. `None` fields are unchanged.
     pub fn amend(&mut self, req: AmendRequest) -> Result<Capsule> {
-        // Destructure the request up front so each Optional field is owned
-        // and can be moved (rather than cloned twice) into its SQL value
-        // and its diff entry below.
         let AmendRequest {
             capsule_id,
             title,
@@ -262,64 +275,44 @@ impl Store {
             .or_not_found(&capsule_id)?;
         let status = parse_status(&status_str);
         if status != Status::Planned {
-            return Err(StoreError::NotAmendable(capsule_id, status.as_wire_str()));
+            return Err(StoreError::not_amendable(capsule_id, status));
         }
 
-        let mut sets: Vec<String> = Vec::new();
-        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
-        let mut diff = json::Map::new();
-
-        // Placeholder index is always `vals.len() + 1` (one-based, matching
-        // what the just-pushed value will become). Centralized so the six
-        // call sites can't drift on the +1 bookkeeping.
-        let push_col = |sets: &mut Vec<String>,
-                        vals: &mut Vec<rusqlite::types::Value>,
-                        col: &str,
-                        val: rusqlite::types::Value| {
-            sets.push(format!("{col} = ?{}", vals.len() + 1));
-            vals.push(val);
-        };
-
+        let mut update = AmendUpdate::new();
         if let Some(title) = title {
-            push_col(&mut sets, &mut vals, "title", title.clone().into());
-            diff.insert("title".into(), json::Value::String(title));
+            update.set_string("title", "title", title);
         }
         if let Some(desc) = description {
-            push_col(&mut sets, &mut vals, "description", desc.clone().into());
-            diff.insert("description".into(), json::Value::String(desc));
+            update.set_string("description", "description", desc);
         }
         if let Some(acc) = acceptance {
-            // Build the diff Value directly from the typed struct via
-            // `to_value` instead of re-parsing the SQL JSON string with
-            // `from_str`. Keep the SQL bytes from `to_string` to avoid
-            // changing the stored representation.
-            push_col(&mut sets, &mut vals, "acceptance_json", json::to_string(&acc)?.into());
-            diff.insert("acceptance".into(), json::to_value(acc)?);
+            update.set_json("acceptance_json", "acceptance", &acc)?;
         }
         if let Some(scope) = scope_prefixes {
-            push_col(&mut sets, &mut vals, "scope_json", json::to_string(&scope)?.into());
-            diff.insert("scope_prefixes".into(), json::to_value(scope)?);
+            update.set_json("scope_json", "scope_prefixes", &scope)?;
         }
         if let Some(base_ref) = base_ref {
-            push_col(&mut sets, &mut vals, "base_ref", base_ref.clone().into());
-            diff.insert("base_ref".into(), json::Value::String(base_ref));
+            update.set_string("base_ref", "base_ref", base_ref);
         }
 
-        if sets.is_empty() {
+        if update.is_empty() {
             tx.commit()?;
             return self.get_capsule(&capsule_id);
         }
 
-        push_col(&mut sets, &mut vals, "updated_at", now_str.clone().into());
-        let where_idx = vals.len() + 1;
-        vals.push(capsule_id.clone().into());
+        update.bind_sql_only("updated_at", now_str.clone().into());
+        let where_idx = update.next_placeholder();
+        update.vals.push(capsule_id.clone().into());
         let sql = format!(
             "UPDATE capsule SET {} WHERE id = ?{}",
-            sets.join(", "),
+            update.sets.join(", "),
             where_idx
         );
-        let params_slice: Vec<&dyn rusqlite::ToSql> =
-            vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        let params_slice: Vec<&dyn rusqlite::ToSql> = update
+            .vals
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
         tx.execute(&sql, params_slice.as_slice())?;
 
         insert_event(
@@ -329,7 +322,7 @@ impl Store {
             None,
             actor::OPERATOR,
             EventKind::CapsuleAmended,
-            &json::Value::Object(diff),
+            &json::Value::Object(update.diff),
         )?;
         tx.commit()?;
         self.get_capsule(&capsule_id)
@@ -965,10 +958,7 @@ impl Store {
         }
         let status = parse_status(&status_str);
         if status.is_terminal() {
-            return Err(StoreError::Terminal(
-                req.capsule_id,
-                status.as_wire_str(),
-            ));
+            return Err(StoreError::terminal(req.capsule_id, status));
         }
 
         // If a lease is held, the abandoning session must own it.
@@ -1933,6 +1923,52 @@ struct CreatedPayload<'a> {
     scope_prefixes: &'a [CanonicalPath],
     base_ref: &'a str,
     depends_on: &'a [CapsuleId],
+}
+
+/// Builder for `Store::amend`'s parallel writes: each field set goes into
+/// the SQL UPDATE statement (`sets` + `vals`) and the audit-event diff
+/// (`diff`) in lockstep, so a partial update can't drift between SQL and
+/// event log.
+#[derive(Default)]
+struct AmendUpdate {
+    sets: Vec<String>,
+    vals: Vec<rusqlite::types::Value>,
+    diff: json::Map<String, json::Value>,
+}
+
+impl AmendUpdate {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    fn next_placeholder(&self) -> usize {
+        self.vals.len() + 1
+    }
+
+    fn bind_sql_only(&mut self, col: &str, val: rusqlite::types::Value) {
+        self.sets.push(format!("{col} = ?{}", self.next_placeholder()));
+        self.vals.push(val);
+    }
+
+    fn set_string(&mut self, col: &str, diff_key: &str, value: String) {
+        self.bind_sql_only(col, value.clone().into());
+        self.diff.insert(diff_key.into(), json::Value::String(value));
+    }
+
+    fn set_json<T: serde::Serialize>(
+        &mut self,
+        col: &str,
+        diff_key: &str,
+        value: &T,
+    ) -> Result<()> {
+        self.bind_sql_only(col, json::to_string(value)?.into());
+        self.diff.insert(diff_key.into(), json::to_value(value)?);
+        Ok(())
+    }
 }
 
 struct RowCapsule {
