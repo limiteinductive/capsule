@@ -60,6 +60,17 @@ impl Status {
             Self::Planned | Self::Active | Self::Accepted => false,
         }
     }
+
+    /// True iff a capsule in this status has a live lease bound to an
+    /// `active_attempt` (DESIGN.md §3.3). Heartbeat and other lease-window
+    /// operations gate on this. Same exhaustive-match discipline as
+    /// `is_terminal` — a new `Status` variant must be classified explicitly.
+    pub const fn holds_lease(self) -> bool {
+        match self {
+            Self::Active | Self::Accepted => true,
+            Self::Planned | Self::Landed | Self::Abandoned => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

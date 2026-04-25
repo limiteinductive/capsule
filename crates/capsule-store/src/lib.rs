@@ -660,6 +660,10 @@ impl Store {
 
     /// Heartbeat: refresh `lease.expires_at = now + lease.ttl_sec`. See DESIGN.md §3.3.
     /// TTL is fixed at claim time; heartbeat does not let the worker change it.
+    ///
+    /// `pending_land_json` is not read: §7.2 says heartbeats are not required
+    /// once a lander has frozen the capsule, and aren't rejected either — the
+    /// effective lease won't expire, so this becomes a benign no-op.
     pub fn heartbeat(&mut self, req: HeartbeatRequest) -> Result<HeartbeatAck> {
         use capsule_core::Lease;
 
@@ -667,10 +671,6 @@ impl Store {
 
         let tx = self.conn.transaction()?;
 
-        // pending_land_json intentionally not read: §7.2 says heartbeats are
-        // not required while pending_land != null, but we don't reject them
-        // either — they're a no-op against an effective lease that won't
-        // expire. So no need to branch on the freeze flag.
         let (status_str, active_attempt): (String, Option<i64>) = tx
             .query_row(
                 "SELECT status, active_attempt FROM capsule WHERE id = ?1",
@@ -679,31 +679,18 @@ impl Store {
             )
             .or_not_found(&req.capsule_id)?;
 
-        // Heartbeat is allowed during active OR accepted (lease retained, §3.3).
-        // Explicit match (not `matches!`) so adding a `Status` variant forces
-        // compile-time review of whether the lease window includes it — same
-        // exhaustive-classification discipline as `Status::is_terminal`.
         let status = parse_status(&status_str);
-        match status {
-            Status::Active | Status::Accepted => {}
-            Status::Planned | Status::Landed | Status::Abandoned => {
-                return Err(StoreError::wrong_status(
-                    req.capsule_id,
-                    StoreOp::Heartbeat,
-                    status,
-                ));
-            }
+        if !status.holds_lease() {
+            return Err(StoreError::wrong_status(
+                req.capsule_id,
+                StoreOp::Heartbeat,
+                status,
+            ));
         }
-        // Mirrors `attest`: status ∈ {active, accepted} ⇒ active_attempt is
-        // Some (DESIGN.md §3.3 invariant). None here ⇒ DB corruption, panic.
-        let aid = active_attempt.expect("active|accepted ⇒ active_attempt set");
+        let aid = active_attempt.expect("holds_lease ⇒ active_attempt set");
 
         let lease = load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
-        // Defense-in-depth: lease_json is not schema-enforced, so a corrupt or
-        // legacy row could carry a TTL outside i64::MAX or whose addition to
-        // `now` overflows OffsetDateTime. Surface the same clean error claim
-        // does instead of wrapping silently or panicking.
         let new_expires = checked_lease_expiry(now, lease.ttl_sec)?;
         let new_lease = Lease {
             expires_at: new_expires,
@@ -1990,9 +1977,9 @@ struct RowCapsule {
 
 impl RowCapsule {
     /// Single source of truth for the capsule SELECT — both `list_capsules`
-    /// (no WHERE) and `get_capsule` (`WHERE id = ?1`) start here. Drift between
-    /// the column list and `from_row`'s positional `r.get(N)` calls would
-    /// silently corrupt one of the two paths.
+    /// (no WHERE) and `get_capsule` (`WHERE id = ?1`) start here. `from_row`
+    /// reads columns by name (not position), so a future SELECT reorder
+    /// or insertion cannot silently shift one of the two paths.
     const SELECT_BASE: &'static str = "SELECT id, title, description, acceptance_json, scope_json, base_ref,
                 depends_on_json, status, active_attempt, verification_json,
                 pending_land_json, landing_json, created_at, updated_at
@@ -2000,20 +1987,20 @@ impl RowCapsule {
 
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            description: r.get(2)?,
-            acceptance_json: r.get(3)?,
-            scope_json: r.get(4)?,
-            base_ref: r.get(5)?,
-            depends_on_json: r.get(6)?,
-            status: r.get(7)?,
-            active_attempt: r.get(8)?,
-            verification_json: r.get(9)?,
-            pending_land_json: r.get(10)?,
-            landing_json: r.get(11)?,
-            created_at: r.get(12)?,
-            updated_at: r.get(13)?,
+            id: r.get("id")?,
+            title: r.get("title")?,
+            description: r.get("description")?,
+            acceptance_json: r.get("acceptance_json")?,
+            scope_json: r.get("scope_json")?,
+            base_ref: r.get("base_ref")?,
+            depends_on_json: r.get("depends_on_json")?,
+            status: r.get("status")?,
+            active_attempt: r.get("active_attempt")?,
+            verification_json: r.get("verification_json")?,
+            pending_land_json: r.get("pending_land_json")?,
+            landing_json: r.get("landing_json")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
         })
     }
 
