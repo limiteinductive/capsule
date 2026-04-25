@@ -1813,10 +1813,14 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
 
 fn exit_codes_match(expect: &capsule_core::ExpectExit, got: &capsule_core::ExitCode) -> bool {
     use capsule_core::{ExitCode, ExpectExit};
+    // Cross-shape mismatches enumerated explicitly (not `_ => false`) so a
+    // future variant added to either `ExpectExit` or `ExitCode` forces
+    // compile-time review here — same discipline as `Status::is_terminal`.
     match (expect, got) {
         (ExpectExit::Code(a), ExitCode::Code(b)) => a == b,
         (ExpectExit::Sentinel(a), ExitCode::Sentinel(b)) => a == b,
-        _ => false,
+        (ExpectExit::Code(_), ExitCode::Sentinel(_))
+        | (ExpectExit::Sentinel(_), ExitCode::Code(_)) => false,
     }
 }
 
@@ -2443,6 +2447,39 @@ mod tests {
 
     fn claim_req(id: &str, sess: &str) -> ClaimRequest {
         claim_req_with_ttl(id, sess, 300)
+    }
+
+    #[test]
+    fn exit_codes_match_truth_table() {
+        // Pin the 4-cell truth table directly. Pre-iter-112 the cross-shape
+        // cells were absorbed by `_ => false`; iter 112 spelled them out so a
+        // future variant on either enum forces compile-time review. Existing
+        // attest tests exercise some cells transitively but only assert event
+        // serialization, not the pass/fail policy. Test below pins the policy
+        // outright.
+        use capsule_core::{ExitCode, ExpectExit};
+        // Same-shape, equal payload ⇒ true.
+        assert!(exit_codes_match(&ExpectExit::Code(0), &ExitCode::Code(0)));
+        assert!(exit_codes_match(
+            &ExpectExit::Sentinel("timeout".into()),
+            &ExitCode::Sentinel("timeout".into()),
+        ));
+        // Same-shape, different payload ⇒ false.
+        assert!(!exit_codes_match(&ExpectExit::Code(0), &ExitCode::Code(1)));
+        assert!(!exit_codes_match(
+            &ExpectExit::Sentinel("timeout".into()),
+            &ExitCode::Sentinel("killed".into()),
+        ));
+        // Cross-shape ⇒ false. Real-world: capsule expects exit 0, run hits
+        // a sentinel like "timeout" — DESIGN §5 says that's a genuine fail.
+        assert!(!exit_codes_match(
+            &ExpectExit::Code(0),
+            &ExitCode::Sentinel("timeout".into()),
+        ));
+        assert!(!exit_codes_match(
+            &ExpectExit::Sentinel("timeout".into()),
+            &ExitCode::Code(0),
+        ));
     }
 
     fn claim_req_with_ttl(id: &str, sess: &str, ttl_sec: u64) -> ClaimRequest {
