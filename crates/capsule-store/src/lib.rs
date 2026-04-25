@@ -30,6 +30,9 @@ pub enum StoreError {
     /// A capsule operation was rejected because the capsule's current status
     /// does not allow that transition. Struct variant (not tuple) so the two
     /// `&'static str` fields can't be accidentally swapped at construction.
+    /// `op` is one of `claim` / `attest` / `heartbeat` / `land` (sourced
+    /// from the private `StoreOp::as_wire_str`); `current_status` is one of
+    /// the wire strings for `Status` (capsule-core).
     #[error("capsule {capsule_id}: cannot {op} when status={current_status}")]
     WrongStatus {
         capsule_id: CapsuleId,
@@ -81,6 +84,30 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// State-transition operation names that surface in `StoreError::WrongStatus`
+/// error messages. Closed enum so the four hand-written op literals at the
+/// `wrong_status` callsites become typed — a typo (`"atest"`) is now a
+/// compile error rather than a silently-shipped error string. Mirrors
+/// `EventKind::as_wire_str` (iter 114).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreOp {
+    Claim,
+    Attest,
+    Heartbeat,
+    Land,
+}
+
+impl StoreOp {
+    const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Attest => "attest",
+            Self::Heartbeat => "heartbeat",
+            Self::Land => "land",
+        }
+    }
+}
+
 impl StoreError {
     /// Build a `WrongStatus` from a `Status` value, snapping its wire form
     /// once. Used by every state-transition guard (`claim`, `attest`,
@@ -89,10 +116,10 @@ impl StoreError {
     /// `current.as_wire_str()` call drift out of step with the type's
     /// definition (forgetting it would compile, since `&'static str` is
     /// already what the field wants).
-    fn wrong_status(capsule_id: CapsuleId, op: &'static str, current: Status) -> Self {
+    fn wrong_status(capsule_id: CapsuleId, op: StoreOp, current: Status) -> Self {
         Self::WrongStatus {
             capsule_id,
-            op,
+            op: op.as_wire_str(),
             current_status: current.as_wire_str(),
         }
     }
@@ -427,7 +454,7 @@ impl Store {
 
         let status = parse_status(&status_str);
         if status != Status::Planned {
-            return Err(StoreError::wrong_status(req.capsule_id, "claim", status));
+            return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Claim, status));
         }
 
         // §7.1.1 step 3: deps must be landed. One query against the existing
@@ -570,7 +597,7 @@ impl Store {
 
         let status = parse_status(&status_str);
         if status != Status::Active {
-            return Err(StoreError::wrong_status(req.capsule_id, "attest", status));
+            return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Attest, status));
         }
         let aid = active_attempt.expect("active ⇒ active_attempt set");
 
@@ -669,7 +696,7 @@ impl Store {
             Status::Planned | Status::Landed | Status::Abandoned => {
                 return Err(StoreError::wrong_status(
                     req.capsule_id,
-                    "heartbeat",
+                    StoreOp::Heartbeat,
                     status,
                 ));
             }
@@ -770,7 +797,7 @@ impl Store {
             }
             let status = parse_status(&status_str);
             if status != Status::Accepted {
-                return Err(StoreError::wrong_status(req.capsule_id, "land", status));
+                return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Land, status));
             }
             // status=Accepted ⇒ active_attempt is Some and verification_json is
             // set (DESIGN §3.3 + §7.1.1: attest is the only path into Accepted
@@ -2354,6 +2381,26 @@ mod tests {
         let path = dir.path().join("state.db");
         let _ = Store::open(&path).unwrap();
         let _ = Store::open(&path).unwrap();
+    }
+
+    #[test]
+    fn store_op_wire_table_pinned() {
+        // Pin (variant, wire) for `StoreOp::as_wire_str`. The strings surface
+        // in `StoreError::WrongStatus.op` (rendered into the user-visible
+        // error message) and are asserted by `matches!(err, WrongStatus {
+        // op: "claim", .. })` test sites — keeping the wire format pinned
+        // here lets those tests stay readable as string literals while the
+        // production callsites become typo-proof. Mirrors
+        // `event_kind_wire_table_pinned`.
+        let cases = [
+            (StoreOp::Claim, "claim"),
+            (StoreOp::Attest, "attest"),
+            (StoreOp::Heartbeat, "heartbeat"),
+            (StoreOp::Land, "land"),
+        ];
+        for (v, wire) in cases {
+            assert_eq!(v.as_wire_str(), wire);
+        }
     }
 
     #[test]
