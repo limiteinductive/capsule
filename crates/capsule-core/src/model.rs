@@ -71,6 +71,14 @@ impl Status {
             Self::Planned | Self::Landed | Self::Abandoned => false,
         }
     }
+
+    /// SQL fragment listing the wire strings of statuses for which
+    /// `holds_lease()` is true, single-quoted and comma-joined for direct
+    /// interpolation into `... WHERE status IN ({Status::HOLDS_LEASE_SQL_IN_LIST}) ...`.
+    /// Pinned against `holds_lease` by `status_holds_lease_sql_list_matches_predicate`
+    /// — adding a new lease-holding variant without updating this list is a
+    /// test failure rather than a runtime miss.
+    pub const HOLDS_LEASE_SQL_IN_LIST: &'static str = "'active','accepted'";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +415,41 @@ mod tests {
         assert!(!Status::Planned.is_terminal());
         assert!(!Status::Active.is_terminal());
         assert!(!Status::Accepted.is_terminal());
+    }
+
+    #[test]
+    fn status_lease_set_pinned() {
+        // Pin lease-holding membership: SQL queries in capsule-store filter
+        // in-flight capsules by `status IN ('active','accepted')` and bind
+        // that list to `Status::HOLDS_LEASE_SQL_IN_LIST`. A future variant
+        // added without updating `holds_lease` would fail compile (exhaustive
+        // match); the test pins the classification.
+        assert!(Status::Active.holds_lease());
+        assert!(Status::Accepted.holds_lease());
+        assert!(!Status::Planned.holds_lease());
+        assert!(!Status::Landed.holds_lease());
+        assert!(!Status::Abandoned.holds_lease());
+    }
+
+    #[test]
+    fn status_holds_lease_sql_list_matches_predicate() {
+        // Derive the SQL list from `holds_lease()`'s truth-table and assert
+        // it equals the hand-written const. A new lease-holding variant
+        // becomes a test failure here, forcing the SQL fragment update in
+        // lockstep with the predicate.
+        let computed = [
+            Status::Planned,
+            Status::Active,
+            Status::Accepted,
+            Status::Landed,
+            Status::Abandoned,
+        ]
+        .into_iter()
+        .filter(|s| s.holds_lease())
+        .map(|s| format!("'{}'", s.as_wire_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+        assert_eq!(computed, Status::HOLDS_LEASE_SQL_IN_LIST);
     }
 
     #[test]

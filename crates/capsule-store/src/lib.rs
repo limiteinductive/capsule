@@ -372,10 +372,10 @@ impl Store {
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
             let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
-                .prepare(
-                    "SELECT id, scope_json FROM capsule
-                     WHERE status IN ('active','accepted')",
-                )?
+                .prepare(&format!(
+                    "SELECT id, scope_json FROM capsule WHERE status IN ({})",
+                    Status::HOLDS_LEASE_SQL_IN_LIST,
+                ))?
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
@@ -450,52 +450,16 @@ impl Store {
             return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Claim, status));
         }
 
-        // §7.1.1 step 3: deps must be landed. One query against the existing
-        // depends_on_json blob via `json_each(?)` — single bind, no SQLite
-        // variable-limit ceiling, and the prior per-dep round-trips collapse.
-        // LEFT JOIN + WHERE c.id IS NULL returns deps that either don't exist
-        // OR aren't landed (same as the old per-row `Option<String>` ⇒ None
-        // branch). Order preserved via `j.key` (json_each emits 0-based array
-        // indices), so `UnmetDeps`'s Vec retains the input order.
-        let mut stmt = tx.prepare(
-            "SELECT j.value FROM json_each(?1) j
-             LEFT JOIN capsule c ON c.id = j.value AND c.status = 'landed'
-             WHERE c.id IS NULL
-             ORDER BY j.key",
-        )?;
-        let unmet: Vec<String> = stmt
-            .query_map(params![depends_on_json], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
+        let unmet = find_unmet_deps(&tx, &depends_on_json)?;
         if !unmet.is_empty() {
             return Err(StoreError::UnmetDeps(req.capsule_id, unmet));
         }
 
-        // §7.1.1 step 4: scope-overlap check vs other in-flight capsules.
-        let our_scope: Vec<CanonicalPath> = json::from_str(&scope_json)?;
-        let mut stmt = tx.prepare(
-            "SELECT id, scope_json FROM capsule
-             WHERE status IN ('active','accepted') AND id != ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![req.capsule_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        for (other_id, other_scope_json) in rows {
-            let other: Vec<CanonicalPath> = json::from_str(&other_scope_json)?;
-            if CanonicalPath::any_overlap(&our_scope, &other) {
-                return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
-            }
+        if let Some(other_id) = find_scope_conflict(&tx, &req.capsule_id, &scope_json)? {
+            return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
         }
 
-        // §7.1.1 step 5: allocate attempt_id.
-        let next_id: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
-            params![req.capsule_id],
-            |r| r.get(0),
-        )?;
+        let next_id = next_attempt_id(&tx, &req.capsule_id)?;
 
         let branch = format!("capsules/{}/a{}", req.capsule_id, next_id);
         let witness_branch = format!("capsule-witness/{}/a{}", req.capsule_id, next_id);
@@ -1712,15 +1676,16 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
 
     let now_str = format_iso8601(now)?;
 
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare(&format!(
         "SELECT c.id, c.active_attempt, a.lease_json
          FROM capsule c
          JOIN attempt a
            ON a.capsule_id = c.id AND a.attempt_id = c.active_attempt
-         WHERE c.status IN ('active','accepted')
+         WHERE c.status IN ({})
            AND c.active_attempt IS NOT NULL
            AND c.pending_land_json IS NULL",
-    )?;
+        Status::HOLDS_LEASE_SQL_IN_LIST,
+    ))?;
     let candidates: Vec<(String, i64, String)> = stmt
         .query_map([], |r| {
             Ok((
@@ -1771,6 +1736,66 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
     }
 
     Ok(())
+}
+
+/// DESIGN.md §7.1.1 step 3: return any dep ids in `depends_on_json` that are
+/// missing or not yet `landed`. `json_each` keeps everything to one bind (no
+/// SQLite variable-limit ceiling) and `ORDER BY j.key` preserves the input
+/// order so `UnmetDeps` reports stable positions.
+fn find_unmet_deps(
+    tx: &rusqlite::Transaction<'_>,
+    depends_on_json: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT j.value FROM json_each(?1) j
+         LEFT JOIN capsule c ON c.id = j.value AND c.status = 'landed'
+         WHERE c.id IS NULL
+         ORDER BY j.key",
+    )?;
+    let unmet = stmt
+        .query_map(params![depends_on_json], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(unmet)
+}
+
+/// DESIGN.md §7.1.1 step 4: return the first other in-flight (lease-holding)
+/// capsule whose scope component-wise overlaps `our_scope_json`, or `None`.
+fn find_scope_conflict(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    our_scope_json: &str,
+) -> Result<Option<CapsuleId>> {
+    let our_scope: Vec<CanonicalPath> = json::from_str(our_scope_json)?;
+    let mut stmt = tx.prepare(&format!(
+        "SELECT id, scope_json FROM capsule
+         WHERE status IN ({}) AND id != ?1",
+        Status::HOLDS_LEASE_SQL_IN_LIST,
+    ))?;
+    let rows = stmt
+        .query_map(params![capsule_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (other_id, other_scope_json) in rows {
+        let other: Vec<CanonicalPath> = json::from_str(&other_scope_json)?;
+        if CanonicalPath::any_overlap(&our_scope, &other) {
+            return Ok(Some(other_id));
+        }
+    }
+    Ok(None)
+}
+
+/// DESIGN.md §7.1.1 step 5: allocate the next `attempt_id` for `capsule_id`.
+/// Monotonically increasing per capsule; gaps are allowed (an aborted claim
+/// leaves a row that future claims do not reuse).
+fn next_attempt_id(tx: &rusqlite::Transaction<'_>, capsule_id: &str) -> Result<i64> {
+    let next = tx.query_row(
+        "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
+        params![capsule_id],
+        |r| r.get(0),
+    )?;
+    Ok(next)
 }
 
 /// Load and deserialize the `Lease` for one attempt. Underlying loader for
