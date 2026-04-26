@@ -301,19 +301,23 @@ impl Store {
             return self.get_capsule(&capsule_id);
         }
 
-        update.bind_sql_only("updated_at", now_str.clone().into());
-        let where_idx = update.next_placeholder();
-        update.vals.push(capsule_id.clone().into());
+        // Trailing `updated_at` + WHERE parameters are passed by reference into
+        // the params slice rather than cloned into `update.vals`, since both
+        // values are needed below for the audit event and the read-back.
+        let updated_at_idx = update.vals.len() + 1;
+        let where_idx = updated_at_idx + 1;
+        update.sets.push(format!("updated_at = ?{updated_at_idx}"));
         let sql = format!(
-            "UPDATE capsule SET {} WHERE id = ?{}",
+            "UPDATE capsule SET {} WHERE id = ?{where_idx}",
             update.sets.join(", "),
-            where_idx
         );
-        let params_slice: Vec<&dyn rusqlite::ToSql> = update
+        let mut params_slice: Vec<&dyn rusqlite::ToSql> = update
             .vals
             .iter()
             .map(|v| v as &dyn rusqlite::ToSql)
             .collect();
+        params_slice.push(&now_str);
+        params_slice.push(&capsule_id);
         tx.execute(&sql, params_slice.as_slice())?;
 
         insert_event(
