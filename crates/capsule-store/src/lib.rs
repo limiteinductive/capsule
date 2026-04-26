@@ -1689,7 +1689,6 @@ fn retain_available(
         .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-    // Collect into StoreError so both rusqlite::Error and json::Error can use ? here.
     let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
         .prepare(&format!(
             "SELECT id, scope_json FROM capsule WHERE status IN ({})",
@@ -1876,8 +1875,6 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
                 |r| r.get(0),
             )
             .optional()?;
-        // Insert after the query so `params![node]` can borrow it first, then
-        // move the owned ID into `seen` without cloning.
         seen.insert(node);
         let Some(deps_json) = deps_json else {
             continue;
