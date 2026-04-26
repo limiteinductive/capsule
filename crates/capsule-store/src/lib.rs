@@ -2039,15 +2039,9 @@ impl RowCapsule {
             status: parse_status(&self.status),
             active_attempt: self.active_attempt.map(|i| i as u64),
             attempts,
-            verification: self
-                .verification_json
-                .map(|s| json::from_str(&s))
-                .transpose()?,
-            pending_land: self
-                .pending_land_json
-                .map(|s| json::from_str(&s))
-                .transpose()?,
-            landing: self.landing_json.map(|s| json::from_str(&s)).transpose()?,
+            verification: decode_opt_json(self.verification_json)?,
+            pending_land: decode_opt_json(self.pending_land_json)?,
+            landing: decode_opt_json(self.landing_json)?,
             created_at: parse_iso8601(&self.created_at),
             updated_at: parse_iso8601(&self.updated_at),
         })
@@ -2154,6 +2148,17 @@ fn checked_lease_expiry(now: OffsetDateTime, ttl_sec: u64) -> Result<OffsetDateT
 fn parse_iso8601(s: &str) -> OffsetDateTime {
     OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
         .expect("DB stored a non-iso8601 timestamp")
+}
+
+/// Decode a nullable JSON column. The three nullable JSON-backed fields on
+/// `Capsule` (verification, pending_land, landing) all share the same
+/// `Option<String>` → `Option<T>` shape; centralizing keeps the
+/// `.map(...).transpose()?` ritual off the call sites and limits the
+/// `serde_json::Error → StoreError` conversion to one place.
+fn decode_opt_json<T: serde::de::DeserializeOwned>(s: Option<String>) -> Result<Option<T>> {
+    s.map(|s| json::from_str::<T>(&s))
+        .transpose()
+        .map_err(Into::into)
 }
 
 /// True iff a row with this id exists in `capsule`. `id` is the primary key,
