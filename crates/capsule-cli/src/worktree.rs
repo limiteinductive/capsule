@@ -290,12 +290,11 @@ fn git_worktree_list_for_branch(branch: &str) -> Result<Option<String>> {
     let out = run_git_capture(&["worktree", "list", "--porcelain"])
         .context("git worktree list --porcelain")?;
     let mut current_path: Option<&str> = None;
-    let want = format!("refs/heads/{branch}");
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("worktree ") {
             current_path = Some(rest);
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            if rest == want {
+        } else if let Some(name) = line.strip_prefix("branch refs/heads/") {
+            if name == branch {
                 return Ok(current_path.map(str::to_string));
             }
         } else if line.is_empty() {
