@@ -681,6 +681,88 @@ fn pre_spawn_heartbeat(dir: &Path, capsule_id: &str, session: &str) -> Result<()
     Ok(())
 }
 
+/// Handle for the spawned heartbeat thread. Drop `stop` to wake the thread
+/// from its `recv_timeout` and let it exit; `join` it; then read `lease_lost`
+/// to decide whether to force a non-zero parent exit.
+struct HeartbeatThread {
+    handle: std::thread::JoinHandle<Result<()>>,
+    stop: std::sync::mpsc::Sender<()>,
+    lease_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Spawn the heartbeat-thread that pings the lease at `ttl/3` cadence on a
+/// fresh SQLite connection (WAL makes same-process dual connections safe).
+///
+/// - **Cadence floor.** Clamps `ttl/3` at 1s. Tests use tiny TTLs (e.g. ttl=1)
+///   and agents fronting `capsule work` may pass anything; without the floor
+///   `recv_timeout(0)` returns immediately and heartbeat hammers the DB.
+///   Defend at the consumer, not by rejecting at claim.
+/// - **Shutdown.** The parent drops `stop`; the thread's `recv_timeout` then
+///   returns `Disconnected` and exits cleanly. Sleep-first cadence avoids
+///   double-heartbeating immediately after the pre-spawn ping. No site sends
+///   on the channel, so `Ok(())` from `recv_timeout` is unreachable by
+///   construction — the `unreachable!` surfaces a contract break if a future
+///   contributor adds `stop.send(())`.
+/// - **Lease loss.** `CrossSession` / `LeaseExpired` set `lease_lost` and
+///   exit; the child is **not** killed. The parent reads the flag after
+///   `join` and forces a non-zero exit. `AtomicBool` (not a second channel)
+///   because the parent reads after `join`.
+fn spawn_heartbeat_thread(
+    dir: &Path,
+    capsule_id: String,
+    session: String,
+    ttl: u64,
+) -> HeartbeatThread {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let lease_lost = Arc::new(AtomicBool::new(false));
+    let dir = dir.to_path_buf();
+    let lease_lost_hb = Arc::clone(&lease_lost);
+
+    let interval = Duration::from_secs((ttl / 3).max(1));
+    let handle = thread::spawn(move || -> Result<()> {
+        let mut store = open_store(&dir)?;
+        loop {
+            match stop_rx.recv_timeout(interval) {
+                Ok(()) => unreachable!(
+                    "heartbeat shutdown is signaled by dropping the sender, not sending"
+                ),
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            match store.heartbeat(&capsule_id, &session) {
+                Ok(_) => {}
+                Err(
+                    e @ (capsule_store::StoreError::CrossSession
+                    | capsule_store::StoreError::LeaseExpired(_)),
+                ) => {
+                    eprintln!(
+                        "capsule work: lease lost ({e}); attest will fail. Finish or cancel \
+                         the child and re-claim."
+                    );
+                    lease_lost_hb.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("capsule work: heartbeat failed: {e}");
+                    return Ok(());
+                }
+            }
+        }
+    });
+
+    HeartbeatThread {
+        handle,
+        stop,
+        lease_lost,
+    }
+}
+
 /// `capsule work`: spawn child, heartbeat in a thread at `ttl/3` cadence on a
 /// second SQLite connection (WAL makes same-process dual connections safe), and
 /// forward the child's exit code. No custom signal handlers — terminal signals
@@ -688,11 +770,7 @@ fn pre_spawn_heartbeat(dir: &Path, capsule_id: &str, session: &str) -> Result<()
 /// shuts down when the parent drops `stop_tx` (the `recv_timeout` returns
 /// `Disconnected` immediately).
 fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
 
     let SessionAttempt {
         ttl,
@@ -716,57 +794,11 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
 
     pre_spawn_heartbeat(dir, &args.capsule_id, &args.session)?;
 
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    // Lease lost mid-run: flag set, child NOT killed, parent exits non-zero.
-    // `AtomicBool` rather than a second channel because the parent reads it
-    // after `join`; the channel only carries the shutdown edge.
-    let lease_lost = Arc::new(AtomicBool::new(false));
-    let dir_hb = dir.to_path_buf();
-    let capsule_id_hb = args.capsule_id.clone();
-    let session_hb = args.session.clone();
-    let lease_lost_hb = Arc::clone(&lease_lost);
-
-    let hb_thread = thread::spawn(move || -> Result<()> {
-        let mut store = open_store(&dir_hb)?;
-        // Clamp at 1s. With ttl < 3, naive `ttl/3` is 0 → the recv_timeout
-        // returns immediately → heartbeat fires in a tight loop hammering the
-        // DB. Tests use tiny TTLs (e.g. ttl=1) and an agent fronting `capsule
-        // work` may pass any value; defend at the consumer rather than
-        // rejecting at claim.
-        let interval = Duration::from_secs((ttl / 3).max(1));
-        loop {
-            // Sleep first so we don't double-heartbeat immediately after claim.
-            // Drop of the sender is the canonical shutdown signal; no site
-            // sends, so `Ok(())` is unreachable by construction. If a future
-            // contributor adds `stop_tx.send(())`, the `unreachable!` will
-            // surface that the control contract changed.
-            match stop_rx.recv_timeout(interval) {
-                Ok(()) => unreachable!(
-                    "heartbeat shutdown is signaled by dropping the sender, not sending"
-                ),
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            match store.heartbeat(&capsule_id_hb, &session_hb) {
-                Ok(_) => {}
-                Err(
-                    e @ (capsule_store::StoreError::CrossSession
-                    | capsule_store::StoreError::LeaseExpired(_)),
-                ) => {
-                    eprintln!(
-                        "capsule work: lease lost ({e}); attest will fail. Finish or cancel \
-                         the child and re-claim."
-                    );
-                    lease_lost_hb.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("capsule work: heartbeat failed: {e}");
-                    return Ok(());
-                }
-            }
-        }
-    });
+    let HeartbeatThread {
+        handle: hb_thread,
+        stop: stop_tx,
+        lease_lost,
+    } = spawn_heartbeat_thread(dir, args.capsule_id.clone(), args.session.clone(), ttl);
 
     let (first, rest) = args.cmd.split_first().expect("clap required >= 1 arg");
     let mut command = std::process::Command::new(first);
