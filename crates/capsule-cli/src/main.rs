@@ -667,8 +667,6 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     let attempt_num = attempt.id;
     drop(pre);
 
-    // Materialize worktree if requested. Held for the child's lifetime via
-    // `_isolate` (drops the runtime flock on scope exit).
     let isolate_state = if args.isolate == IsolateMode::Worktree {
         Some(worktree::setup(
             dir,
@@ -696,9 +694,9 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     // the prior 200ms polling tick (and shaving up to that much off shutdown
     // latency on child exit).
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    // F8: lease lost mid-run → flag set, child not killed, parent exits non-zero.
-    // Stays an `AtomicBool` because the parent reads it after `join`; the channel
-    // only carries the shutdown edge.
+    // Lease lost mid-run: flag set, child NOT killed, parent exits non-zero.
+    // `AtomicBool` rather than a second channel because the parent reads it
+    // after `join`; the channel only carries the shutdown edge.
     let lease_lost = Arc::new(AtomicBool::new(false));
     let dir_hb = dir.to_path_buf();
     let capsule_id_hb = args.capsule_id.clone();
@@ -776,7 +774,6 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
                     1
                 }
             });
-            // F8: if lease was lost mid-run, force non-zero even on child success.
             if lease_lost.load(Ordering::SeqCst) && code == 0 {
                 Ok(1)
             } else {
