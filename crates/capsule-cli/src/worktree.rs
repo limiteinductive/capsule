@@ -126,6 +126,10 @@ fn validate_worktree_dir_override(
     main_root: &Path,
     capsule_dir: &Path,
 ) -> Result<PathBuf> {
+    // Reject relative paths up-front. `fs::canonicalize` would resolve them
+    // against the process cwd, which is unpredictable when `capsule work` is
+    // invoked by an agent from a variable working directory — silently landing
+    // the worktree in a surprising location. Force the caller to be explicit.
     if !p.is_absolute() {
         bail!(
             "--worktree-dir must be an absolute path (got {}); relative paths would resolve \

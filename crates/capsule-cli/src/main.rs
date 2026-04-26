@@ -789,15 +789,21 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     }
 }
 
-fn join_scope(prefixes: &[CanonicalPath]) -> String {
-    let mut out = String::new();
-    for (i, p) in prefixes.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+/// `Display` adapter for the comma-joined scope-list rendering used inside
+/// `print_capsule_summary_line`'s `[...]` cell. Formats straight into the
+/// `println!` buffer — no intermediate `String` per row.
+struct ScopeList<'a>(&'a [CanonicalPath]);
+
+impl std::fmt::Display for ScopeList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, p) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            f.write_str(p.as_str())?;
         }
-        out.push_str(p.as_str());
+        Ok(())
     }
-    out
 }
 
 /// One-line tab-separated summary used by both `list` (one row per capsule)
@@ -811,7 +817,7 @@ fn print_capsule_summary_line(c: &Capsule) {
         c.id,
         c.status.as_wire_str(),
         c.base_ref,
-        join_scope(&c.scope_prefixes),
+        ScopeList(&c.scope_prefixes),
         c.title
     );
 }
