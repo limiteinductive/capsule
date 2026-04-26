@@ -852,22 +852,14 @@ impl Store {
         let now = OffsetDateTime::now_utc();
         let tx = self.conn.transaction()?;
 
-        // Read the target capsule's status + freeze flag inside the tx so the
-        // freeze check and reclaim share one snapshot. Matches `claim` /
-        // `abandon`; closes the pre-tx → in-tx window where a concurrent land
-        // could set pending_land between our freeze check and the sweep
-        // (sweep would correctly skip the frozen capsule, but `reclaim` would
-        // return `Ok(false)` instead of `PendingLandFrozen`).
-        let (before_status, pending): (String, Option<String>) = tx
+        assert_not_pending_land_frozen_in_tx(&tx, capsule_id)?;
+        let before_status: String = tx
             .query_row(
-                "SELECT status, pending_land_json FROM capsule WHERE id = ?1",
+                "SELECT status FROM capsule WHERE id = ?1",
                 params![capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .or_not_found(capsule_id)?;
-        if pending.is_some() {
-            return Err(StoreError::PendingLandFrozen(capsule_id.into()));
-        }
 
         reclaim_expired_in_tx(&tx, now)?;
         let after_status: String = tx.query_row(
@@ -1808,6 +1800,21 @@ fn pending_land_snapshot_unchanged(
 ) -> Result<bool> {
     let cur = load_pending_land_json(tx, capsule_id)?;
     Ok(cur.as_deref() == Some(snapshot_json))
+}
+
+/// Reject any state change that would race with an in-flight land. Read +
+/// check share one tx snapshot so a concurrent `land` between the two reads
+/// can't produce `Ok(false)` here when `PendingLandFrozen` is the right
+/// answer (§7.2). Used by `reclaim`; `claim`/`abandon`/`land` open-code the
+/// same check because they read the freeze flag in a wider column-set query.
+fn assert_not_pending_land_frozen_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+) -> Result<()> {
+    if load_pending_land_json(tx, capsule_id)?.is_some() {
+        return Err(StoreError::PendingLandFrozen(capsule_id.into()));
+    }
+    Ok(())
 }
 
 /// Shared preamble for `add_dep`/`remove_dep`: load `depends_on_json` and
