@@ -1024,15 +1024,8 @@ impl Store {
         };
         let pending: PendingLand = json::from_str(&snapshot_json)?;
 
-        // ls-remote witness branch.
         let witness_sha = ls_remote_branch(&req.remote, &pending.witness_branch)?;
-        let witness_state = if witness_sha == capsule_git::ZERO_OID {
-            WitnessState::Absent
-        } else if witness_sha == pending.verified_sha {
-            WitnessState::AtVerifiedSha(witness_sha)
-        } else {
-            WitnessState::Different(witness_sha)
-        };
+        let witness_state = WitnessState::classify(witness_sha, &pending.verified_sha);
 
         let actor = operator
             .as_ref()
@@ -1362,6 +1355,19 @@ enum WitnessState {
 }
 
 impl WitnessState {
+    /// Classify a freshly ls-remote'd witness sha against the lander's claimed
+    /// `verified_sha`: zero-OID ⇒ Absent, equal ⇒ AtVerifiedSha (the witness
+    /// truly carries the lander's commit), otherwise ⇒ Different.
+    fn classify(observed: String, verified: &str) -> Self {
+        if observed == capsule_git::ZERO_OID {
+            Self::Absent
+        } else if observed == verified {
+            Self::AtVerifiedSha(observed)
+        } else {
+            Self::Different(observed)
+        }
+    }
+
     /// Stable wire string for the `state` discriminant in the
     /// `witness_remote_state` payload (DESIGN §6 `reconciler_ran`). Mirrors
     /// `ReconcileOutcome::as_wire_str` — explicit `match` so a new variant
