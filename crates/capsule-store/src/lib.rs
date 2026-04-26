@@ -2692,13 +2692,14 @@ mod tests {
         }
     }
 
+    /// Pin `(variant, wire)` for `WitnessState::state_wire_str`. The strings
+    /// surface as the `state` field of `witness_remote_state` in the
+    /// `reconciler_ran` event payload (DESIGN §6) — operator dashboards and
+    /// audit consumers key on these. Also pins payload shape: the `sha` field
+    /// is present iff the state variant carries one. Mirrors the
+    /// `reconcile_outcome_wire_table_pinned` pattern.
     #[test]
     fn witness_state_wire_table_pinned() {
-        // Pin (variant, wire) for `WitnessState::state_wire_str`. The strings
-        // surface as the `state` field of `witness_remote_state` in the
-        // `reconciler_ran` event payload (DESIGN §6) — operator dashboards
-        // and audit consumers key on these. Mirrors the
-        // `reconcile_outcome_wire_table_pinned` pattern.
         let cases = [
             (WitnessState::Absent, "absent"),
             (WitnessState::AtVerifiedSha("dead".into()), "at_verified_sha"),
@@ -2707,7 +2708,6 @@ mod tests {
         for (v, wire) in &cases {
             assert_eq!(v.state_wire_str(), *wire);
         }
-        // Pin payload shape too (sha field present iff state carries one).
         assert_eq!(
             witness_remote_state_json(&WitnessState::Absent),
             json::json!({ "state": "absent" })
@@ -2732,11 +2732,11 @@ mod tests {
         assert_eq!(got.scope_prefixes.len(), 1);
     }
 
+    /// DESIGN §6 `attempt_claimed` payload: `{attempt_id, session_id,
+    /// base_sha, lease}`. Pin the keys so a future refactor can't silently
+    /// drop back to the pre-fix `lease_expires_at` flat shape.
     #[test]
     fn attempt_claimed_event_payload_matches_design_spec() {
-        // DESIGN.md §6 attempt_claimed payload: {attempt_id, session_id,
-        // base_sha, lease}. Pin the keys so a future refactor can't silently
-        // drop back to the pre-fix `lease_expires_at` shape.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
