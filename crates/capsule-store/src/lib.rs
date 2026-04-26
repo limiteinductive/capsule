@@ -690,13 +690,16 @@ impl Store {
 
             load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
+            // Move locals into `pending` rather than cloning; downstream
+            // (steps 3-4) borrows `&pending.X` instead of keeping parallel
+            // String locals alive.
             let pending = PendingLand {
                 at: now,
                 attempt_id: aid as u64,
-                verified_sha: verified_sha.clone(),
-                prior_base_sha: prior_base_sha.clone(),
-                witness_branch: witness_branch.clone(),
-                lander: req.lander.clone(),
+                verified_sha,
+                prior_base_sha,
+                witness_branch,
+                lander: req.lander,
             };
             // SQL bytes (used in step 4's CAS) and event payload share one
             // serialization so both paths see identical bytes by construction.
@@ -712,7 +715,7 @@ impl Store {
                 &now_str,
                 &req.capsule_id,
                 Some(aid),
-                &req.lander,
+                &pending.lander,
                 EventKind::PendingLandCommitted,
                 &pending_value,
             )?;
@@ -725,8 +728,8 @@ impl Store {
             &req.repo_dir,
             &req.remote,
             &base_ref,
-            &witness_branch,
-            &verified_sha,
+            &pending.witness_branch,
+            &pending.verified_sha,
         )?;
 
         // ---- Step 4: synchronous reconcile from outcome. ----
@@ -740,7 +743,7 @@ impl Store {
 
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
-                let advanced_base_ref = verified_sha != prior_base_sha;
+                let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
                 let landing = pending.into_landing(now, advanced_base_ref);
                 finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 LandOutcome::Landed { landing }
@@ -751,7 +754,7 @@ impl Store {
                     &now_str,
                     &req.capsule_id,
                     Some(attempt_id),
-                    &req.lander,
+                    &pending.lander,
                     PendingLandClearedReason::BaseRefMoved,
                 )?;
                 LandOutcome::BaseRefMoved
@@ -763,11 +766,11 @@ impl Store {
                     &now_str,
                     &req.capsule_id,
                     Some(attempt_id),
-                    &req.lander,
+                    &pending.lander,
                     OperationalIncidentKind::WitnessOidMismatch,
                     json::json!({
-                        "witness_branch": witness_branch,
-                        "verified_sha": verified_sha,
+                        "witness_branch": pending.witness_branch,
+                        "verified_sha": pending.verified_sha,
                     }),
                 )?;
                 LandOutcome::WitnessOidMismatch
@@ -778,7 +781,7 @@ impl Store {
                     &now_str,
                     &req.capsule_id,
                     attempt_id,
-                    &req.lander,
+                    &pending.lander,
                     &stderr,
                 )?;
                 tx.commit()?;
