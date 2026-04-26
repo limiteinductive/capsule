@@ -171,16 +171,14 @@ mod tests {
             .collect()
     }
 
+    /// The two tests below pin set-equality between a SQL `CHECK (col IN
+    /// (...))` accept-list and the Rust enum's `as_wire_str` set, in **both**
+    /// directions. Drift either way is a bug we want caught at test time:
+    /// - SQL omission ⇒ `INSERT` fails at runtime when Rust emits the new variant.
+    /// - SQL extra ⇒ accept-list entry that no Rust code can produce, masking
+    ///   a removed/renamed variant.
     #[test]
     fn capsule_status_check_set_equals_status_wire_set() {
-        // The `capsule.status` CHECK constraint enumerates wire strings as
-        // SQL literals (`'planned'`, `'active'`, ...). Pin BOTH directions:
-        // every `Status::as_wire_str` value appears in the CHECK list AND
-        // the CHECK list contains no stale extras. A rename or new variant
-        // that lands without updating both sides would otherwise either
-        // ship a runtime INSERT failure (omission) or silently keep an
-        // accept-list entry that no Rust code emits (extra) — both are
-        // bugs, both are caught here.
         let conn = Connection::open_in_memory().unwrap();
         ensure(&conn).unwrap();
         let sql = live_table_sql(&conn, "capsule");
@@ -203,8 +201,6 @@ mod tests {
 
     #[test]
     fn attempt_outcome_check_set_equals_outcome_wire_set() {
-        // Mirrors `capsule_status_check_set_equals_status_wire_set` for
-        // `attempt.outcome`.
         let conn = Connection::open_in_memory().unwrap();
         ensure(&conn).unwrap();
         let sql = live_table_sql(&conn, "attempt");
