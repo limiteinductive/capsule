@@ -639,24 +639,13 @@ impl Store {
         use capsule_git::{land_push, ls_remote_branch, LandOutcome as GitOutcome};
 
         // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
-        // We need this for both the PendingLand record and the eventual
-        // Landing.advanced_base_ref computation. If the remote moves between
-        // here and step 3, the atomic push will reject as base_ref_moved.
-        // Collapse the three "missing landable state" checks into one: any of
-        // missing verification, missing active_attempt, or active_attempt not
-        // in attempts list maps to the same `NotLandable` error. Single
-        // clone of `req.capsule_id` for the error path.
         let cap = self.get_capsule(&req.capsule_id)?;
-        let landable = cap.active_attempt_record().and_then(|att| {
-            let v = cap.verification.as_ref()?;
-            Some((
-                cap.base_ref.clone(),
-                att.witness_branch.clone(),
-                v.verified_sha.clone(),
-            ))
-        });
-        let (base_ref, witness_branch, verified_sha) =
-            landable.ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+        let LandableSnapshot {
+            base_ref,
+            witness_branch,
+            verified_sha,
+        } = LandableSnapshot::extract(&cap)
+            .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
         // ---- Step 2: write PendingLand under preconditions. ----
@@ -1909,6 +1898,29 @@ fn exit_codes_match(expect: &capsule_core::ExpectExit, got: &capsule_core::ExitC
         (ExpectExit::Sentinel(a), ExitCode::Sentinel(b)) => a == b,
         (ExpectExit::Code(_), ExitCode::Sentinel(_))
         | (ExpectExit::Sentinel(_), ExitCode::Code(_)) => false,
+    }
+}
+
+/// The three fields `Store::land` step 1 needs from the in-memory capsule:
+/// `base_ref` to ls-remote, `witness_branch` for the atomic push, `verified_sha`
+/// for both the push target and the in-tx re-bind. `extract` returns `Some`
+/// only when verification + active_attempt are both present; any missing
+/// piece collapses to `NotLandable` at the call site.
+struct LandableSnapshot {
+    base_ref: String,
+    witness_branch: String,
+    verified_sha: String,
+}
+
+impl LandableSnapshot {
+    fn extract(cap: &capsule_core::Capsule) -> Option<Self> {
+        let att = cap.active_attempt_record()?;
+        let v = cap.verification.as_ref()?;
+        Some(Self {
+            base_ref: cap.base_ref.clone(),
+            witness_branch: att.witness_branch.clone(),
+            verified_sha: v.verified_sha.clone(),
+        })
     }
 }
 
