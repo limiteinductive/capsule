@@ -175,6 +175,11 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(db_path)?;
+        // Default rusqlite stmt cache holds 16 entries; we cache ~14
+        // distinct prepares already and the count is still growing as
+        // SQL-projection helpers proliferate. Bump to 32 so LRU
+        // eviction never thrashes our hot path.
+        conn.set_prepared_statement_cache_capacity(32);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -334,7 +339,7 @@ impl Store {
             Some(s) => (RowCapsule::SELECT_BY_STATUS_ORDERED, Some(s.as_wire_str())),
             None => (RowCapsule::SELECT_ALL_ORDERED, None),
         };
-        let mut stmt = tx.prepare(q)?;
+        let mut stmt = tx.prepare_cached(q)?;
         let rows: Vec<RowCapsule> = stmt
             .query_map(rusqlite::params_from_iter(status_param), RowCapsule::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1660,11 +1665,11 @@ fn retain_available(
     capsules: Vec<Capsule>,
 ) -> Result<Vec<Capsule>> {
     let landed_ids: std::collections::HashSet<String> = tx
-        .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
+        .prepare_cached("SELECT id FROM capsule WHERE status = 'landed'")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
-        .prepare(concat!(
+        .prepare_cached(concat!(
             "SELECT id, scope_json FROM capsule WHERE status IN (",
             capsule_core::holds_lease_sql_in_list!(),
             ")",
@@ -2158,7 +2163,7 @@ fn load_attempts_for_capsule(
     conn: &Connection,
     capsule_id: &str,
 ) -> Result<Vec<capsule_core::Attempt>> {
-    let mut stmt = conn.prepare(RowAttempt::SELECT)?;
+    let mut stmt = conn.prepare_cached(RowAttempt::SELECT)?;
     let mut rows = stmt.query(params![capsule_id])?;
     let mut attempts = Vec::new();
     while let Some(row) = rows.next()? {
