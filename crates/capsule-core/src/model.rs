@@ -439,12 +439,16 @@ mod tests {
         assert_eq!(AttemptOutcome::from_wire("not_an_outcome"), None);
     }
 
+    /// The four tests below pin set-membership predicates over `Status` and
+    /// `AttemptOutcome`. Each predicate is an exhaustive match — adding a
+    /// future variant fails compile until it's classified, so these tests
+    /// don't catch *missing* classification; they catch *wrong* classification
+    /// (a refactor that flips a bit). Store guards rely on these splits:
+    /// `Status::is_terminal` (dep mutations), `Status::holds_lease`
+    /// (`HOLDS_LEASE_SQL_IN_LIST`, the SQL `status IN (...)` filter), and
+    /// `AttemptOutcome::is_terminal` (closed_at presence).
     #[test]
     fn status_terminal_set_pinned() {
-        // Pin the membership of the terminal set: dep mutations and several
-        // store guards branch on this. A future variant added without updating
-        // `is_terminal` would fail compile until classified (the match is
-        // exhaustive); the test pins the actual classification.
         assert!(Status::Landed.is_terminal());
         assert!(Status::Abandoned.is_terminal());
         assert!(!Status::Planned.is_terminal());
@@ -454,11 +458,6 @@ mod tests {
 
     #[test]
     fn status_lease_set_pinned() {
-        // Pin lease-holding membership: SQL queries in capsule-store filter
-        // in-flight capsules by `status IN ('active','accepted')` and bind
-        // that list to `Status::HOLDS_LEASE_SQL_IN_LIST`. A future variant
-        // added without updating `holds_lease` would fail compile (exhaustive
-        // match); the test pins the classification.
         assert!(Status::Active.holds_lease());
         assert!(Status::Accepted.holds_lease());
         assert!(!Status::Planned.holds_lease());
@@ -466,12 +465,10 @@ mod tests {
         assert!(!Status::Abandoned.holds_lease());
     }
 
+    /// Derive the SQL fragment from the predicate and assert it equals the
+    /// hand-written const, so the SQL bind can never drift from `holds_lease`.
     #[test]
     fn status_holds_lease_sql_list_matches_predicate() {
-        // Derive the SQL list from `holds_lease()`'s truth-table and assert
-        // it equals the hand-written const. A new lease-holding variant
-        // becomes a test failure here, forcing the SQL fragment update in
-        // lockstep with the predicate.
         let computed = [
             Status::Planned,
             Status::Active,
@@ -489,10 +486,6 @@ mod tests {
 
     #[test]
     fn attempt_outcome_terminal_set_pinned() {
-        // Pin the membership: store guards that branch on "outcome has a
-        // `closed_at`" rely on this. A future variant added without updating
-        // `is_terminal` would fail compile until classified (the match is
-        // exhaustive); the test pins the actual classification.
         assert!(AttemptOutcome::Landed.is_terminal());
         assert!(AttemptOutcome::Abandoned.is_terminal());
         assert!(AttemptOutcome::Expired.is_terminal());
