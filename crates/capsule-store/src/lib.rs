@@ -2078,7 +2078,7 @@ impl RowCapsule {
 /// the column list and the `Attempt` field assignments would silently corrupt
 /// rehydration. Sibling of `RowCapsule::SELECT_BASE` / `RowCapsule::from_row`.
 ///
-/// The two-pass shape (collect raw tuples first, then build `Attempt`) is
+/// The two-pass shape (collect raw rows first, then build `Attempt`) is
 /// deliberate: the closure passed to `query_map` returns `rusqlite::Result`,
 /// but `json::from_str` and `parse_iso8601` produce other error types — so
 /// the JSON/ISO-8601 decode lives outside the closure.
@@ -2086,43 +2086,62 @@ fn load_attempts_for_capsule(
     conn: &Connection,
     capsule_id: &str,
 ) -> Result<Vec<capsule_core::Attempt>> {
-    let mut stmt = conn.prepare(
-        "SELECT attempt_id, lease_json, branch, witness_branch, base_sha, tip_sha,
-                last_heartbeat, outcome, opened_at, closed_at
-         FROM attempt WHERE capsule_id = ?1 ORDER BY attempt_id ASC",
-    )?;
+    let mut stmt = conn.prepare(RowAttempt::SELECT)?;
     let rows = stmt
-        .query_map(params![capsule_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, Option<String>>(9)?,
-            ))
-        })?
+        .query_map(params![capsule_id], RowAttempt::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter()
-        .map(|(id, lease_json, branch, wb, base_sha, tip_sha, hb, outcome, opened, closed)| {
-            Ok(capsule_core::Attempt {
-                id: id as u64,
-                lease: json::from_str(&lease_json)?,
-                branch,
-                witness_branch: wb,
-                base_sha,
-                tip_sha,
-                last_heartbeat: parse_iso8601(&hb),
-                outcome: parse_outcome(&outcome),
-                opened_at: parse_iso8601(&opened),
-                closed_at: closed.map(|s| parse_iso8601(&s)),
-            })
+    rows.into_iter().map(RowAttempt::into_attempt).collect()
+}
+
+struct RowAttempt {
+    attempt_id: i64,
+    lease_json: String,
+    branch: String,
+    witness_branch: String,
+    base_sha: String,
+    tip_sha: Option<String>,
+    last_heartbeat: String,
+    outcome: String,
+    opened_at: String,
+    closed_at: Option<String>,
+}
+
+impl RowAttempt {
+    /// Sibling of `RowCapsule::SELECT_BASE`. Read by name in `from_row` so a
+    /// future column reorder is safe.
+    const SELECT: &'static str = "SELECT attempt_id, lease_json, branch, witness_branch, base_sha,
+                tip_sha, last_heartbeat, outcome, opened_at, closed_at
+         FROM attempt WHERE capsule_id = ?1 ORDER BY attempt_id ASC";
+
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            attempt_id: r.get("attempt_id")?,
+            lease_json: r.get("lease_json")?,
+            branch: r.get("branch")?,
+            witness_branch: r.get("witness_branch")?,
+            base_sha: r.get("base_sha")?,
+            tip_sha: r.get("tip_sha")?,
+            last_heartbeat: r.get("last_heartbeat")?,
+            outcome: r.get("outcome")?,
+            opened_at: r.get("opened_at")?,
+            closed_at: r.get("closed_at")?,
         })
-        .collect()
+    }
+
+    fn into_attempt(self) -> Result<capsule_core::Attempt> {
+        Ok(capsule_core::Attempt {
+            id: self.attempt_id as u64,
+            lease: json::from_str(&self.lease_json)?,
+            branch: self.branch,
+            witness_branch: self.witness_branch,
+            base_sha: self.base_sha,
+            tip_sha: self.tip_sha,
+            last_heartbeat: parse_iso8601(&self.last_heartbeat),
+            outcome: parse_outcome(&self.outcome),
+            opened_at: parse_iso8601(&self.opened_at),
+            closed_at: self.closed_at.as_deref().map(parse_iso8601),
+        })
+    }
 }
 
 // Wire string round-trips live on the enum (capsule_core::model). The SQL CHECK
