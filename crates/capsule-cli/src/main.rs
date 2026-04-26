@@ -669,6 +669,18 @@ fn load_session_attempt(
     })
 }
 
+/// One synchronous heartbeat before the child spawns: fails fast if the lease
+/// already expired or drifted to another session (worktree setup may have
+/// consumed TTL), and refreshes expiry so the heartbeat thread's first tick
+/// has full headroom.
+fn pre_spawn_heartbeat(dir: &Path, capsule_id: &str, session: &str) -> Result<()> {
+    let mut store = open_store(dir)?;
+    store
+        .heartbeat(capsule_id, session)
+        .context("pre-spawn heartbeat (lease lost before child started)")?;
+    Ok(())
+}
+
 /// `capsule work`: spawn child, heartbeat in a thread at `ttl/3` cadence on a
 /// second SQLite connection (WAL makes same-process dual connections safe), and
 /// forward the child's exit code. No custom signal handlers — terminal signals
@@ -702,19 +714,8 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
         None
     };
 
-    // Heartbeat once before spawning the child: fails fast on already-expired
-    // or cross-session leases (worktree setup may have consumed TTL), and
-    // refreshes expiry so the first thread tick has full headroom.
-    {
-        let mut hb = open_store(dir)?;
-        hb.heartbeat(&args.capsule_id, &args.session)
-            .context("pre-spawn heartbeat (lease lost before child started)")?;
-    }
+    pre_spawn_heartbeat(dir, &args.capsule_id, &args.session)?;
 
-    // Shutdown signaled by dropping `stop_tx` in the parent: the heartbeat
-    // thread's `recv_timeout` returns `Disconnected` immediately, eliminating
-    // the prior 200ms polling tick (and shaving up to that much off shutdown
-    // latency on child exit).
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     // Lease lost mid-run: flag set, child NOT killed, parent exits non-zero.
     // `AtomicBool` rather than a second channel because the parent reads it
