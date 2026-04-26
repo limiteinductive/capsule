@@ -38,7 +38,6 @@ pub struct InitOpts {
 }
 
 pub fn run(opts: InitOpts) -> Result<InitReport> {
-    // Store bootstrap — opening the Store creates `<dir>/state.db` and applies migrations.
     let db = opts.dir.join("state.db");
     let _ = capsule_store::Store::open(&db)
         .with_context(|| format!("opening store at {}", db.display()))?;
@@ -121,6 +120,22 @@ fn parse_git_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Render a path as a gitignore directory pattern: POSIX `/` separators
+/// regardless of host OS, with a trailing `/` so git treats it as a dir.
+/// Returns `None` for the empty path (worktree root), where ignoring the
+/// pattern would shadow the entire repo.
+fn format_gitignore_dir_pattern(rel: &Path) -> Option<String> {
+    let joined = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    if joined.is_empty() {
+        return None;
+    }
+    Some(format!("{joined}/"))
+}
+
 /// Append a rule for the store dir to the worktree-root `.gitignore`, idempotently.
 ///
 /// Returns `(Some(path), None)` on write, `(None, Some(reason))` on skip.
@@ -156,19 +171,12 @@ fn maybe_update_gitignore(
         }
     };
 
-    // Gitignore is POSIX-sep + trailing slash to mark a dir.
-    let mut line = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/");
-    if line.is_empty() {
+    let Some(line) = format_gitignore_dir_pattern(&rel) else {
         return Ok((
             None,
             Some("store dir equals worktree root — refusing to ignore the repo".to_string()),
         ));
-    }
-    line.push('/');
+    };
 
     let gi_path = abs_worktree.join(".gitignore");
     let current = fs::read_to_string(&gi_path).unwrap_or_default();
