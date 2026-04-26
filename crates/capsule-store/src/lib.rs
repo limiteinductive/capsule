@@ -1514,15 +1514,18 @@ fn emit_operational_incident(
 ///
 /// For every matching attempt: marks `outcome=expired`, sets `closed_at=now`,
 /// clears `verification_json`, sets capsule `status=planned`, clears
-/// `active_attempt`, and emits an `attempt_expired` event.
+/// `active_attempt`, and emits an `attempt_expired` event with the DESIGN §6
+/// payload `{at, prior_lease_expires_at}` (the prior expiry is pass-through
+/// from `json_extract`, same canonical form `format_iso8601` would produce).
+///
+/// The candidate query projects only `$.expires_at` from `lease_json` — full
+/// lease blob stays inside SQLite. The expiry compare still happens in Rust
+/// via `parse_iso8601`, not as a SQL lex-compare on the stored string,
+/// because `Iso8601::DEFAULT` uses `SubsecondDigits::OneOrMore` and may
+/// elide trailing zeros.
 fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) -> Result<()> {
     let now_str = format_iso8601(now)?;
 
-    // Project just `$.expires_at` from `lease_json`; the full lease blob stays
-    // inside SQLite. The expiry compare still happens in Rust (via
-    // `parse_iso8601`) because `Iso8601::DEFAULT` uses
-    // `SubsecondDigits::OneOrMore` — trailing zeros may be elided, so a SQL
-    // lex-compare on the stored string isn't safe across all values.
     let mut stmt = tx.prepare_cached(concat!(
         "SELECT c.id, c.active_attempt,
                 json_extract(a.lease_json, '$.expires_at')
@@ -1567,9 +1570,6 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
               WHERE id=?2",
             params![now_str, capsule_id],
         )?;
-        // DESIGN.md §6 attempt_expired payload: {at, prior_lease_expires_at}.
-        // `expires_at_str` is pass-through from json_extract; same canonical
-        // form `format_iso8601` would produce.
         let payload = json::json!({
             "at": now_str,
             "prior_lease_expires_at": expires_at_str,
