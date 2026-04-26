@@ -778,29 +778,13 @@ impl Store {
                 LandOutcome::WitnessOidMismatch
             }
             GitOutcome::OtherFailure { stderr } => {
-                // Per DESIGN: not enumerated in §7.1.2 step 5 (only base_ref_moved
-                // and witness_oid_mismatch are). Treat as transient: clear
-                // pending_land so the caller can retry without manual unfreeze;
-                // bubble the stderr up as an error.
-                clear_pending_land(
+                record_transient_land_failure(
                     &tx,
                     &now_str,
                     &req.capsule_id,
-                    Some(attempt_id),
+                    attempt_id,
                     &req.lander,
-                    PendingLandClearedReason::OtherFailure,
-                )?;
-                // DESIGN §6 keeps `pending_land_cleared` slim ({reason, by}); push
-                // stderr out to a paired `operational_incident` so operators
-                // still have the diagnostic.
-                emit_operational_incident(
-                    &tx,
-                    &now_str,
-                    &req.capsule_id,
-                    Some(attempt_id),
-                    &req.lander,
-                    OperationalIncidentKind::LandOtherFailure,
-                    json::json!({ "stderr": stderr }),
+                    &stderr,
                 )?;
                 tx.commit()?;
                 return Err(StoreError::LandOtherFailure(stderr));
@@ -2356,6 +2340,39 @@ fn clear_pending_land(
         by,
         EventKind::PendingLandCleared,
         &payload,
+    )
+}
+
+/// `Store::land` step 4: handle a push failure that DESIGN §7.1.2 step 5 does
+/// not enumerate (i.e. neither base_ref_moved nor witness_oid_mismatch).
+/// Treat as transient — clear `pending_land` so the caller can retry without
+/// manual unfreeze, and emit a paired `operational_incident` carrying the
+/// stderr. The pair-emit exists because §6 pins `pending_land_cleared` to a
+/// slim `{reason, by}` shape, so the diagnostic rides a separate event row.
+fn record_transient_land_failure(
+    tx: &rusqlite::Transaction<'_>,
+    now_str: &str,
+    capsule_id: &str,
+    attempt_id: i64,
+    by: &str,
+    stderr: &str,
+) -> Result<()> {
+    clear_pending_land(
+        tx,
+        now_str,
+        capsule_id,
+        Some(attempt_id),
+        by,
+        PendingLandClearedReason::OtherFailure,
+    )?;
+    emit_operational_incident(
+        tx,
+        now_str,
+        capsule_id,
+        Some(attempt_id),
+        by,
+        OperationalIncidentKind::LandOtherFailure,
+        json::json!({ "stderr": stderr }),
     )
 }
 
