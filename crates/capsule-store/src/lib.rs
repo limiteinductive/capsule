@@ -1987,8 +1987,14 @@ impl AmendUpdate {
         diff_key: &str,
         value: &T,
     ) -> Result<()> {
-        self.bind_sql_only(col, json::to_string(value)?.into());
-        self.diff.insert(diff_key.into(), json::to_value(value)?);
+        // Walk `T` once: render to `Value` for the audit diff, then derive
+        // compact JSON text from that same semantic value for the SQL column.
+        // Output is semantically equivalent to a direct `to_string`, not
+        // byte-identical (the `Value` path emits object keys in sorted order
+        // — fine since reads round-trip via `serde_json::from_str`).
+        let v = json::to_value(value)?;
+        self.bind_sql_only(col, v.to_string().into());
+        self.diff.insert(diff_key.into(), v);
         Ok(())
     }
 }
