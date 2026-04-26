@@ -2093,9 +2093,9 @@ impl RowCapsule {
 /// rehydration. Sibling of `RowCapsule::SELECT_BASE` / `RowCapsule::from_row`.
 ///
 /// Streamed rather than `query_map`-collected: `query_map`'s closure must
-/// return `rusqlite::Result`, but `into_attempt` raises `StoreError` (JSON +
-/// ISO-8601 decode), so a one-pass `while let Some(row) = rows.next()?` lets
-/// both error kinds short-circuit the loop without an intermediate Vec.
+/// return `rusqlite::Result`, but `into_attempt` raises `StoreError` on
+/// `lease_json` decode, so a one-pass `while let Some(row) = rows.next()?`
+/// lets both error kinds short-circuit the loop without an intermediate Vec.
 fn load_attempts_for_capsule(
     conn: &Connection,
     capsule_id: &str,
@@ -2104,7 +2104,8 @@ fn load_attempts_for_capsule(
     let mut rows = stmt.query(params![capsule_id])?;
     let mut attempts = Vec::new();
     while let Some(row) = rows.next()? {
-        attempts.push(RowAttempt::from_row(row)?.into_attempt()?);
+        let raw = RowAttempt::from_row(row)?;
+        attempts.push(raw.into_attempt()?);
     }
     Ok(attempts)
 }
