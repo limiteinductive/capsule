@@ -790,11 +790,14 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
 }
 
 fn join_scope(prefixes: &[CanonicalPath]) -> String {
-    prefixes
-        .iter()
-        .map(CanonicalPath::as_str)
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut out = String::new();
+    for (i, p) in prefixes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(p.as_str());
+    }
+    out
 }
 
 /// One-line tab-separated summary used by both `list` (one row per capsule)
