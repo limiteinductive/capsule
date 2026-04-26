@@ -733,12 +733,7 @@ impl Store {
         let (now, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
-        // CAS: re-read pending_land_json in tx. If it has been mutated since
-        // step 2 (concurrent reconcile / force_unfreeze finalized this same
-        // pending), abort. Mirrors `reconcile_inner` (§7.1.2 / §7.2). The
-        // observable git state has already been recorded by the winner.
-        let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
-        if cur_pending.as_deref() != Some(pending_json.as_str()) {
+        if !pending_land_snapshot_unchanged(&tx, &req.capsule_id, &pending_json)? {
             tx.commit()?;
             return Err(StoreError::LandRaceLost(req.capsule_id));
         }
@@ -1037,10 +1032,7 @@ impl Store {
         let witness_state_json = witness_remote_state_json(&witness_state);
 
         let tx = self.conn.transaction()?;
-        // CAS: re-read pending_land in tx. If it has been mutated since the
-        // outside read, abort with a no-op (another reconciler/lander won).
-        let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
-        if cur_pending.as_deref() != Some(snapshot_json.as_str()) {
+        if !pending_land_snapshot_unchanged(&tx, &req.capsule_id, &snapshot_json)? {
             // DESIGN §6 reconciler_ran: emit on every reconciler invocation
             // that reached the witness ls-remote, including CAS-lost no-ops.
             emit_reconciler_ran(
@@ -1800,6 +1792,20 @@ fn load_pending_land_json(
         |r| r.get(0),
     )
     .or_not_found(capsule_id)
+}
+
+/// CAS check on `pending_land_json`: true iff the in-tx column still equals
+/// the bytes the caller snapshotted earlier. False ⇒ a concurrent reconcile
+/// / force_unfreeze / lander finalized this same pending; the observable git
+/// state has already been recorded by the winner. Both `Store::land` step 4
+/// and `reconcile_inner` gate their finalize work on this (§7.1.2 / §7.2).
+fn pending_land_snapshot_unchanged(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    snapshot_json: &str,
+) -> Result<bool> {
+    let cur = load_pending_land_json(tx, capsule_id)?;
+    Ok(cur.as_deref() == Some(snapshot_json))
 }
 
 /// Shared preamble for `add_dep`/`remove_dep`: load `depends_on_json` and
