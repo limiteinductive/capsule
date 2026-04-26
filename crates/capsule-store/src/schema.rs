@@ -147,15 +147,13 @@ mod tests {
     /// a real parser.
     fn extract_check_in_list(sql: &str, column: &str) -> std::collections::HashSet<String> {
         let needle = format!("CHECK ({column} IN");
-        let (_, after) = sql
+        let after = sql
             .split_once(&needle)
-            .unwrap_or_else(|| panic!("CHECK ({column} IN ...) not found in:\n{sql}"));
-        let open = after.find('(').expect("IN list open paren");
-        let close = open
-            + after[open..]
-                .find(')')
-                .expect("IN list close paren");
-        after[open + 1..close]
+            .unwrap_or_else(|| panic!("CHECK ({column} IN ...) not found in:\n{sql}"))
+            .1;
+        let after_open = after.split_once('(').expect("IN list open paren").1;
+        let inside = after_open.split_once(')').expect("IN list close paren").0;
+        inside
             .split(',')
             .map(|tok| {
                 let t = tok.trim();
