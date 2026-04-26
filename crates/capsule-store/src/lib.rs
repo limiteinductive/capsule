@@ -1371,12 +1371,13 @@ fn emit_force_unfreeze_invoked(
 
 /// Emit a `reconciler_ran` event with the canonical
 /// `{decision, witness_remote_state}` payload (DESIGN.md §6). The contract:
-/// every reconciler invocation that reached the witness `ls-remote` emits
-/// exactly one of these — including CAS-lost no-ops, which let dashboards
-/// see the reconciler tried even when another writer beat it. Both call
-/// sites in `reconcile_inner` (CAS-lost no-op and final outcome) route
-/// through this helper so the payload shape stays structurally identical
-/// and a future payload-key tweak lands in one place.
+/// every reconciler invocation that successfully completed the witness
+/// `ls-remote` and classified a witness state emits exactly one of these —
+/// including CAS-lost no-ops, so audit/observability consumers can see the
+/// reconciler tried even when another writer beat it. Both call sites in
+/// `reconcile_inner` (CAS-lost no-op and final outcome) route through this
+/// helper so the payload shape stays structurally identical and a future
+/// payload-key tweak lands in one place.
 fn emit_reconciler_ran(
     tx: &rusqlite::Transaction<'_>,
     now_str: &str,
