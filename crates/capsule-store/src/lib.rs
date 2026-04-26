@@ -185,8 +185,6 @@ impl Store {
     /// Create a new capsule. Caller supplies the id (typically a uuid). All
     /// fields validated; status starts at `planned`.
     pub fn create_capsule(&mut self, c: NewCapsule) -> Result<Capsule> {
-        // Use an explicit branch so the invalid-id path can move `c.id` into
-        // the error while the success path can move it into `Capsule.id`.
         if let Err(e) = capsule_core::id::validate(&c.id) {
             return Err(StoreError::InvalidId(c.id, e.to_string()));
         }
@@ -423,7 +421,6 @@ impl Store {
 
         let branch = format!("capsules/{}/a{}", req.capsule_id, next_id);
         let witness_branch = format!("capsule-witness/{}/a{}", req.capsule_id, next_id);
-        // Lease is the canonical home for owner + session from claim through land.
         let lease = Lease {
             owner: req.owner,
             session_id: req.session_id,
@@ -644,12 +641,14 @@ impl Store {
 
         // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
         let cap = self.get_capsule(&req.capsule_id)?;
-        let LandableSnapshot {
+        let Some(LandableSnapshot {
             base_ref,
             witness_branch,
             verified_sha,
-        } = LandableSnapshot::extract(cap)
-            .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
+        }) = LandableSnapshot::extract(cap)
+        else {
+            return Err(StoreError::NotLandable(req.capsule_id));
+        };
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
         // ---- Step 2: write PendingLand under preconditions. ----
@@ -979,7 +978,6 @@ impl Store {
 
         let (now, now_str) = now_pair()?;
 
-        // Outside-tx read of pending_land. We snapshot the JSON for CAS.
         let pending_json = load_pending_land_json(&self.conn, &req.capsule_id)?;
         let Some(snapshot_json) = pending_json else {
             // Reconciler is a no-op when nothing is frozen (DESIGN §7.1.2 —
@@ -1021,8 +1019,6 @@ impl Store {
             .as_ref()
             .map(|(op, _)| op.clone())
             .unwrap_or_else(|| actor::RECONCILER.into());
-        // SQLite INTEGER is i64; AttemptId is u64. Hoisted before the CAS
-        // check so reconciler_ran on the CasLost path can bind it too.
         let attempt_id_i64 = pending.attempt_id as i64;
         let witness_state_json = witness_remote_state_json(&witness_state);
 
