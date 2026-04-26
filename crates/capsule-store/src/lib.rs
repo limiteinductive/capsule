@@ -416,17 +416,17 @@ impl Store {
         }
 
         if let Some(other_id) = find_scope_conflict(&tx, &req.capsule_id, &scope_json)? {
-            return Err(StoreError::ScopeConflict(req.capsule_id.clone(), other_id));
+            return Err(StoreError::ScopeConflict(req.capsule_id, other_id));
         }
 
         let next_id = next_attempt_id(&tx, &req.capsule_id)?;
 
         let branch = format!("capsules/{}/a{}", req.capsule_id, next_id);
         let witness_branch = format!("capsule-witness/{}/a{}", req.capsule_id, next_id);
-        // Lease is the canonical home for owner from claim through land.
+        // Lease is the canonical home for owner + session from claim through land.
         let lease = Lease {
             owner: req.owner,
-            session_id: req.session_id.clone(),
+            session_id: req.session_id,
             acquired_at: now,
             expires_at: expires,
             ttl_sec: req.lease_ttl_sec,
@@ -456,7 +456,7 @@ impl Store {
 
         let claimed_payload = json::to_value(ClaimedPayload {
             attempt_id: next_id,
-            session_id: &req.session_id,
+            session_id: &lease.session_id,
             base_sha: &req.base_sha,
             lease: &lease,
         })?;
@@ -465,7 +465,7 @@ impl Store {
             &now_str,
             &req.capsule_id,
             Some(next_id),
-            &req.session_id,
+            &lease.session_id,
             EventKind::AttemptClaimed,
             &claimed_payload,
         )?;
@@ -674,7 +674,7 @@ impl Store {
                 .or_not_found(&req.capsule_id)?;
 
             if pending_land_json.is_some() {
-                return Err(StoreError::PendingLandFrozen(req.capsule_id.clone()));
+                return Err(StoreError::PendingLandFrozen(req.capsule_id));
             }
             let status = parse_status(&status_str);
             if status != Status::Accepted {
