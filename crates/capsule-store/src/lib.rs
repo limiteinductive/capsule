@@ -1635,11 +1635,10 @@ fn find_scope_conflict(
     ))?;
     let mut rows = stmt.query(params![capsule_id])?;
     while let Some(row) = rows.next()? {
-        let other_id: String = row.get(0)?;
         let other_scope_json: String = row.get(1)?;
         let other: Vec<CanonicalPath> = json::from_str(&other_scope_json)?;
         if CanonicalPath::any_overlap(&our_scope, &other) {
-            return Ok(Some(other_id));
+            return Ok(Some(row.get(0)?));
         }
     }
     Ok(None)
