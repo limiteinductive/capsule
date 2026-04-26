@@ -3134,6 +3134,40 @@ mod tests {
         assert_eq!(keys, vec!["at", "prior_lease_expires_at"]);
     }
 
+    /// Pin byte-for-byte: `prior_lease_expires_at` in the emitted
+    /// `attempt_expired` event equals `$.expires_at` as stored in
+    /// `lease_json` (iter 172 dropped the parse + re-format and now
+    /// passes the `json_extract` string straight through to the payload).
+    /// If a future change drifts the stored ISO-8601 form away from what
+    /// `format_iso8601` produces, this test fails.
+    #[test]
+    fn reclaim_event_payload_matches_stored_expires_at_byte_for_byte() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        // Capture `$.expires_at` exactly as stored, before reclaim closes the
+        // attempt and the row is gone from the live join.
+        let stored_expires_at: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", 1i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let _ = s.list_capsules(ListFilter::default()).unwrap();
+
+        let v = read_event_payload(&s, "x", "attempt_expired");
+        let payload_str = v
+            .get("prior_lease_expires_at")
+            .and_then(|v| v.as_str())
+            .expect("prior_lease_expires_at must be a string");
+        assert_eq!(payload_str, stored_expires_at);
+    }
+
     #[test]
     fn reclaim_does_not_touch_unrelated_capsules() {
         let mut s = tmp_store();
