@@ -687,16 +687,10 @@ impl Store {
             if status != Status::Accepted {
                 return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Land, status));
             }
-            // status=Accepted ⇒ active_attempt is Some and verification_json is
-            // set (DESIGN §3.3 + §7.1.1: attest is the only path into Accepted
-            // and writes both atomically). None here ⇒ DB corruption; mirrors
-            // attest/heartbeat's invariant assertions.
             let aid = active_attempt.expect("accepted ⇒ active_attempt set");
             attempt_id = aid;
             let v_json = verification_json.expect("accepted ⇒ verification set");
             let v: Verification = json::from_str(&v_json)?;
-            // Re-bind verified_sha from the in-tx read (defense-in-depth: no
-            // gap between read and PendingLand write).
             if v.verified_sha != verified_sha {
                 return Err(StoreError::NotLandable(req.capsule_id));
             }
@@ -711,10 +705,8 @@ impl Store {
                 witness_branch: witness_branch.clone(),
                 lander: req.lander.clone(),
             };
-            // Build the canonical Value once; the String form serializes the
-            // SQL `pending_land_json` column AND is compared in step 3's CAS,
-            // and the same Value goes to the event payload — so both paths
-            // see identical bytes by construction.
+            // SQL bytes (used in step 4's CAS) and event payload share one
+            // serialization so both paths see identical bytes by construction.
             let pending_value = json::to_value(&pending)?;
             pending_json = pending_value.to_string();
 
@@ -948,11 +940,7 @@ impl Store {
         if deps.contains(&req.depends_on) {
             return Ok(());
         }
-        // Cycle check: BFS from `depends_on` over depends_on edges; if we
-        // reach `capsule_id`, adding the edge would close a cycle. Self-dep
-        // is the reflexive `reachable(x, x) == true` case — see `reachable`'s
-        // doc-comment.
-        if reachable(&tx, &req.depends_on, &req.capsule_id)? {
+        if creates_cycle(&tx, &req.capsule_id, &req.depends_on)? {
             return Err(StoreError::DependencyCycle(
                 req.capsule_id,
                 req.depends_on,
@@ -1859,11 +1847,22 @@ fn load_deps_for_mutation(
     Ok(Some(json::from_str(&deps_json)?))
 }
 
+/// True iff adding `capsule_id -> new_dep` to the depends_on graph would
+/// close a cycle (DESIGN.md §7.1.3). Equivalent to: is `capsule_id`
+/// reachable from `new_dep`? Self-dep falls out reflexively from
+/// `reachable(tx, x, x) == true`.
+fn creates_cycle(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    new_dep: &str,
+) -> Result<bool> {
+    reachable(tx, new_dep, capsule_id)
+}
+
 /// BFS over the `depends_on` graph from `from` looking for `target`.
-/// Used by `add_dep` for cycle rejection (DESIGN.md §7.1.3). Reachability is
-/// reflexive: `reachable(tx, x, x)` returns true (the graph-theory definition
-/// — `add_dep` relies on this so that the self-dep case is not a separate
-/// branch). Preserve this when refactoring.
+/// Reachability is reflexive: `reachable(tx, x, x)` returns true (the
+/// graph-theory definition — `creates_cycle` relies on this so the
+/// self-dep case is not a separate branch). Preserve this when refactoring.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<String> = HashSet::new();
