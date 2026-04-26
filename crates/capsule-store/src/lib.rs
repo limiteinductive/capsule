@@ -496,7 +496,7 @@ impl Store {
         }
         let aid = active_attempt.expect("active ⇒ active_attempt set");
 
-        load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
+        assert_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
         let acceptance: Acceptance = json::from_str(&acceptance_json)?;
         let verification = Verification {
@@ -676,7 +676,7 @@ impl Store {
                 return Err(StoreError::NotLandable(req.capsule_id));
             }
 
-            load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
+            assert_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
             let pending = PendingLand {
                 at: now,
@@ -1684,11 +1684,14 @@ fn retain_available(
         .collect())
 }
 
-/// Raw lease loader; centralizes the SQL + JSON-shape contract. Prefer the
-/// invariant-asserting wrapper `load_live_lease_for_session` at call sites
-/// when the full lease body is needed; for ownership-only checks (e.g.
-/// `abandon`), use `assert_session_owns_attempt`, which keeps the lease blob
-/// inside SQLite via `json_extract`.
+/// Raw lease loader; centralizes the SQL + JSON-shape contract. Used by
+/// `load_live_lease_for_session` (heartbeat path — needs `ttl_sec` + the
+/// `..lease` rebuild). For predicate-only callers, prefer the
+/// `assert_*_lease_for_session` family which keeps the lease blob inside
+/// SQLite via `json_extract`:
+///   - `assert_session_owns_attempt` (ownership only — `abandon`).
+///   - `assert_live_lease_for_session` (ownership + non-expiry — `attest`,
+///     `land` step 2).
 fn load_lease(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1702,8 +1705,10 @@ fn load_lease(
     Ok(json::from_str(&lease_json)?)
 }
 
-/// Lease invariant for `attest` / `heartbeat` / `land`: caller owns it AND
-/// it has not expired.
+/// Live-lease loader for `heartbeat`, which consumes `ttl_sec` to rebuild
+/// the lease (`..lease`) for the renewal write. `attest` and `land` step 2
+/// use `assert_live_lease_for_session` instead — same precedence, but
+/// without materializing the body.
 fn load_live_lease_for_session(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1741,6 +1746,38 @@ fn assert_session_owns_attempt(
     )?;
     if owner != session_id {
         return Err(StoreError::CrossSession);
+    }
+    Ok(())
+}
+
+/// Live-lease assertion for callers that don't consume the lease body
+/// (`attest`, `land` step 2). Projects only `session_id` + `expires_at` via
+/// `json_extract`, so the full lease blob stays inside SQLite — saves one
+/// String alloc + one `serde_json::from_str::<Lease>` parse per call vs
+/// `load_live_lease_for_session`. Precedence (CrossSession before
+/// LeaseExpired) matches `load_live_lease_for_session`; the
+/// `cross_session_outranks_expired_lease` test pins this via the heartbeat
+/// path, and we replicate the order here.
+fn assert_live_lease_for_session(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+    session_id: &str,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let (owner, expires_at_str): (String, String) = tx.query_row(
+        "SELECT json_extract(lease_json, '$.session_id'),
+                json_extract(lease_json, '$.expires_at')
+         FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        params![capsule_id, attempt_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if owner != session_id {
+        return Err(StoreError::CrossSession);
+    }
+    let expires_at = parse_iso8601(&expires_at_str);
+    if now > expires_at {
+        return Err(StoreError::LeaseExpired(expires_at_str));
     }
     Ok(())
 }
@@ -3000,6 +3037,35 @@ mod tests {
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let err = s.heartbeat("x", "wrong").unwrap_err();
+        assert!(
+            matches!(err, StoreError::CrossSession),
+            "expected CrossSession, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn attest_cross_session_outranks_expired_lease() {
+        // Parallel pin to `cross_session_outranks_expired_lease` for the
+        // `assert_live_lease_for_session` helper. `attest` does not run
+        // reclaim before lease load, so status stays `active` and the
+        // CrossSession-before-LeaseExpired precedence is observable here too.
+        // The two helpers are independently evolvable; without this pin a
+        // future tweak could drift one without the other failing.
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let err = s
+            .attest(AttestRequest {
+                capsule_id: "x".into(),
+                session_id: "wrong".into(),
+                verified_sha: FAKE_SHA.into(),
+                command: "true".into(),
+                exit_code: capsule_core::ExitCode::Code(0),
+                duration_ms: 1,
+                log_ref: "file:///dev/null".into(),
+            })
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::CrossSession),
             "expected CrossSession, got {err:?}",
