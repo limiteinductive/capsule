@@ -21,6 +21,14 @@ pub type Result<T> = std::result::Result<T, GitError>;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
+// Compile-time pin: ZERO_OID conforms to `sha::validate` (40 lowercase hex).
+// The runtime test elsewhere only checked `len == 40`; this catches a typo
+// (e.g. an `O` in place of `0`) at build time instead.
+const _: () = match capsule_core::sha::validate(ZERO_OID) {
+    Ok(()) => (),
+    Err(_) => panic!("ZERO_OID does not satisfy sha::validate"),
+};
+
 /// Substrings of git's user-facing error messages that classify_push matches
 /// against to map a push failure to a `LandOutcome`. These are NOT git's own
 /// stable API — they're the canonical client's CLI output. Centralizing them
@@ -295,10 +303,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ls_remote_nonexistent_returns_zero_oid() {
-        // Smoke test against a clearly-bogus remote — git will fail or return empty.
-        // We only assert the API shape (ZERO_OID len = 40).
-        assert_eq!(ZERO_OID.len(), 40);
+    fn zero_oid_is_valid_sha() {
+        // Doubles the build-time `const _: ()` pin in test surface, so a
+        // typo in ZERO_OID surfaces in `cargo test` output as well.
+        capsule_core::sha::validate(ZERO_OID).unwrap();
     }
 
     #[test]

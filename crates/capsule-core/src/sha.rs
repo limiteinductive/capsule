@@ -21,16 +21,19 @@ pub enum ShaError {
     NotLowercase,
 }
 
-pub fn validate(s: &str) -> Result<(), ShaError> {
+pub const fn validate(s: &str) -> Result<(), ShaError> {
     if s.len() != 40 {
         return Err(ShaError::BadLength(s.len()));
     }
-    for (i, b) in s.bytes().enumerate() {
-        match b {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
             b'0'..=b'9' | b'a'..=b'f' => {}
             b'A'..=b'F' => return Err(ShaError::NotLowercase),
             _ => return Err(ShaError::NonHex(i)),
         }
+        i += 1;
     }
     Ok(())
 }
