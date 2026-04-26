@@ -1735,11 +1735,13 @@ fn load_lease_owner_allow_expired(
 }
 
 /// Read `pending_land_json` for a capsule. Returns `Ok(None)` when the column
-/// is NULL, `Err(NotFound)` if the capsule does not exist. Used by every CAS
-/// site that snapshots or re-reads the pending-land flag — `land` step 4 and
-/// `reconcile_inner` (DESIGN.md §7.1.2). Accepts `&Connection` so that
-/// `&Transaction` (which derefs to `&Connection`) callers work without
-/// per-shape duplication.
+/// is NULL, `Err(NotFound)` if the capsule does not exist. Used when the
+/// caller actually needs the JSON body — `reconcile_inner` deserializes it
+/// into `PendingLand` to drive the witness comparison (DESIGN.md §7.1.2).
+/// Callers that only need snapshot equality should use
+/// `pending_land_snapshot_unchanged`, which keeps the blob inside SQLite.
+/// Accepts `&Connection` so that `&Transaction` (which derefs to
+/// `&Connection`) callers work without per-shape duplication.
 fn load_pending_land_json(
     conn: &rusqlite::Connection,
     capsule_id: &str,
@@ -1762,8 +1764,20 @@ fn pending_land_snapshot_unchanged(
     capsule_id: &str,
     snapshot_json: &str,
 ) -> Result<bool> {
-    let cur = load_pending_land_json(tx, capsule_id)?;
-    Ok(cur.as_deref() == Some(snapshot_json))
+    // SQL-side byte compare so the pending_land JSON blob never crosses into
+    // Rust just to be re-equality-checked. `pending_land_json IS NOT NULL AND
+    // pending_land_json = ?2` projects directly to a 0/1 the row reader hands
+    // back as `bool`. The `IS NOT NULL` guard normalizes NULL to false: under
+    // SQLite's three-valued logic `NULL = ?2` would itself be NULL (not 0),
+    // which would surface to Rust as a row-decode error rather than the
+    // expected "freeze cleared, snapshot does not match" boolean.
+    tx.query_row(
+        "SELECT pending_land_json IS NOT NULL AND pending_land_json = ?2
+         FROM capsule WHERE id = ?1",
+        params![capsule_id, snapshot_json],
+        |r| r.get(0),
+    )
+    .or_not_found(capsule_id)
 }
 
 /// SQL-side existence check for the §7.2 reclaim/abandon freeze flag,
