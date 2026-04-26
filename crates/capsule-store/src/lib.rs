@@ -2522,15 +2522,13 @@ mod tests {
         let _ = Store::open(&path).unwrap();
     }
 
+    /// Wire-format pin for the enums whose `as_wire_str` strings ship to
+    /// external consumers (audit-event payloads, --json CLI output, error
+    /// messages). A typo or rename in production call sites would propagate
+    /// silently; the assertions below freeze the (variant, wire) table so
+    /// such drift is a test failure.
     #[test]
     fn store_op_wire_table_pinned() {
-        // Pin (variant, wire) for `StoreOp::as_wire_str`. The strings surface
-        // in `StoreError::WrongStatus.op` (rendered into the user-visible
-        // error message) and are asserted by `matches!(err, WrongStatus {
-        // op: "claim", .. })` test sites — keeping the wire format pinned
-        // here lets those tests stay readable as string literals while the
-        // production callsites become typo-proof. Mirrors
-        // `event_kind_wire_table_pinned`.
         let cases = [
             (StoreOp::Claim, "claim"),
             (StoreOp::Attest, "attest"),
@@ -2542,16 +2540,11 @@ mod tests {
         }
     }
 
+    /// `EventKind` is the subset of DESIGN §6 currently emitted by the
+    /// store; `attempt_heartbeat` / `attempt_released` are spec'd but not
+    /// yet wired up.
     #[test]
     fn event_kind_wire_table_pinned() {
-        // Pin (variant, wire) for `EventKind::as_wire_str`. The strings are
-        // the audit-event vocabulary currently emitted by the store
-        // (subset of DESIGN §6; the spec also lists `attempt_heartbeat` /
-        // `attempt_released`, neither of which is emitted yet). External
-        // consumers — operators, agent runners, dashboards — key on exact
-        // spelling. A typo here ships unnoticed; centralizing in an enum
-        // makes call sites typo-proof and this test makes the wire format
-        // load-bearing. Mirrors `reconcile_outcome_wire_table_pinned`.
         let cases = [
             (EventKind::CapsuleCreated, "capsule_created"),
             (EventKind::CapsuleAmended, "capsule_amended"),
@@ -2575,12 +2568,6 @@ mod tests {
 
     #[test]
     fn reconcile_outcome_wire_table_pinned() {
-        // Pin (variant, wire) for `ReconcileOutcome::as_wire_str`. The strings
-        // surface in the `reconciler_ran` event payload (DESIGN §6) and in the
-        // `--json` output of `capsule reconcile` / `capsule force-unfreeze` —
-        // external consumers (event readers, agents, scripts) lock on the
-        // exact spelling, so a typo or rename in one variant could ship
-        // unnoticed. Mirrors the `status_wire_table_pinned` pattern.
         let cases = [
             (ReconcileOutcome::NotFrozen, "not_frozen"),
             (ReconcileOutcome::CasLost, "cas_lost"),
@@ -2595,10 +2582,6 @@ mod tests {
 
     #[test]
     fn operational_incident_kind_wire_table_pinned() {
-        // Pin (variant, wire) for `OperationalIncidentKind::as_wire_str`.
-        // Surfaces as the `kind` field of the `operational_incident` event
-        // (DESIGN §6) — operator dashboards and audit consumers key on these
-        // strings.
         let cases = [
             (
                 OperationalIncidentKind::WitnessOidMismatch,
@@ -2616,9 +2599,6 @@ mod tests {
 
     #[test]
     fn pending_land_cleared_reason_wire_table_pinned() {
-        // Pin (variant, wire) for `PendingLandClearedReason::as_wire_str`.
-        // Surfaces as the `reason` field of the `pending_land_cleared` event
-        // (DESIGN §6).
         let cases = [
             (PendingLandClearedReason::BaseRefMoved, "base_ref_moved"),
             (PendingLandClearedReason::OtherFailure, "other_failure"),
