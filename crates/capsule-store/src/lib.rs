@@ -655,21 +655,22 @@ impl Store {
             let (now, now_str) = now_pair()?;
             let tx = self.conn.transaction()?;
 
-            let (status_str, active_attempt, pending_land_json, verification_json): (
+            let (status_str, active_attempt, frozen, verification_json): (
                 String,
                 Option<i64>,
-                Option<String>,
+                bool,
                 Option<String>,
             ) = tx
                 .query_row(
-                    "SELECT status, active_attempt, pending_land_json, verification_json
+                    "SELECT status, active_attempt, pending_land_json IS NOT NULL,
+                            verification_json
                      FROM capsule WHERE id = ?1",
                     params![req.capsule_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .or_not_found(&req.capsule_id)?;
 
-            if pending_land_json.is_some() {
+            if frozen {
                 return Err(StoreError::PendingLandFrozen(req.capsule_id));
             }
             let status = parse_status(&status_str);
