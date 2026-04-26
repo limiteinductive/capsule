@@ -1012,8 +1012,6 @@ impl Store {
 
         let tx = self.conn.transaction()?;
         if !pending_land_snapshot_unchanged(&tx, &req.capsule_id, &snapshot_json)? {
-            // DESIGN §6 reconciler_ran: emit on every reconciler invocation
-            // that reached the witness ls-remote, including CAS-lost no-ops.
             emit_reconciler_ran(
                 &tx,
                 &now_str,
@@ -1372,10 +1370,13 @@ fn emit_force_unfreeze_invoked(
 }
 
 /// Emit a `reconciler_ran` event with the canonical
-/// `{decision, witness_remote_state}` payload (DESIGN.md §6). Both branches in
-/// `reconcile_inner` (CAS-lost no-op and final outcome) emit the same shape;
-/// the helper keeps the two payloads structurally identical so a future
-/// payload-key tweak lands in one place.
+/// `{decision, witness_remote_state}` payload (DESIGN.md §6). The contract:
+/// every reconciler invocation that reached the witness `ls-remote` emits
+/// exactly one of these — including CAS-lost no-ops, which let dashboards
+/// see the reconciler tried even when another writer beat it. Both call
+/// sites in `reconcile_inner` (CAS-lost no-op and final outcome) route
+/// through this helper so the payload shape stays structurally identical
+/// and a future payload-key tweak lands in one place.
 fn emit_reconciler_ran(
     tx: &rusqlite::Transaction<'_>,
     now_str: &str,
