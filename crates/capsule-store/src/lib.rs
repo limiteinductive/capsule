@@ -1015,10 +1015,10 @@ impl Store {
         let witness_sha = ls_remote_branch(&req.remote, &pending.witness_branch)?;
         let witness_state = WitnessState::classify(witness_sha, &pending.verified_sha);
 
-        let actor = operator
+        let actor: &str = operator
             .as_ref()
-            .map(|(op, _)| op.clone())
-            .unwrap_or_else(|| actor::RECONCILER.into());
+            .map(|(op, _)| op.as_str())
+            .unwrap_or(actor::RECONCILER);
         let attempt_id_i64 = pending.attempt_id as i64;
         let witness_state_json = witness_remote_state_json(&witness_state);
 
@@ -1031,7 +1031,7 @@ impl Store {
                 &now_str,
                 &req.capsule_id,
                 Some(attempt_id_i64),
-                &actor,
+                actor,
                 ReconcileOutcome::CasLost,
                 &witness_state_json,
             )?;
@@ -1061,7 +1061,7 @@ impl Store {
                     at: now,
                     landed_sha: observed_sha,
                     prior_base_sha: pending.prior_base_sha.clone(),
-                    landed_by: actor.clone(),
+                    landed_by: actor.to_string(),
                     attempt_id: pending.attempt_id,
                     witness_branch: pending.witness_branch.clone(),
                     advanced_base_ref: pending.verified_sha != pending.prior_base_sha,
@@ -1076,7 +1076,7 @@ impl Store {
                     &now_str,
                     &req.capsule_id,
                     Some(attempt_id_i64),
-                    &actor,
+                    actor,
                     OperationalIncidentKind::WitnessOidMismatch,
                     json::json!({
                         "witness_branch": pending.witness_branch,
@@ -1092,7 +1092,7 @@ impl Store {
                     &now_str,
                     &req.capsule_id,
                     Some(attempt_id_i64),
-                    &actor,
+                    actor,
                     PendingLandClearedReason::WitnessAbsent,
                 )?;
                 ReconcileOutcome::Cleared
@@ -1104,7 +1104,7 @@ impl Store {
             &now_str,
             &req.capsule_id,
             Some(attempt_id_i64),
-            &actor,
+            actor,
             outcome,
             &witness_state_json,
         )?;
