@@ -247,13 +247,20 @@ impl PendingLand {
     /// Promote this pending record to the canonical `Landing` once the atomic
     /// push has been observed to advance the witness ref. `at` is the land
     /// commit time; `advanced_base_ref` is `verified_sha != prior_base_sha`
-    /// at the moment the push observed the remote.
-    pub fn into_landing(self, at: OffsetDateTime, advanced_base_ref: bool) -> Landing {
+    /// at the moment the push observed the remote. `landed_by` is the actor
+    /// that finalized the landing — usually `self.lander`, but the reconciler
+    /// (or an operator on `force_unfreeze`) records itself instead.
+    pub fn into_landing(
+        self,
+        at: OffsetDateTime,
+        advanced_base_ref: bool,
+        landed_by: String,
+    ) -> Landing {
         Landing {
             at,
             landed_sha: self.verified_sha,
             prior_base_sha: self.prior_base_sha,
-            landed_by: self.lander,
+            landed_by,
             attempt_id: self.attempt_id,
             witness_branch: self.witness_branch,
             advanced_base_ref,

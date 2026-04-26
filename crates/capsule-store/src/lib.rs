@@ -738,7 +738,8 @@ impl Store {
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
-                let landing = pending.into_landing(now, advanced_base_ref);
+                let lander = pending.lander.clone();
+                let landing = pending.into_landing(now, advanced_base_ref, lander);
                 finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 LandOutcome::Landed { landing }
             }
@@ -1047,21 +1048,10 @@ impl Store {
         }
 
         let outcome = match witness_state {
-            WitnessState::AtVerifiedSha(observed_sha) => {
-                // Push ran before crash. Reconstruct Landing from PendingLand.
-                // Use the *observed* sha (== pending.verified_sha by the
-                // equality check that built this variant) so the data flow
-                // matches the branch's claim rather than reconstructing from
-                // PendingLand.
-                let landing = Landing {
-                    at: now,
-                    landed_sha: observed_sha,
-                    prior_base_sha: pending.prior_base_sha.clone(),
-                    landed_by: actor.to_string(),
-                    attempt_id: pending.attempt_id,
-                    witness_branch: pending.witness_branch.clone(),
-                    advanced_base_ref: pending.verified_sha != pending.prior_base_sha,
-                };
+            WitnessState::AtVerifiedSha(_) => {
+                let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
+                let landing =
+                    pending.clone().into_landing(now, advanced_base_ref, actor.to_string());
                 finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 ReconcileOutcome::Landed
             }
