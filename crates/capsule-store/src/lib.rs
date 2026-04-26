@@ -1889,11 +1889,12 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
     Ok(false)
 }
 
+/// Same-shape equality for the verification gate. Cross-shape mismatches are
+/// enumerated explicitly (not `_ => false`) so that adding a variant to
+/// either `ExpectExit` or `ExitCode` forces compile-time review here — same
+/// exhaustive-match discipline as `Status::is_terminal`.
 fn exit_codes_match(expect: &capsule_core::ExpectExit, got: &capsule_core::ExitCode) -> bool {
     use capsule_core::{ExitCode, ExpectExit};
-    // Cross-shape mismatches enumerated explicitly (not `_ => false`) so a
-    // future variant added to either `ExpectExit` or `ExitCode` forces
-    // compile-time review here — same discipline as `Status::is_terminal`.
     match (expect, got) {
         (ExpectExit::Code(a), ExitCode::Code(b)) => a == b,
         (ExpectExit::Sentinel(a), ExitCode::Sentinel(b)) => a == b,
