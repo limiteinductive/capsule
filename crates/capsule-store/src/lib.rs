@@ -1846,7 +1846,7 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
     let mut q: VecDeque<String> = VecDeque::new();
     q.push_back(from.to_string());
     while let Some(node) = q.pop_front() {
-        if !seen.insert(node.clone()) {
+        if seen.contains(&node) {
             continue;
         }
         if node == target {
@@ -1859,6 +1859,9 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
                 |r| r.get(0),
             )
             .optional()?;
+        // Insert after the query so `params![node]` can borrow it first, then
+        // move the owned ID into `seen` without cloning.
+        seen.insert(node);
         let Some(deps_json) = deps_json else {
             continue;
         };
