@@ -803,7 +803,7 @@ impl Store {
         }
 
         if let Some(aid) = active_attempt {
-            load_lease_owner_allow_expired(&tx, &req.capsule_id, aid, &req.session_id)?;
+            assert_session_owns_attempt(&tx, &req.capsule_id, aid, &req.session_id)?;
             close_attempt(
                 &tx,
                 &req.capsule_id,
@@ -1685,8 +1685,10 @@ fn retain_available(
 }
 
 /// Raw lease loader; centralizes the SQL + JSON-shape contract. Prefer the
-/// named wrappers (`load_live_lease_for_session`, `load_lease_owner_allow_expired`)
-/// at call sites — they spell out the lease invariant being asserted.
+/// invariant-asserting wrapper `load_live_lease_for_session` at call sites
+/// when the full lease body is needed; for ownership-only checks (e.g.
+/// `abandon`), use `assert_session_owns_attempt`, which keeps the lease blob
+/// inside SQLite via `json_extract`.
 fn load_lease(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1719,19 +1721,28 @@ fn load_live_lease_for_session(
     Ok(lease)
 }
 
-/// Lease invariant for `abandon`: caller owns it; expiry is not checked, so
-/// a worker can self-abandon after losing its heartbeat grip (DESIGN.md §3.3).
-fn load_lease_owner_allow_expired(
+/// Lease ownership check for `abandon`: assert the calling session owns the
+/// attempt's lease. Expiry is not checked, so a worker can self-abandon after
+/// losing its heartbeat grip (DESIGN.md §3.3). Projects `lease_json ->
+/// session_id` via `json_extract` so the rest of the lease blob stays inside
+/// SQLite — only the small session_id string crosses the rusqlite boundary,
+/// and the JSON parse on the Rust side is elided entirely.
+fn assert_session_owns_attempt(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
     attempt_id: i64,
     session_id: &str,
-) -> Result<capsule_core::Lease> {
-    let lease = load_lease(tx, capsule_id, attempt_id)?;
-    if lease.session_id != session_id {
+) -> Result<()> {
+    let owner: String = tx.query_row(
+        "SELECT json_extract(lease_json, '$.session_id')
+         FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        params![capsule_id, attempt_id],
+        |r| r.get(0),
+    )?;
+    if owner != session_id {
         return Err(StoreError::CrossSession);
     }
-    Ok(lease)
+    Ok(())
 }
 
 /// Read `pending_land_json` for a capsule. Returns `Ok(None)` when the column
