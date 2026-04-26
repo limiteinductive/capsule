@@ -330,22 +330,22 @@ impl Store {
         let tx = self.conn.transaction()?;
         reclaim_expired_in_tx(&tx, now)?;
 
-        let (q, query_params): (String, Vec<rusqlite::types::Value>) = match filter.status {
+        let (q, status_param): (String, Option<&'static str>) = match filter.status {
             Some(s) => (
                 format!(
                     "{} WHERE status = ?1 ORDER BY created_at ASC",
                     RowCapsule::SELECT_BASE
                 ),
-                vec![s.as_wire_str().to_string().into()],
+                Some(s.as_wire_str()),
             ),
             None => (
                 format!("{} ORDER BY created_at ASC", RowCapsule::SELECT_BASE),
-                vec![],
+                None,
             ),
         };
         let mut stmt = tx.prepare(&q)?;
         let rows: Vec<RowCapsule> = stmt
-            .query_map(rusqlite::params_from_iter(&query_params), RowCapsule::from_row)?
+            .query_map(rusqlite::params_from_iter(status_param), RowCapsule::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
