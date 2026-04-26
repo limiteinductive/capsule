@@ -561,19 +561,21 @@ impl Store {
         load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
         let acceptance: Acceptance = json::from_str(&acceptance_json)?;
+        // From here `verification` is the canonical attestation record: move
+        // owned request fields into it after the live-lease lookup above.
         let verification = Verification {
             at: now,
-            attestor: req.session_id.clone(),
+            attestor: req.session_id,
             attempt_id: aid as u64,
-            verified_sha: req.verified_sha.clone(),
+            verified_sha: req.verified_sha,
             command: req.command,
-            exit_code: req.exit_code.clone(),
+            exit_code: req.exit_code,
             duration_ms: req.duration_ms,
             log_ref: req.log_ref,
         };
         let verification_json = json::to_string(&verification)?;
 
-        let pass = exit_codes_match(&acceptance.expect_exit, &req.exit_code);
+        let pass = exit_codes_match(&acceptance.expect_exit, &verification.exit_code);
         let new_status = if pass {
             Status::Accepted
         } else {
@@ -591,7 +593,7 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE attempt SET tip_sha=?1 WHERE capsule_id=?2 AND attempt_id=?3",
-            params![req.verified_sha, req.capsule_id, aid],
+            params![verification.verified_sha, req.capsule_id, aid],
         )?;
         // DESIGN.md §6 attempt_attested payload: {verified_sha, exit_code,
         // command, log_ref, duration_ms} — the run inputs/outputs. The event
@@ -610,7 +612,7 @@ impl Store {
             &now_str,
             &req.capsule_id,
             Some(aid),
-            &req.session_id,
+            &verification.attestor,
             EventKind::AttemptAttested,
             &event_payload,
         )?;
