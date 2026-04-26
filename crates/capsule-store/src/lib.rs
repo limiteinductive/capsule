@@ -169,16 +169,17 @@ impl Store {
     /// Open or create the store at `db_path`. Idempotent — applies any
     /// pending schema migrations on open. Used by both `init` and the
     /// per-command open path.
+    ///
+    /// Bumps rusqlite's prepared-statement cache from its default 16 to 32:
+    /// `Store` already caches ~14 distinct prepares and the count grows as
+    /// SQL-projection helpers proliferate, so the headroom prevents LRU
+    /// eviction from thrashing the hot path.
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         let db_path = db_path.as_ref();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(db_path)?;
-        // Default rusqlite stmt cache holds 16 entries; we cache ~14
-        // distinct prepares already and the count is still growing as
-        // SQL-projection helpers proliferate. Bump to 32 so LRU
-        // eviction never thrashes our hot path.
         conn.set_prepared_statement_cache_capacity(32);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -593,17 +594,15 @@ impl Store {
         let new_expires = checked_lease_expiry(now, ttl_sec)?;
         let new_expires_str = format_iso8601(new_expires)?;
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE attempt
              SET lease_json = json_set(lease_json, '$.expires_at', ?1),
                  last_heartbeat = ?2
              WHERE capsule_id = ?3 AND attempt_id = ?4",
-            params![new_expires_str, now_str, capsule_id, aid],
-        )?;
-        tx.execute(
-            "UPDATE capsule SET updated_at=?1 WHERE id=?2",
-            params![now_str, capsule_id],
-        )?;
+        )?
+        .execute(params![new_expires_str, now_str, capsule_id, aid])?;
+        tx.prepare_cached("UPDATE capsule SET updated_at=?1 WHERE id=?2")?
+            .execute(params![now_str, capsule_id])?;
 
         tx.commit()?;
         Ok(HeartbeatAck {
@@ -646,24 +645,8 @@ impl Store {
             let (now, now_str) = now_pair()?;
             let tx = self.conn.transaction()?;
 
-            // Project just `$.verified_sha` from `verification_json` for the
-            // in-tx CAS — full Verification blob (`command`, `exit_code`,
-            // `duration_ms`, `log_ref`) is not needed here. Saves one
-            // `serde_json::from_str::<Verification>` per land step 2.
-            let (status_str, active_attempt, frozen, in_tx_verified_sha): (
-                String,
-                Option<i64>,
-                bool,
-                Option<String>,
-            ) = tx
-                .query_row(
-                    "SELECT status, active_attempt, pending_land_json IS NOT NULL,
-                            json_extract(verification_json, '$.verified_sha')
-                     FROM capsule WHERE id = ?1",
-                    params![req.capsule_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .or_not_found(&req.capsule_id)?;
+            let (status_str, active_attempt, frozen, in_tx_verified_sha) =
+                load_land_preconditions(&tx, &req.capsule_id)?;
 
             if frozen {
                 return Err(StoreError::PendingLandFrozen(req.capsule_id));
@@ -1716,6 +1699,25 @@ fn assert_session_owns_attempt(
         return Err(StoreError::CrossSession);
     }
     Ok(())
+}
+
+/// Single-row read for `Store::land` step 2: `(status, active_attempt,
+/// frozen, verified_sha)`. Projects `pending_land_json IS NOT NULL` for the
+/// freeze flag and `json_extract($.verified_sha)` from `verification_json`
+/// so neither full blob crosses into Rust — saves one
+/// `serde_json::from_str::<Verification>` parse per land step 2.
+fn load_land_preconditions(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+) -> Result<(String, Option<i64>, bool, Option<String>)> {
+    tx.query_row(
+        "SELECT status, active_attempt, pending_land_json IS NOT NULL,
+                json_extract(verification_json, '$.verified_sha')
+         FROM capsule WHERE id = ?1",
+        params![capsule_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .or_not_found(capsule_id)
 }
 
 /// Live-lease assertion for callers that don't consume the lease body
