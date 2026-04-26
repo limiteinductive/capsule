@@ -176,14 +176,17 @@ fn classify_push(
     base_ref: &str,
     witness_branch: &str,
 ) -> Result<LandOutcome> {
-    let base_dst = format!("refs/heads/{base_ref}");
-    let witness_dst = format!("refs/heads/{witness_branch}");
     let mut witness: Option<RefLine<'_>> = None;
     let mut base: Option<RefLine<'_>> = None;
+    // `land_push` emits full `refs/heads/<branch>` destinations; strip the
+    // prefix and compare bare names to avoid two `format!` allocs per call.
     for line in stdout.lines().filter_map(parse_ref_line) {
-        if line.dst == witness_dst {
+        let Some(name) = line.dst.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if name == witness_branch {
             witness = Some(line);
-        } else if line.dst == base_dst {
+        } else if name == base_ref {
             base = Some(line);
         }
     }
