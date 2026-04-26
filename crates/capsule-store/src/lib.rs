@@ -1523,15 +1523,15 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
 
     let now_str = format_iso8601(now)?;
 
-    let mut stmt = tx.prepare(&format!(
+    let mut stmt = tx.prepare(concat!(
         "SELECT c.id, c.active_attempt, a.lease_json
          FROM capsule c
          JOIN attempt a
            ON a.capsule_id = c.id AND a.attempt_id = c.active_attempt
-         WHERE c.status IN ({})
-           AND c.active_attempt IS NOT NULL
+         WHERE c.status IN (",
+        capsule_core::holds_lease_sql_in_list!(),
+        ") AND c.active_attempt IS NOT NULL
            AND c.pending_land_json IS NULL",
-        Status::HOLDS_LEASE_SQL_IN_LIST,
     ))?;
     let candidates: Vec<(String, i64, String)> = stmt
         .query_map([], |r| {
@@ -1615,10 +1615,11 @@ fn find_scope_conflict(
     our_scope_json: &str,
 ) -> Result<Option<CapsuleId>> {
     let our_scope: Vec<CanonicalPath> = json::from_str(our_scope_json)?;
-    let mut stmt = tx.prepare(&format!(
+    let mut stmt = tx.prepare(concat!(
         "SELECT id, scope_json FROM capsule
-         WHERE status IN ({}) AND id != ?1",
-        Status::HOLDS_LEASE_SQL_IN_LIST,
+         WHERE status IN (",
+        capsule_core::holds_lease_sql_in_list!(),
+        ") AND id != ?1",
     ))?;
     let mut rows = stmt.query(params![capsule_id])?;
     while let Some(row) = rows.next()? {
@@ -1656,9 +1657,10 @@ fn retain_available(
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
-        .prepare(&format!(
-            "SELECT id, scope_json FROM capsule WHERE status IN ({})",
-            Status::HOLDS_LEASE_SQL_IN_LIST,
+        .prepare(concat!(
+            "SELECT id, scope_json FROM capsule WHERE status IN (",
+            capsule_core::holds_lease_sql_in_list!(),
+            ")",
         ))?
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .map(|row| {

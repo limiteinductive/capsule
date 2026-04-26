@@ -77,8 +77,20 @@ impl Status {
     /// interpolation into `... WHERE status IN ({Status::HOLDS_LEASE_SQL_IN_LIST}) ...`.
     /// Pinned against `holds_lease` by `status_holds_lease_sql_list_matches_predicate`
     /// — adding a new lease-holding variant without updating this list is a
-    /// test failure rather than a runtime miss.
-    pub const HOLDS_LEASE_SQL_IN_LIST: &'static str = "'active','accepted'";
+    /// test failure rather than a runtime miss. Backed by
+    /// `holds_lease_sql_in_list!()`, which expands to the same literal and lets
+    /// callers `concat!` it into a fully `&'static str` query.
+    pub const HOLDS_LEASE_SQL_IN_LIST: &'static str = crate::holds_lease_sql_in_list!();
+}
+
+/// Literal form of `Status::HOLDS_LEASE_SQL_IN_LIST` for `concat!` callers
+/// (which require token-level string literals). Single source of truth: the
+/// const above is defined in terms of this macro.
+#[macro_export]
+macro_rules! holds_lease_sql_in_list {
+    () => {
+        "'active','accepted'"
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
