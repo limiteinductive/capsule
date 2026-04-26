@@ -44,9 +44,9 @@ pub fn validate(id: &str) -> Result<(), IdError> {
         return Err(IdError::LockSuffix);
     }
     for (i, b) in id.bytes().enumerate() {
-        let ok = b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.';
-        if !ok {
-            return Err(IdError::InvalidChar(i));
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {}
+            _ => return Err(IdError::InvalidChar(i)),
         }
     }
     Ok(())
