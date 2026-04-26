@@ -865,8 +865,8 @@ struct CapsuleSummary<'a> {
     id: &'a str,
     status: Status,
     base_ref: &'a str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    scope_prefixes: Vec<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    scope_prefixes: &'a [CanonicalPath],
     title: &'a str,
 }
 
@@ -876,7 +876,7 @@ impl<'a> From<&'a Capsule> for CapsuleSummary<'a> {
             id: &c.id,
             status: c.status,
             base_ref: &c.base_ref,
-            scope_prefixes: c.scope_prefixes.iter().map(|p| p.as_str()).collect(),
+            scope_prefixes: &c.scope_prefixes,
             title: &c.title,
         }
     }
