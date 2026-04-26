@@ -126,10 +126,6 @@ fn validate_worktree_dir_override(
     main_root: &Path,
     capsule_dir: &Path,
 ) -> Result<PathBuf> {
-    // Reject relative paths up-front. `fs::canonicalize` would resolve them
-    // against the process cwd, which is unpredictable when `capsule work` is
-    // invoked by an agent from a variable working directory — silently landing
-    // the worktree in a surprising location. Force the caller to be explicit.
     if !p.is_absolute() {
         bail!(
             "--worktree-dir must be an absolute path (got {}); relative paths would resolve \
@@ -138,25 +134,7 @@ fn validate_worktree_dir_override(
         );
     }
 
-    // Canonicalize via parent if the path doesn't exist yet.
-    let canonical = if p.exists() {
-        fs::canonicalize(p).with_context(|| format!("canonicalize {}", p.display()))?
-    } else {
-        let parent = p
-            .parent()
-            .ok_or_else(|| anyhow!("--worktree-dir has no parent: {}", p.display()))?;
-        let parent_canon = fs::canonicalize(parent).with_context(|| {
-            format!(
-                "canonicalize parent of {} ({})",
-                p.display(),
-                parent.display()
-            )
-        })?;
-        let leaf = p
-            .file_name()
-            .ok_or_else(|| anyhow!("--worktree-dir has no file name: {}", p.display()))?;
-        parent_canon.join(leaf)
-    };
+    let canonical = canonicalize_via_parent_if_missing(p)?;
 
     if canonical == main_root {
         bail!(
@@ -189,6 +167,30 @@ fn validate_worktree_dir_override(
 
 fn path_within(child: &Path, parent: &Path) -> bool {
     child == parent || child.starts_with(parent)
+}
+
+/// Canonicalize `p` if it exists; otherwise canonicalize its parent and rejoin
+/// the leaf. `fs::canonicalize` requires the path to exist, but `--worktree-dir`
+/// can name a not-yet-created location whose parent does exist (typical when
+/// the worktree dir will be `git worktree add`-ed).
+fn canonicalize_via_parent_if_missing(p: &Path) -> Result<PathBuf> {
+    if p.exists() {
+        return fs::canonicalize(p).with_context(|| format!("canonicalize {}", p.display()));
+    }
+    let parent = p
+        .parent()
+        .ok_or_else(|| anyhow!("--worktree-dir has no parent: {}", p.display()))?;
+    let parent_canon = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "canonicalize parent of {} ({})",
+            p.display(),
+            parent.display()
+        )
+    })?;
+    let leaf = p
+        .file_name()
+        .ok_or_else(|| anyhow!("--worktree-dir has no file name: {}", p.display()))?;
+    Ok(parent_canon.join(leaf))
 }
 
 fn open_lock_file(path: &Path) -> Result<File> {
