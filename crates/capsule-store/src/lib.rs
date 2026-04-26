@@ -333,31 +333,23 @@ impl Store {
         let tx = self.conn.transaction()?;
         reclaim_expired_in_tx(&tx, now)?;
 
-        // SELECT shape varies only by the optional `status` filter; bind the
-        // status as a SQL parameter rather than splicing the wire-string into
-        // the query text. Even though `Status::as_wire_str()` returns one of a
-        // closed set of safe `&'static str` literals (no injection vector), a
-        // parameterized query keeps the SQL discipline uniform with every other
-        // site in this file.
-        let status_wire: Option<&'static str> = filter.status.map(Status::as_wire_str);
-        let q = if status_wire.is_some() {
-            format!(
-                "{} WHERE status = ?1 ORDER BY created_at ASC",
-                RowCapsule::SELECT_BASE
-            )
-        } else {
-            format!("{} ORDER BY created_at ASC", RowCapsule::SELECT_BASE)
+        let (q, query_params): (String, Vec<rusqlite::types::Value>) = match filter.status {
+            Some(s) => (
+                format!(
+                    "{} WHERE status = ?1 ORDER BY created_at ASC",
+                    RowCapsule::SELECT_BASE
+                ),
+                vec![s.as_wire_str().to_string().into()],
+            ),
+            None => (
+                format!("{} ORDER BY created_at ASC", RowCapsule::SELECT_BASE),
+                vec![],
+            ),
         };
-
         let mut stmt = tx.prepare(&q)?;
-        let rows = match status_wire {
-            Some(s) => stmt
-                .query_map(params![s], RowCapsule::from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            None => stmt
-                .query_map([], RowCapsule::from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        };
+        let rows: Vec<RowCapsule> = stmt
+            .query_map(rusqlite::params_from_iter(&query_params), RowCapsule::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
         let mut capsules: Vec<Capsule> = rows
@@ -365,35 +357,8 @@ impl Store {
             .map(|r| r.into_capsule(&tx))
             .collect::<Result<Vec<_>>>()?;
 
-        // Status of dependencies — needed for `--available`.
         if filter.available {
-            let landed_ids: std::collections::HashSet<String> = tx
-                .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-            let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
-                .prepare(&format!(
-                    "SELECT id, scope_json FROM capsule WHERE status IN ({})",
-                    Status::HOLDS_LEASE_SQL_IN_LIST,
-                ))?
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .map(|(id, j)| Ok::<_, json::Error>((id, json::from_str(&j)?)))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            capsules.retain(|c| {
-                if c.status != Status::Planned {
-                    return false;
-                }
-                if !c.depends_on.iter().all(|d| landed_ids.contains(d)) {
-                    return false;
-                }
-                !in_flight_scopes.iter().any(|(other_id, other_scope)| {
-                    other_id != &c.id
-                        && CanonicalPath::any_overlap(&c.scope_prefixes, other_scope)
-                })
-            });
+            capsules = retain_available(&tx, capsules)?;
         }
 
         if let Some(probe) = &filter.scope_overlaps {
@@ -1798,6 +1763,42 @@ fn next_attempt_id(tx: &rusqlite::Transaction<'_>, capsule_id: &str) -> Result<i
         |r| r.get(0),
     )?;
     Ok(next)
+}
+
+/// `list --available` filter: keep only `Planned` capsules whose deps are all
+/// landed and whose scope does not overlap any in-flight (lease-holding)
+/// capsule. Mirrors the precondition set of `Store::claim` (DESIGN.md §7.1.1)
+/// — a capsule is "available" iff a fresh `claim` against it would succeed.
+fn retain_available(
+    tx: &rusqlite::Transaction<'_>,
+    capsules: Vec<Capsule>,
+) -> Result<Vec<Capsule>> {
+    let landed_ids: std::collections::HashSet<String> = tx
+        .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
+        .prepare(&format!(
+            "SELECT id, scope_json FROM capsule WHERE status IN ({})",
+            Status::HOLDS_LEASE_SQL_IN_LIST,
+        ))?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(id, j)| Ok::<_, json::Error>((id, json::from_str(&j)?)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(capsules
+        .into_iter()
+        .filter(|c| {
+            c.status == Status::Planned
+                && c.depends_on.iter().all(|d| landed_ids.contains(d))
+                && !in_flight_scopes.iter().any(|(other_id, other_scope)| {
+                    other_id != &c.id
+                        && CanonicalPath::any_overlap(&c.scope_prefixes, other_scope)
+                })
+        })
+        .collect())
 }
 
 /// Load and deserialize the `Lease` for one attempt. Underlying loader for
