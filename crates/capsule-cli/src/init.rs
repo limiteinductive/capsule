@@ -125,15 +125,18 @@ fn parse_git_version(s: &str) -> Option<(u32, u32)> {
 /// Returns `None` for the empty path (worktree root), where ignoring the
 /// pattern would shadow the entire repo.
 fn format_gitignore_dir_pattern(rel: &Path) -> Option<String> {
-    let joined = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/");
-    if joined.is_empty() {
+    let mut out = String::new();
+    for c in rel.components() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&c.as_os_str().to_string_lossy());
+    }
+    if out.is_empty() {
         return None;
     }
-    Some(format!("{joined}/"))
+    out.push('/');
+    Some(out)
 }
 
 /// Append a rule for the store dir to the worktree-root `.gitignore`, idempotently.
@@ -223,6 +226,22 @@ mod tests {
         let res = run(InitOpts { dir, no_gitignore });
         std::env::set_current_dir(prev).unwrap();
         res
+    }
+
+    #[test]
+    fn format_gitignore_dir_pattern_shape() {
+        // Empty path = worktree root: refuse (would shadow whole repo).
+        assert_eq!(format_gitignore_dir_pattern(Path::new("")), None);
+        // Single component: trailing `/` only.
+        assert_eq!(
+            format_gitignore_dir_pattern(Path::new(".capsule")).as_deref(),
+            Some(".capsule/"),
+        );
+        // Nested: `/`-separated, single trailing `/`.
+        assert_eq!(
+            format_gitignore_dir_pattern(Path::new("var/cap")).as_deref(),
+            Some("var/cap/"),
+        );
     }
 
     #[test]
