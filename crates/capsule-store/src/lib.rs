@@ -1600,7 +1600,7 @@ fn find_unmet_deps(
     tx: &rusqlite::Transaction<'_>,
     depends_on_json: &str,
 ) -> Result<Vec<String>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT j.value FROM json_each(?1) j
          LEFT JOIN capsule c ON c.id = j.value AND c.status = 'landed'
          WHERE c.id IS NULL
@@ -1622,7 +1622,7 @@ fn find_scope_conflict(
     our_scope_json: &str,
 ) -> Result<Option<CapsuleId>> {
     let our_scope: Vec<CanonicalPath> = json::from_str(our_scope_json)?;
-    let mut stmt = tx.prepare(concat!(
+    let mut stmt = tx.prepare_cached(concat!(
         "SELECT id, scope_json FROM capsule
          WHERE status IN (",
         capsule_core::holds_lease_sql_in_list!(),
@@ -1806,18 +1806,18 @@ fn load_pending_land_json(
 /// / force_unfreeze / lander finalized this same pending; the observable git
 /// state has already been recorded by the winner. Both `Store::land` step 4
 /// and `reconcile_inner` gate their finalize work on this (§7.1.2 / §7.2).
+///
+/// SQL-side byte compare keeps the JSON blob inside SQLite — the
+/// `IS NOT NULL AND = ?2` projection lands directly as a 0/1 boolean. The
+/// explicit `IS NOT NULL` guard normalizes NULL to `false`: under SQLite's
+/// three-valued logic `NULL = ?2` is itself NULL (not 0) and would surface
+/// to Rust as a row-decode error instead of "freeze cleared, snapshot does
+/// not match".
 fn pending_land_snapshot_unchanged(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
     snapshot_json: &str,
 ) -> Result<bool> {
-    // SQL-side byte compare so the pending_land JSON blob never crosses into
-    // Rust just to be re-equality-checked. `pending_land_json IS NOT NULL AND
-    // pending_land_json = ?2` projects directly to a 0/1 the row reader hands
-    // back as `bool`. The `IS NOT NULL` guard normalizes NULL to false: under
-    // SQLite's three-valued logic `NULL = ?2` would itself be NULL (not 0),
-    // which would surface to Rust as a row-decode error rather than the
-    // expected "freeze cleared, snapshot does not match" boolean.
     tx.query_row(
         "SELECT pending_land_json IS NOT NULL AND pending_land_json = ?2
          FROM capsule WHERE id = ?1",
@@ -2514,6 +2514,9 @@ fn record_transient_land_failure(
 /// so the on-wire key order is alphabetical, not struct declaration order.
 /// DESIGN.md §6 pins payload shape, not byte order; consumers parse via
 /// `from_str` and are order-agnostic.
+///
+/// Uses `prepare_cached`: every state-changing op emits ≥1 event, so the
+/// prepared form amortizes across the whole Store lifetime; SQL is invariant.
 fn insert_event(
     tx: &rusqlite::Transaction<'_>,
     at: &str,
@@ -2524,11 +2527,18 @@ fn insert_event(
     payload: &json::Value,
 ) -> Result<()> {
     let payload_json = json::to_string(payload)?;
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO event (at, capsule_id, attempt_id, actor, kind, payload_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![at, capsule_id, attempt_id, actor, kind.as_wire_str(), payload_json],
-    )?;
+    )?
+    .execute(params![
+        at,
+        capsule_id,
+        attempt_id,
+        actor,
+        kind.as_wire_str(),
+        payload_json
+    ])?;
     Ok(())
 }
 
