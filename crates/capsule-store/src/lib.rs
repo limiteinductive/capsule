@@ -1650,13 +1650,12 @@ fn find_scope_conflict(
          WHERE status IN ({}) AND id != ?1",
         Status::HOLDS_LEASE_SQL_IN_LIST,
     ))?;
-    let rows = stmt
-        .query_map(params![capsule_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    for (other_id, other_scope_json) in rows {
+    // Stream rows so the first overlap short-circuits the cursor instead of
+    // materializing every in-flight row into an intermediate Vec.
+    let mut rows = stmt.query(params![capsule_id])?;
+    while let Some(row) = rows.next()? {
+        let other_id: String = row.get(0)?;
+        let other_scope_json: String = row.get(1)?;
         let other: Vec<CanonicalPath> = json::from_str(&other_scope_json)?;
         if CanonicalPath::any_overlap(&our_scope, &other) {
             return Ok(Some(other_id));
