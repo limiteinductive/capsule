@@ -1702,16 +1702,18 @@ fn retain_available(
         .prepare("SELECT id FROM capsule WHERE status = 'landed'")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    // Collect into StoreError so both rusqlite::Error and json::Error can use ? here.
     let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
         .prepare(&format!(
             "SELECT id, scope_json FROM capsule WHERE status IN ({})",
             Status::HOLDS_LEASE_SQL_IN_LIST,
         ))?
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(id, j)| Ok::<_, json::Error>((id, json::from_str(&j)?)))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|row| {
+            let (id, j) = row?;
+            Ok((id, json::from_str(&j)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(capsules
         .into_iter()
