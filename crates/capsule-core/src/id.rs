@@ -24,28 +24,37 @@ pub enum IdError {
 }
 
 pub fn validate(id: &str) -> Result<(), IdError> {
-    if id.is_empty() {
+    let bytes = id.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
         return Err(IdError::Empty);
     }
-    if id.len() > 128 {
-        return Err(IdError::TooLong(id.len()));
+    if len > 128 {
+        return Err(IdError::TooLong(len));
     }
-    if id.starts_with('.') || id.ends_with('.') {
+    if bytes[0] == b'.' || bytes[len - 1] == b'.' {
         return Err(IdError::EdgeDot);
-    }
-    if id.contains("..") {
-        return Err(IdError::DoubleDot);
     }
     // Git ref-name rule: no slash-separated component may end with ".lock".
     // Capsule id is one such component (`refs/heads/capsules/<id>/a<N>`), so
     // a `.lock` suffix here would surface as an opaque push failure at land
     // time. Reject up-front. Verified with `git check-ref-format`.
-    if id.ends_with(".lock") {
+    if len >= 5 && &bytes[len - 5..] == b".lock" {
         return Err(IdError::LockSuffix);
     }
-    for (i, b) in id.bytes().enumerate() {
+    // Single pass: char whitelist + `..` detection. Tracking `prev_dot` lets
+    // the `..` check piggyback on the byte iteration that already visits
+    // every dot, dropping the prior `id.contains("..")` second scan.
+    let mut prev_dot = false;
+    for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {}
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => prev_dot = false,
+            b'.' => {
+                if prev_dot {
+                    return Err(IdError::DoubleDot);
+                }
+                prev_dot = true;
+            }
             _ => return Err(IdError::InvalidChar(i)),
         }
     }
@@ -114,5 +123,14 @@ mod tests {
     fn lock_substring_in_middle_ok() {
         // `.lock` only matters at the end of the component.
         validate("foo.lock.bar").unwrap();
+    }
+
+    #[test]
+    fn invalid_char_before_dotdot_reports_invalid_char() {
+        // Single-pass validation reports the first defect positionally:
+        // a `/` (invalid) at byte 1 wins over a `..` later in the string.
+        // Either error is correct for boundary rejection; this test pins
+        // the chosen ordering so future refactors don't drift.
+        assert_eq!(validate("a/..b"), Err(IdError::InvalidChar(1)));
     }
 }
