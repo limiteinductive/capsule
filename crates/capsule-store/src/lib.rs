@@ -380,22 +380,23 @@ impl Store {
 
         reclaim_expired_in_tx(&tx, now)?;
 
-        let (status_str, _active_attempt, pending, depends_on_json, scope_json): (
+        let (status_str, _active_attempt, frozen, depends_on_json, scope_json): (
             String,
             Option<i64>,
-            Option<String>,
+            bool,
             String,
             String,
         ) = tx
             .query_row(
-                "SELECT status, active_attempt, pending_land_json, depends_on_json, scope_json
+                "SELECT status, active_attempt, pending_land_json IS NOT NULL,
+                        depends_on_json, scope_json
                  FROM capsule WHERE id = ?1",
                 params![req.capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .or_not_found(&req.capsule_id)?;
 
-        if pending.is_some() {
+        if frozen {
             return Err(StoreError::PendingLandFrozen(req.capsule_id));
         }
 
@@ -685,9 +686,6 @@ impl Store {
 
             load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
-            // Move locals into `pending` rather than cloning; downstream
-            // (steps 3-4) borrows `&pending.X` instead of keeping parallel
-            // String locals alive.
             let pending = PendingLand {
                 at: now,
                 attempt_id: aid as u64,
@@ -794,15 +792,16 @@ impl Store {
         let (_, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
-        let (status_str, active_attempt, pending): (String, Option<i64>, Option<String>) = tx
+        let (status_str, active_attempt, frozen): (String, Option<i64>, bool) = tx
             .query_row(
-                "SELECT status, active_attempt, pending_land_json FROM capsule WHERE id = ?1",
+                "SELECT status, active_attempt, pending_land_json IS NOT NULL
+                 FROM capsule WHERE id = ?1",
                 params![req.capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .or_not_found(&req.capsule_id)?;
 
-        if pending.is_some() {
+        if frozen {
             return Err(StoreError::PendingLandFrozen(req.capsule_id));
         }
         let status = parse_status(&status_str);
@@ -1805,7 +1804,14 @@ fn assert_not_pending_land_frozen_in_tx(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
 ) -> Result<()> {
-    if load_pending_land_json(tx, capsule_id)?.is_some() {
+    let frozen: bool = tx
+        .query_row(
+            "SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1",
+            params![capsule_id],
+            |r| r.get(0),
+        )
+        .or_not_found(capsule_id)?;
+    if frozen {
         return Err(StoreError::PendingLandFrozen(capsule_id.into()));
     }
     Ok(())
