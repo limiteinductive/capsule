@@ -330,20 +330,11 @@ impl Store {
         let tx = self.conn.transaction()?;
         reclaim_expired_in_tx(&tx, now)?;
 
-        let (q, status_param): (String, Option<&'static str>) = match filter.status {
-            Some(s) => (
-                format!(
-                    "{} WHERE status = ?1 ORDER BY created_at ASC",
-                    RowCapsule::SELECT_BASE
-                ),
-                Some(s.as_wire_str()),
-            ),
-            None => (
-                format!("{} ORDER BY created_at ASC", RowCapsule::SELECT_BASE),
-                None,
-            ),
+        let (q, status_param): (&'static str, Option<&'static str>) = match filter.status {
+            Some(s) => (RowCapsule::SELECT_BY_STATUS_ORDERED, Some(s.as_wire_str())),
+            None => (RowCapsule::SELECT_ALL_ORDERED, None),
         };
-        let mut stmt = tx.prepare(&q)?;
+        let mut stmt = tx.prepare(q)?;
         let rows: Vec<RowCapsule> = stmt
             .query_map(rusqlite::params_from_iter(status_param), RowCapsule::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1113,11 +1104,7 @@ impl Store {
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
         let tx = self.snapshot_read_tx()?;
         let row: RowCapsule = tx
-            .query_row(
-                &format!("{} WHERE id = ?1", RowCapsule::SELECT_BASE),
-                params![id],
-                RowCapsule::from_row,
-            )
+            .query_row(RowCapsule::SELECT_BY_ID, params![id], RowCapsule::from_row)
             .or_not_found(id)?;
         row.into_capsule(&tx)
     }
@@ -2020,15 +2007,29 @@ struct RowCapsule {
     updated_at: String,
 }
 
-impl RowCapsule {
-    /// Single source of truth for the capsule SELECT — both `list_capsules`
-    /// (no WHERE) and `get_capsule` (`WHERE id = ?1`) start here. `from_row`
-    /// reads columns by name (not position), so a future SELECT reorder
-    /// or insertion cannot silently shift one of the two paths.
-    const SELECT_BASE: &'static str = "SELECT id, title, description, acceptance_json, scope_json, base_ref,
+/// Single source of truth for the capsule SELECT clause — used by
+/// `list_capsules` (no WHERE / `WHERE status`) and `get_capsule` (`WHERE id`).
+/// `RowCapsule::from_row` reads columns by name (not position), so a future
+/// SELECT reorder or insertion cannot silently shift any caller. Wrapped in
+/// a `macro_rules!` so the trailing-clause variants below can be `concat!`-ed
+/// at compile time, dropping a `format!` per read-path call.
+macro_rules! select_capsule_sql {
+    () => {
+        "SELECT id, title, description, acceptance_json, scope_json, base_ref,
                 depends_on_json, status, active_attempt, verification_json,
                 pending_land_json, landing_json, created_at, updated_at
-         FROM capsule";
+         FROM capsule"
+    };
+}
+
+impl RowCapsule {
+    const SELECT_BY_ID: &'static str = concat!(select_capsule_sql!(), " WHERE id = ?1");
+    const SELECT_ALL_ORDERED: &'static str =
+        concat!(select_capsule_sql!(), " ORDER BY created_at ASC");
+    const SELECT_BY_STATUS_ORDERED: &'static str = concat!(
+        select_capsule_sql!(),
+        " WHERE status = ?1 ORDER BY created_at ASC"
+    );
 
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -2074,7 +2075,7 @@ impl RowCapsule {
 /// Load all attempts for one capsule, ordered by `attempt_id ASC`. Single
 /// source of truth for the SELECT column list against `attempt`; drift between
 /// the column list and the `Attempt` field assignments would silently corrupt
-/// rehydration. Sibling of `RowCapsule::SELECT_BASE` / `RowCapsule::from_row`.
+/// rehydration. Sibling of `select_capsule_sql!` / `RowCapsule::from_row`.
 ///
 /// Streamed rather than `query_map`-collected: `query_map`'s closure must
 /// return `rusqlite::Result`, but `into_attempt` raises `StoreError` on
@@ -2108,7 +2109,7 @@ struct RowAttempt {
 }
 
 impl RowAttempt {
-    /// Sibling of `RowCapsule::SELECT_BASE`. Read by name in `from_row` so a
+    /// Sibling of `select_capsule_sql!`. Read by name in `from_row` so a
     /// future column reorder is safe.
     const SELECT: &'static str = "SELECT attempt_id, lease_json, branch, witness_branch, base_sha,
                 tip_sha, last_heartbeat, outcome, opened_at, closed_at
