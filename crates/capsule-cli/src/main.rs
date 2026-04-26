@@ -5,7 +5,7 @@ use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
     self, AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest,
-    ForceUnfreezeRequest, HeartbeatRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
+    ForceUnfreezeRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
     Store,
 };
 use clap::{Parser, Subcommand};
@@ -501,10 +501,7 @@ fn main() -> Result<()> {
         }
         Cmd::Heartbeat(args) => {
             let mut store = open_store(&dir)?;
-            let ack = store.heartbeat(HeartbeatRequest {
-                capsule_id: args.capsule_id,
-                session_id: args.session,
-            })?;
+            let ack = store.heartbeat(&args.capsule_id, &args.session)?;
             if cli.json {
                 print_json(&ack)?;
             } else {
@@ -692,11 +689,8 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     // refreshes expiry so the first thread tick has full headroom.
     {
         let mut hb = open_store(dir)?;
-        hb.heartbeat(HeartbeatRequest {
-            capsule_id: args.capsule_id.clone(),
-            session_id: args.session.clone(),
-        })
-        .context("pre-spawn heartbeat (lease lost before child started)")?;
+        hb.heartbeat(&args.capsule_id, &args.session)
+            .context("pre-spawn heartbeat (lease lost before child started)")?;
     }
 
     // Shutdown signaled by dropping `stop_tx` in the parent: the heartbeat
@@ -734,10 +728,7 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            match store.heartbeat(HeartbeatRequest {
-                capsule_id: capsule_id_hb.clone(),
-                session_id: session_hb.clone(),
-            }) {
+            match store.heartbeat(&capsule_id_hb, &session_hb) {
                 Ok(_) => {}
                 Err(
                     e @ (capsule_store::StoreError::CrossSession

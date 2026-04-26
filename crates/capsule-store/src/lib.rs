@@ -570,7 +570,7 @@ impl Store {
     /// `pending_land_json` is not read: §7.2 says heartbeats are not required
     /// once a lander has frozen the capsule, and aren't rejected either — the
     /// effective lease won't expire, so this becomes a benign no-op.
-    pub fn heartbeat(&mut self, req: HeartbeatRequest) -> Result<HeartbeatAck> {
+    pub fn heartbeat(&mut self, capsule_id: &str, session_id: &str) -> Result<HeartbeatAck> {
         use capsule_core::Lease;
 
         let (now, now_str) = now_pair()?;
@@ -580,22 +580,22 @@ impl Store {
         let (status_str, active_attempt): (String, Option<i64>) = tx
             .query_row(
                 "SELECT status, active_attempt FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
+                params![capsule_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .or_not_found(&req.capsule_id)?;
+            .or_not_found(capsule_id)?;
 
         let status = parse_status(&status_str);
         if !status.holds_lease() {
             return Err(StoreError::wrong_status(
-                req.capsule_id,
+                capsule_id.to_string(),
                 StoreOp::Heartbeat,
                 status,
             ));
         }
         let aid = active_attempt.expect("holds_lease ⇒ active_attempt set");
 
-        let lease = load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
+        let lease = load_live_lease_for_session(&tx, capsule_id, aid, session_id, now)?;
 
         let new_expires = checked_lease_expiry(now, lease.ttl_sec)?;
         let new_lease = Lease {
@@ -607,11 +607,11 @@ impl Store {
         tx.execute(
             "UPDATE attempt SET lease_json=?1, last_heartbeat=?2
              WHERE capsule_id=?3 AND attempt_id=?4",
-            params![new_lease_json, now_str, req.capsule_id, aid],
+            params![new_lease_json, now_str, capsule_id, aid],
         )?;
         tx.execute(
             "UPDATE capsule SET updated_at=?1 WHERE id=?2",
-            params![now_str, req.capsule_id],
+            params![now_str, capsule_id],
         )?;
 
         tx.commit()?;
@@ -1194,12 +1194,6 @@ pub struct ClaimRequest {
     pub session_id: String,
     pub lease_ttl_sec: u64,
     pub base_sha: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct HeartbeatRequest {
-    pub capsule_id: CapsuleId,
-    pub session_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2861,12 +2855,7 @@ mod tests {
         // Brief sleep so the heartbeat-derived expires is strictly later than
         // the claim-derived one (both are now + ttl, ttl is fixed at claim).
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let ack = s
-            .heartbeat(HeartbeatRequest {
-                capsule_id: "x".into(),
-                session_id: "sess1".into(),
-            })
-            .unwrap();
+        let ack = s.heartbeat("x", "sess1").unwrap();
         assert!(ack.lease_expires_at > a1.lease.expires_at);
     }
 
@@ -2983,12 +2972,7 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
-        let err = s
-            .heartbeat(HeartbeatRequest {
-                capsule_id: "x".into(),
-                session_id: "wrong".into(),
-            })
-            .unwrap_err();
+        let err = s.heartbeat("x", "wrong").unwrap_err();
         assert!(matches!(err, StoreError::CrossSession));
     }
 
@@ -3005,12 +2989,7 @@ mod tests {
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1200));
-        let err = s
-            .heartbeat(HeartbeatRequest {
-                capsule_id: "x".into(),
-                session_id: "wrong".into(),
-            })
-            .unwrap_err();
+        let err = s.heartbeat("x", "wrong").unwrap_err();
         assert!(
             matches!(err, StoreError::CrossSession),
             "expected CrossSession, got {err:?}",
