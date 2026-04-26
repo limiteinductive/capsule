@@ -30,12 +30,11 @@ pub fn setup(
     attempt_num: u64,
     worktree_dir_override: Option<&Path>,
 ) -> Result<IsolateState> {
-    // Step 1: canonicalize capsule_dir to absolute (F26).
     let canonical_capsule_dir = fs::canonicalize(capsule_dir)
         .with_context(|| format!("canonicalize capsule dir {}", capsule_dir.display()))?;
 
-    // Step 2: bare-repo check (F9). Check bare BEFORE --show-toplevel, since
-    // the latter errors out in bare repos with a less actionable message.
+    // Bare-repo check before `git rev-parse --show-toplevel`: the latter errors
+    // out in bare repos with a less actionable message.
     if git_is_bare()? {
         bail!(
             "--isolate=worktree requires a working repository; this is a bare repo. \
@@ -44,32 +43,26 @@ pub fn setup(
     }
     let main_worktree_root = git_show_toplevel()?;
 
-    // Step 3: setup lock (F4, F23). Steps 4-8 happen inside it.
     let locks_dir = canonical_capsule_dir.join("locks");
     fs::create_dir_all(&locks_dir).with_context(|| format!("create {}", locks_dir.display()))?;
     let setup_lock_path = locks_dir.join(format!("worktree-setup-{capsule_id}.lock"));
     let setup_lock = acquire_setup_lock(&setup_lock_path)?;
 
-    // Step 5: resolve worktree path (default or override) and validate (F7).
     let default_path = canonical_capsule_dir.join(format!("worktrees/{capsule_id}-a{attempt_num}"));
     let worktree_path = match worktree_dir_override {
         None => default_path,
         Some(p) => validate_worktree_dir_override(p, &main_worktree_root, &canonical_capsule_dir)?,
     };
 
-    // Step 5: probe state.
     let registered = git_worktree_list_for_branch(attempt_branch)?;
     let branch_exists = git_branch_exists(attempt_branch)?;
     let dir_exists = worktree_path.exists();
 
-    // Step 6: decision tree.
     match (branch_exists, registered.as_deref(), dir_exists) {
-        // (a) branch absent + dir absent + nothing registered.
         (false, None, false) => {
             git_worktree_add_new_branch(&worktree_path, attempt_branch, attempt_base_sha)
                 .context("git worktree add -b")?;
         }
-        // (b) branch present + no registration + dir absent — verify tip (F24).
         (true, None, false) => {
             let tip = git_rev_parse(&format!("refs/heads/{attempt_branch}"))?;
             if tip != attempt_base_sha {
@@ -83,12 +76,11 @@ pub fn setup(
             git_worktree_add_existing_branch(&worktree_path, attempt_branch)
                 .context("git worktree add (existing branch)")?;
         }
-        // (c) registered at expected path, dir present — reuse.
-        // Tip not validated on (c); legitimate commits may exist.
+        // Reuse: tip not re-validated — legitimate commits may have advanced
+        // it since the original worktree add.
         (_, Some(registered_path), true) if Path::new(registered_path) == worktree_path => {}
-        // (c′) registered at expected path but dir is missing (stale registration).
-        // Spawning the child here would fail with ENOENT once we chdir; bail
-        // explicitly with a remediation hint instead.
+        // Stale registration: spawning the child would fail with ENOENT once
+        // we chdir; bail with a remediation hint up front.
         (_, Some(registered_path), false) if Path::new(registered_path) == worktree_path => {
             bail!(
                 "worktree for branch {attempt_branch} is registered at {registered_path} but \
@@ -96,7 +88,6 @@ pub fn setup(
                  remove --force {registered_path}`), then re-run."
             );
         }
-        // (d) registered at different path.
         (_, Some(registered_path), _) => {
             bail!(
                 "worktree for branch {attempt_branch} is registered at {registered_path}, not \
@@ -105,7 +96,6 @@ pub fn setup(
                 worktree_path.display()
             );
         }
-        // (e) dir present but not registered (stale from aborted add).
         (_, None, true) => {
             bail!(
                 "directory {} exists but is not a registered git worktree. Remediation: \
@@ -117,17 +107,11 @@ pub fn setup(
         }
     }
 
-    // (f) registered but dir unreadable — handled implicitly: if registration says
-    // it's there but `dir_exists` was false, we'd have hit arm (d) or fallen through.
-    // git worktree repair is left for v1; the dir-absent + registered case fails
-    // above with a clear message.
-
-    // Step 8: runtime lock (F22). Acquired BEFORE setup lock release.
+    // Runtime lock acquired before the setup lock is released, so a second
+    // `capsule work` invocation can never observe the worktree unlocked.
     let runtime_lock_path =
         locks_dir.join(format!("worktree-run-{capsule_id}-a{attempt_num}.lock"));
     let runtime_lock = acquire_runtime_lock(&runtime_lock_path, &worktree_path)?;
-
-    // Step 9: setup lock released here as `setup_lock` falls out of scope.
     drop(setup_lock);
 
     Ok(IsolateState {
@@ -261,9 +245,10 @@ fn git_is_bare() -> Result<bool> {
 }
 
 fn git_rev_parse(rev: &str) -> Result<String> {
-    let out = run_git_capture(&["rev-parse", "--verify", rev])
+    let mut out = run_git_capture(&["rev-parse", "--verify", rev])
         .with_context(|| format!("git rev-parse {rev}"))?;
-    Ok(out.trim().to_string())
+    out.truncate(out.trim_end().len());
+    Ok(out)
 }
 
 fn git_branch_exists(branch: &str) -> Result<bool> {
