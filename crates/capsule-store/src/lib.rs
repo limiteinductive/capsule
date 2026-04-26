@@ -1630,6 +1630,8 @@ fn find_unmet_deps(
 
 /// DESIGN.md §7.1.1 step 4: return the first other in-flight (lease-holding)
 /// capsule whose scope component-wise overlaps `our_scope_json`, or `None`.
+/// Rows are streamed so the first overlap short-circuits the cursor without
+/// materializing every in-flight row into an intermediate `Vec`.
 fn find_scope_conflict(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1641,8 +1643,6 @@ fn find_scope_conflict(
          WHERE status IN ({}) AND id != ?1",
         Status::HOLDS_LEASE_SQL_IN_LIST,
     ))?;
-    // Stream rows so the first overlap short-circuits the cursor instead of
-    // materializing every in-flight row into an intermediate Vec.
     let mut rows = stmt.query(params![capsule_id])?;
     while let Some(row) = rows.next()? {
         let other_id: String = row.get(0)?;
