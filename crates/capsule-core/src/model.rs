@@ -364,20 +364,20 @@ mod tests {
         assert!(matches!(parsed, ExitCode::Code(127)));
     }
 
+    /// Anything that does not parse as `i32` becomes a `Sentinel`, verbatim
+    /// — CLIs lean on this for sentinels like "timeout" (DESIGN §5). The
+    /// failing arm names `ExitCode::Code(_)` exactly (not a wildcard) so a
+    /// future variant added to `ExitCode` forces compile-time review here,
+    /// same exhaustiveness discipline as `Status::is_terminal` /
+    /// `as_wire_str`. Numeric overflow (e.g. `i32::MAX + 1`) is also covered
+    /// — it does not parse, so it falls into `Sentinel` too.
     #[test]
     fn exit_code_from_string_falls_back_to_sentinel() {
-        // Pin: anything that does not parse as `i32` becomes a Sentinel,
-        // verbatim. CLIs lean on this for sentinel values like "timeout"
-        // (DESIGN §5). The non-target arm names `ExitCode::Code(_)` exactly
-        // (not a wildcard) so a future variant added to `ExitCode` forces a
-        // compile-time review here — same exhaustiveness discipline as
-        // `Status::is_terminal` / `as_wire_str`.
         let parsed: ExitCode = "timeout".to_string().into();
         match parsed {
             ExitCode::Sentinel(s) => assert_eq!(s, "timeout"),
             other @ ExitCode::Code(_) => panic!("expected Sentinel, got {other:?}"),
         }
-        // Numeric overflow falls into Sentinel: i32::MAX + 1 doesn't parse.
         let big = "2147483648".to_string();
         let parsed: ExitCode = big.clone().into();
         match parsed {
@@ -386,25 +386,25 @@ mod tests {
         }
     }
 
+    /// Pin the narrowed contract: canonical `i32` spellings and non-numeric
+    /// sentinels round-trip through `From<String>` → `Display`. CLIs that
+    /// emit canonical `i32` output depend on this.
     #[test]
     fn exit_code_canonical_strings_round_trip() {
-        // Pin the narrowed contract: canonical i32 spellings and non-numeric
-        // sentinels round-trip through `From<String>` → `Display`. This is
-        // what CLIs producing canonical i32 output rely on.
         for s in ["0", "-1", "127", "timeout", "killed:SIGKILL"] {
             let ec: ExitCode = s.to_string().into();
             assert_eq!(ec.to_string(), s);
         }
     }
 
+    /// Pin the doc-comment's "parsed AND canonicalized" clause: numeric
+    /// strings with non-canonical spellings survive as `Code(n)` whose
+    /// `Display` produces the canonical form. The String → ExitCode →
+    /// Display round-trip is therefore NOT byte-identical for these inputs —
+    /// intentional, since storage and audit consumers prefer one canonical
+    /// spelling per integer.
     #[test]
     fn exit_code_non_canonical_numerics_canonicalize() {
-        // Pin the doc-comment's "parsed AND canonicalized" clause: numeric
-        // strings with non-canonical spellings survive as Code(n) whose
-        // Display produces the canonical form. The String→ExitCode→Display
-        // round-trip is therefore NOT byte-identical for these inputs —
-        // intentional, since storage and audit consumers prefer one
-        // canonical spelling per integer.
         let cases = [("01", "1"), ("+1", "1"), ("-0", "0"), ("007", "7")];
         for (input, canonical) in cases {
             let ec: ExitCode = input.to_string().into();
@@ -413,14 +413,14 @@ mod tests {
         }
     }
 
+    /// Pin BOTH the (variant ↔ wire string) bijection AND the literal
+    /// spelling of each wire string. A composed `from_wire(as_wire_str(v))`
+    /// round-trip would still pass if both functions silently agreed on a
+    /// bogus spelling — explicit `(variant, "wire")` tuples are the
+    /// spelling oracle for SQL CHECK strings (schema.rs) and audit-log
+    /// payload consumers (DESIGN §6).
     #[test]
     fn status_wire_table_pinned() {
-        // Pin BOTH the (variant ↔ wire string) bijection AND the literal
-        // spelling of each wire string. A composed `from_wire(as_wire_str(v))`
-        // round-trip would still pass if both functions silently agreed on a
-        // bogus spelling — explicit `(variant, "wire")` tuples are the
-        // spelling oracle for SQL CHECK strings (schema.rs) and audit-log
-        // payload consumers (DESIGN §6).
         let cases = [
             (Status::Planned, "planned"),
             (Status::Active, "active"),
@@ -566,11 +566,11 @@ mod tests {
         assert!(cap.active_attempt_record().is_none());
     }
 
+    /// State-shape violation: `active_attempt` points at an id with no row.
+    /// The doc-comment promises `None` here; pin so a future refactor that
+    /// panics instead would fail this test.
     #[test]
     fn active_attempt_record_none_when_missing_row() {
-        // State-shape violation: active_attempt points at an id with no row.
-        // Doc-comment promises None here; pin so future refactors that
-        // panic instead would fail this test.
         let cap = synthetic_capsule(Some(99), vec![synthetic_attempt(1)]);
         assert!(cap.active_attempt_record().is_none());
     }
