@@ -185,11 +185,14 @@ impl Store {
     /// Create a new capsule. Caller supplies the id (typically a uuid). All
     /// fields validated; status starts at `planned`.
     pub fn create_capsule(&mut self, c: NewCapsule) -> Result<Capsule> {
-        capsule_core::id::validate(&c.id)
-            .map_err(|e| StoreError::InvalidId(c.id.clone(), e.to_string()))?;
+        // Validate by borrow so `c.id` survives for either the error variant
+        // or the move into `Capsule.id` below.
+        if let Err(e) = capsule_core::id::validate(&c.id) {
+            return Err(StoreError::InvalidId(c.id, e.to_string()));
+        }
         let (now, now_str) = now_pair()?;
         let capsule = Capsule {
-            id: c.id.clone(),
+            id: c.id,
             title: c.title,
             description: c.description,
             acceptance: c.acceptance,
@@ -743,17 +746,7 @@ impl Store {
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = verified_sha != prior_base_sha;
-                // `pending` is consumed by this arm only; move its owned fields
-                // into `landing`, the canonical record once the push lands.
-                let landing = Landing {
-                    at: now,
-                    landed_sha: verified_sha,
-                    prior_base_sha: pending.prior_base_sha,
-                    landed_by: pending.lander,
-                    attempt_id: pending.attempt_id,
-                    witness_branch: pending.witness_branch,
-                    advanced_base_ref,
-                };
+                let landing = pending.into_landing(now, advanced_base_ref);
                 finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 LandOutcome::Landed { landing }
             }

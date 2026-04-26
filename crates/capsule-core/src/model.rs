@@ -243,6 +243,24 @@ pub struct PendingLand {
     pub lander: String,
 }
 
+impl PendingLand {
+    /// Promote this pending record to the canonical `Landing` once the atomic
+    /// push has been observed to advance the witness ref. `at` is the land
+    /// commit time; `advanced_base_ref` is `verified_sha != prior_base_sha`
+    /// at the moment the push observed the remote.
+    pub fn into_landing(self, at: OffsetDateTime, advanced_base_ref: bool) -> Landing {
+        Landing {
+            at,
+            landed_sha: self.verified_sha,
+            prior_base_sha: self.prior_base_sha,
+            landed_by: self.lander,
+            attempt_id: self.attempt_id,
+            witness_branch: self.witness_branch,
+            advanced_base_ref,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Landing {
     #[serde(with = "time::serde::iso8601")]
