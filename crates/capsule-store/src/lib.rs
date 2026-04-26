@@ -5,7 +5,7 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 use capsule_core::path::CanonicalPath;
-use capsule_core::{Acceptance, Capsule, CapsuleId, Landing, PendingLand, Status, Verification};
+use capsule_core::{Acceptance, Capsule, CapsuleId, Landing, PendingLand, Status};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json as json;
 use thiserror::Error;
@@ -641,7 +641,11 @@ impl Store {
             let (now, now_str) = now_pair()?;
             let tx = self.conn.transaction()?;
 
-            let (status_str, active_attempt, frozen, verification_json): (
+            // Project just `$.verified_sha` from `verification_json` for the
+            // in-tx CAS — full Verification blob (`command`, `exit_code`,
+            // `duration_ms`, `log_ref`) is not needed here. Saves one
+            // `serde_json::from_str::<Verification>` per land step 2.
+            let (status_str, active_attempt, frozen, in_tx_verified_sha): (
                 String,
                 Option<i64>,
                 bool,
@@ -649,7 +653,7 @@ impl Store {
             ) = tx
                 .query_row(
                     "SELECT status, active_attempt, pending_land_json IS NOT NULL,
-                            verification_json
+                            json_extract(verification_json, '$.verified_sha')
                      FROM capsule WHERE id = ?1",
                     params![req.capsule_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -665,9 +669,9 @@ impl Store {
             }
             let aid = active_attempt.expect("accepted ⇒ active_attempt set");
             attempt_id = aid;
-            let v_json = verification_json.expect("accepted ⇒ verification set");
-            let v: Verification = json::from_str(&v_json)?;
-            if v.verified_sha != verified_sha {
+            let in_tx_verified_sha =
+                in_tx_verified_sha.expect("accepted ⇒ verification set with verified_sha");
+            if in_tx_verified_sha != verified_sha {
                 return Err(StoreError::NotLandable(req.capsule_id));
             }
 
