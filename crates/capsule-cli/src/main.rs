@@ -627,6 +627,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+struct SessionAttempt {
+    ttl: u64,
+    branch: String,
+    base_sha: String,
+    num: u64,
+}
+
+/// Pre-flight for `capsule work`: confirm there is an active attempt for the
+/// given session and surface the fields the work loop needs (ttl, branch,
+/// base sha, attempt num). Distinguishes "no active attempt" (claimable, hint
+/// the user to `capsule claim`) from "`active_attempt` points at a row that
+/// does not exist" (state-shape violation, unreachable in well-formed state
+/// but `claim` can't repair it — so "run claim" would be actively misleading).
+fn load_session_attempt(
+    dir: &Path,
+    capsule_id: &str,
+    session: &str,
+) -> Result<SessionAttempt> {
+    let store = open_store(dir)?;
+    let capsule = store.get_capsule(capsule_id)?;
+    let active_attempt_id = capsule.active_attempt;
+    let attempt = capsule.into_active_attempt().ok_or_else(|| {
+        if let Some(aid) = active_attempt_id {
+            anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
+        } else {
+            anyhow::anyhow!("capsule has no active attempt; run `capsule claim`")
+        }
+    })?;
+    if attempt.lease.session_id != session {
+        anyhow::bail!(
+            "session mismatch: active attempt session is {}",
+            attempt.lease.session_id
+        );
+    }
+    Ok(SessionAttempt {
+        ttl: attempt.lease.ttl_sec.max(3),
+        branch: attempt.branch,
+        base_sha: attempt.base_sha,
+        num: attempt.id,
+    })
+}
+
 /// `capsule work`: spawn child, heartbeat in a thread at `ttl/3` cadence on a
 /// second SQLite connection (WAL makes same-process dual connections safe), and
 /// forward the child's exit code. No custom signal handlers — terminal signals
@@ -640,32 +682,12 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     use std::thread;
     use std::time::Duration;
 
-    // Pre-flight: confirm active attempt exists for this session, read ttl.
-    let pre = open_store(dir)?;
-    let capsule = pre.get_capsule(&args.capsule_id)?;
-    let active_attempt_id = capsule.active_attempt;
-    let attempt = capsule.into_active_attempt().ok_or_else(|| {
-        // Distinguish "no active attempt" (claimable) from "active_attempt
-        // points at a row that does not exist" (corrupt state). The latter
-        // is unreachable in well-formed state, but `claim` cannot repair it,
-        // so a "run claim" hint would be actively misleading.
-        if let Some(aid) = active_attempt_id {
-            anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
-        } else {
-            anyhow::anyhow!("capsule has no active attempt; run `capsule claim`")
-        }
-    })?;
-    if attempt.lease.session_id != args.session {
-        anyhow::bail!(
-            "session mismatch: active attempt session is {}",
-            attempt.lease.session_id
-        );
-    }
-    let ttl = attempt.lease.ttl_sec.max(3);
-    let attempt_branch = attempt.branch;
-    let attempt_base_sha = attempt.base_sha;
-    let attempt_num = attempt.id;
-    drop(pre);
+    let SessionAttempt {
+        ttl,
+        branch: attempt_branch,
+        base_sha: attempt_base_sha,
+        num: attempt_num,
+    } = load_session_attempt(dir, &args.capsule_id, &args.session)?;
 
     let isolate_state = if args.isolate == IsolateMode::Worktree {
         Some(worktree::setup(
