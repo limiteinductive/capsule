@@ -742,7 +742,7 @@ impl Store {
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = verified_sha != prior_base_sha;
-                // `pending` is read by this arm only; move its owned fields
+                // `pending` is consumed by this arm only; move its owned fields
                 // into `landing`, the canonical record once the push lands.
                 let landing = Landing {
                     at: now,
