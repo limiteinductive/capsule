@@ -1865,31 +1865,36 @@ fn creates_cycle(
 /// `seen` is populated at push-time, not pop-time. Each reachable capsule is
 /// enqueued at most once, dropping the pop-time `seen.contains` check and
 /// avoiding duplicate enqueues for diamond-shaped subgraphs.
+///
+/// Per-node neighbor expansion uses `json_each` against the row's
+/// `depends_on_json`, so the deps array stays inside SQLite — no
+/// `serde_json::from_str` per pop. A missing row (capsule not in DB) yields
+/// zero join rows, matching the prior `.optional()` skip path.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<String> = HashSet::new();
     let mut q: VecDeque<String> = VecDeque::new();
-    let from_owned = from.to_string();
-    seen.insert(from_owned.clone());
-    q.push_back(from_owned);
+    seen.insert(from.to_string());
+    q.push_back(from.to_string());
     while let Some(node) = q.pop_front() {
         if node == target {
             return Ok(true);
         }
-        let deps_json: Option<String> = tx
-            .query_row(
-                "SELECT depends_on_json FROM capsule WHERE id = ?1",
-                params![node],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(deps_json) = deps_json else {
-            continue;
-        };
-        let deps: Vec<String> = json::from_str(&deps_json)?;
+        // `prepare_cached` borrows `tx` until the stmt is dropped; the
+        // explicit `drop(stmt)` releases that borrow before the next pop's
+        // `prepare_cached` call. A trailing-expression block scope ran into
+        // `clippy::let_and_return` vs E0597 (the `Rows` iterator borrows
+        // `stmt`) — explicit drop is the cleanest form.
+        let mut stmt = tx.prepare_cached(
+            "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
+             WHERE c.id = ?1",
+        )?;
+        let deps = stmt
+            .query_map(params![node], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        drop(stmt);
         for d in deps {
-            if !seen.contains(&d) {
-                seen.insert(d.clone());
+            if seen.insert(d.clone()) {
                 q.push_back(d);
             }
         }
