@@ -149,9 +149,6 @@ pub fn land_push(
         .stdout(Stdio::piped())
         .output()?;
 
-    // `classify_push` borrows; only the failure-fallback paths inside
-    // `classify_failure_from_stderr` allocate owned copies for storage in
-    // `GitError::Failed`/`LandOutcome::OtherFailure`.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let code = out.status.code().unwrap_or(-1);
@@ -324,14 +321,12 @@ mod tests {
         );
     }
 
+    /// Realistic failure: a misconfigured proxy injects an HTML error page,
+    /// or git emits a warning line before the sha. Garbage on the wire must
+    /// surface as `GitError::Parse`, never flow on as a sha.
     #[test]
     fn parse_ls_remote_rejects_non_sha_token() {
-        // E.g. a misconfigured proxy injected an HTML error page or git emitted
-        // a warning before the sha. Garbage must surface as Parse, not flow on.
         let stdout = "not-a-sha\trefs/heads/main\n";
-        // Non-target arm names every other `GitError` variant explicitly so a
-        // future variant added to `GitError` forces compile-time review here
-        // (mirrors the iter 109 fix on `ExitCode` in capsule-core::model).
         match parse_ls_remote_stdout(stdout) {
             Err(GitError::Parse(msg)) => assert!(msg.contains("not-a-sha"), "msg: {msg}"),
             other @ (Ok(_) | Err(GitError::Io(_)) | Err(GitError::Failed { .. })) => {
