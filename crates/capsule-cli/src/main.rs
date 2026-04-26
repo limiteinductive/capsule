@@ -410,9 +410,7 @@ fn main() -> Result<()> {
                 if args.full {
                     print_json(&capsules)?;
                 } else {
-                    let summaries: Vec<CapsuleSummary<'_>> =
-                        capsules.iter().map(CapsuleSummary::from).collect();
-                    print_json(&summaries)?;
+                    print_json(&CapsuleSummaries(&capsules))?;
                 }
             } else {
                 for c in &capsules {
@@ -885,5 +883,22 @@ impl<'a> From<&'a Capsule> for CapsuleSummary<'a> {
             scope_prefixes: &c.scope_prefixes,
             title: &c.title,
         }
+    }
+}
+
+/// `Serialize` adapter for the `--json` array shape of `capsule list` (default,
+/// non-`--full`). Builds each `CapsuleSummary` on the fly during serialization
+/// so the slice doesn't need to be re-collected into a `Vec<CapsuleSummary<'_>>`
+/// per call. Output is byte-identical to a `Vec`-backed serialization.
+struct CapsuleSummaries<'a>(&'a [Capsule]);
+
+impl serde::Serialize for CapsuleSummaries<'_> {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = ser.serialize_seq(Some(self.0.len()))?;
+        for c in self.0 {
+            seq.serialize_element(&CapsuleSummary::from(c))?;
+        }
+        seq.end()
     }
 }
