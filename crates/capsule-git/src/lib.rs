@@ -173,6 +173,11 @@ pub fn land_push(
 /// failure classification must read stdout. Witness `(stale info)` always
 /// outranks base non-FF, since a witness OID mismatch is a §3.1 protection
 /// leak (operational incident) while a non-FF base is benign caller-rebase.
+///
+/// Destination matching: `land_push` emits full `refs/heads/<branch>`
+/// destinations; this function strips that prefix and compares bare names so
+/// `base_ref` / `witness_branch` callers don't pay two `format!` allocs per
+/// call.
 fn classify_push(
     stdout: &str,
     stderr: &str,
@@ -183,8 +188,6 @@ fn classify_push(
 ) -> Result<LandOutcome> {
     let mut witness: Option<RefLine<'_>> = None;
     let mut base: Option<RefLine<'_>> = None;
-    // `land_push` emits full `refs/heads/<branch>` destinations; strip the
-    // prefix and compare bare names to avoid two `format!` allocs per call.
     for line in stdout.lines().filter_map(parse_ref_line) {
         let Some(name) = line.dst.strip_prefix("refs/heads/") else {
             continue;
@@ -222,9 +225,9 @@ fn witness_protection_leak(witness: Option<&RefLine<'_>>) -> bool {
     rejected_with(witness, git_reject::STALE_INFO)
 }
 
+/// Inlined (not three `rejected_with` calls) so `flag == '!'` is checked
+/// once across the three equivalent rejection reasons git emits for non-FF.
 fn base_non_fast_forward(base: Option<&RefLine<'_>>) -> bool {
-    // Inlined rather than fanning out three `rejected_with` calls so the
-    // `flag == '!'` check runs once across the equivalent rejection reasons.
     base.is_some_and(|l| {
         l.flag == '!'
             && [
@@ -299,10 +302,11 @@ fn rejected_with(line: Option<&RefLine<'_>>, needle: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Mirror the build-time `const _: ()` pin in `cargo test` output too,
+    /// so a typo in `ZERO_OID` surfaces in test runs and not just `cargo
+    /// build`.
     #[test]
     fn zero_oid_is_valid_sha() {
-        // Doubles the build-time `const _: ()` pin in test surface, so a
-        // typo in ZERO_OID surfaces in `cargo test` output as well.
         capsule_core::sha::validate(ZERO_OID).unwrap();
     }
 
@@ -344,8 +348,8 @@ mod tests {
         ));
     }
 
-    // Empirical transcripts captured from `git push --porcelain` against a
-    // real remote (git 2.x). Tab-separated, as porcelain emits.
+    /// Empirical transcripts captured from `git push --porcelain` against a
+    /// real remote (git 2.x). Tab-separated, as porcelain emits.
     const STALE_INFO_STDOUT: &str = "To /tmp/remote.git\n!\trefs/heads/witness:refs/heads/witness\t[rejected] (stale info)\nDone\n";
     const STALE_INFO_STDERR: &str = "error: failed to push some refs to '/tmp/remote.git'\n";
     const FETCH_FIRST_STDOUT: &str =
@@ -383,10 +387,11 @@ mod tests {
         assert_eq!(r, LandOutcome::BaseRefMoved);
     }
 
+    /// Synthesized: with `--atomic`, a witness stale-info would still appear
+    /// even when base also failed. Witness wins (protection leak outranks
+    /// caller-rebase).
     #[test]
     fn witness_stale_outranks_base_non_ff() {
-        // Synthesized: with --atomic, a witness stale-info would still appear
-        // even when base also failed. Witness wins (protection leak).
         let stdout = "To /tmp/remote.git\n\
             !\tHEAD:refs/heads/main\t[rejected] (fetch first)\n\
             !\trefs/heads/w:refs/heads/capsule-witness/foo/a1\t[rejected] (stale info)\n\
