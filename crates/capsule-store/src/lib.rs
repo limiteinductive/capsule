@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, CapsuleId, Landing, PendingLand, Status};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde_json as json;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -2288,13 +2288,15 @@ fn decode_opt_json<T: serde::de::DeserializeOwned>(s: Option<String>) -> Result<
 /// True iff a row with this id exists in `capsule`. `id` is the primary key,
 /// so this is an indexed lookup. (Distinct from `capsule_core::id::validate`,
 /// which is a syntactic check on the id string.)
+/// `EXISTS(SELECT 1 ...)` always yields exactly one row holding 0/1, so the
+/// `.optional()? .unwrap_or(false)` indirection the callsite-once row-presence
+/// shape needed disappears — one `query_row` returning `bool` suffices.
 fn capsule_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool> {
-    let exists: Option<bool> = tx
-        .query_row("SELECT 1 FROM capsule WHERE id = ?1", params![id], |_| {
-            Ok(true)
-        })
-        .optional()?;
-    Ok(exists.unwrap_or(false))
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capsule WHERE id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Persist a dependency-edge change: write the new `depends_on_json` and
