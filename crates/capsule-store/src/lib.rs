@@ -458,16 +458,12 @@ impl Store {
             params![next_id, now_str, req.capsule_id],
         )?;
 
-        // DESIGN.md §6 attempt_claimed payload: {attempt_id, session_id,
-        // base_sha, lease}. `attempt_id` also appears as the event row's
-        // attempt_id column so the audit log can be filtered without
-        // parsing JSON.
-        let claimed_payload = json::json!({
-            "attempt_id": next_id,
-            "session_id": req.session_id,
-            "base_sha": req.base_sha,
-            "lease": lease,
-        });
+        let claimed_payload = json::to_value(ClaimedPayload {
+            attempt_id: next_id,
+            session_id: &req.session_id,
+            base_sha: &req.base_sha,
+            lease: &lease,
+        })?;
         insert_event(
             &tx,
             &now_str,
@@ -560,18 +556,13 @@ impl Store {
             "UPDATE attempt SET tip_sha=?1 WHERE capsule_id=?2 AND attempt_id=?3",
             params![verification.verified_sha, req.capsule_id, aid],
         )?;
-        // DESIGN.md §6 attempt_attested payload: {verified_sha, exit_code,
-        // command, log_ref, duration_ms} — the run inputs/outputs. The event
-        // row's at/actor/attempt_id columns carry what DESIGN's Verification
-        // struct §5 calls at/attestor/attempt_id, so they are not duplicated
-        // in the payload.
-        let event_payload = json::json!({
-            "verified_sha": verification.verified_sha,
-            "exit_code": verification.exit_code,
-            "command": verification.command,
-            "log_ref": verification.log_ref,
-            "duration_ms": verification.duration_ms,
-        });
+        let event_payload = json::to_value(AttestedPayload {
+            verified_sha: &verification.verified_sha,
+            exit_code: &verification.exit_code,
+            command: &verification.command,
+            log_ref: &verification.log_ref,
+            duration_ms: verification.duration_ms,
+        })?;
         insert_event(
             &tx,
             &now_str,
@@ -1938,6 +1929,30 @@ struct CreatedPayload<'a> {
     scope_prefixes: &'a [CanonicalPath],
     base_ref: &'a str,
     depends_on: &'a [CapsuleId],
+}
+
+/// `attempt_claimed` event payload (DESIGN.md §6). The event row's
+/// `attempt_id` column duplicates `attempt_id` here so the audit log can be
+/// filtered without parsing JSON.
+#[derive(serde::Serialize)]
+struct ClaimedPayload<'a> {
+    attempt_id: i64,
+    session_id: &'a str,
+    base_sha: &'a str,
+    lease: &'a capsule_core::Lease,
+}
+
+/// `attempt_attested` event payload (DESIGN.md §6) — the run inputs and
+/// outputs. The event row's `at` / `actor` / `attempt_id` columns carry what
+/// `Verification` (§5) calls `at` / `attestor` / `attempt_id`, so they are
+/// not duplicated in this struct.
+#[derive(serde::Serialize)]
+struct AttestedPayload<'a> {
+    verified_sha: &'a str,
+    exit_code: &'a capsule_core::ExitCode,
+    command: &'a str,
+    log_ref: &'a str,
+    duration_ms: u64,
 }
 
 /// Builder for `Store::amend`'s parallel writes: each field set goes into
