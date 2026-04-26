@@ -648,7 +648,7 @@ impl Store {
             base_ref,
             witness_branch,
             verified_sha,
-        } = LandableSnapshot::extract(&cap)
+        } = LandableSnapshot::extract(cap)
             .ok_or_else(|| StoreError::NotLandable(req.capsule_id.clone()))?;
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
@@ -1891,13 +1891,17 @@ struct LandableSnapshot {
 }
 
 impl LandableSnapshot {
-    fn extract(cap: &capsule_core::Capsule) -> Option<Self> {
-        let att = cap.active_attempt_record()?;
-        let v = cap.verification.as_ref()?;
+    /// Consumes the capsule so land step 1 can move out the three needed
+    /// String fields instead of cloning them.
+    fn extract(mut cap: capsule_core::Capsule) -> Option<Self> {
+        let aid = cap.active_attempt?;
+        let v = cap.verification.take()?;
+        let pos = cap.attempts.iter().position(|a| a.id == aid)?;
+        let att = cap.attempts.remove(pos);
         Some(Self {
-            base_ref: cap.base_ref.clone(),
-            witness_branch: att.witness_branch.clone(),
-            verified_sha: v.verified_sha.clone(),
+            base_ref: cap.base_ref,
+            witness_branch: att.witness_branch,
+            verified_sha: v.verified_sha,
         })
     }
 }
