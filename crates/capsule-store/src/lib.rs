@@ -753,11 +753,13 @@ impl Store {
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = verified_sha != prior_base_sha;
+                // `pending` is read by this arm only; move its owned fields
+                // into `landing`, the canonical record once the push lands.
                 let landing = Landing {
                     at: now,
                     landed_sha: verified_sha,
-                    prior_base_sha: pending.prior_base_sha.clone(),
-                    landed_by: req.lander.clone(),
+                    prior_base_sha: pending.prior_base_sha,
+                    landed_by: pending.lander,
                     attempt_id: pending.attempt_id,
                     witness_branch: pending.witness_branch,
                     advanced_base_ref,
@@ -848,15 +850,8 @@ impl Store {
             return Err(StoreError::terminal(req.capsule_id, status));
         }
 
-        // If a lease is held, the abandoning session must own it.
-        // Do NOT use `load_live_lease_for_session` here: self-abandon must
-        // work after lease expiry — that's the worker's recovery path when
-        // it has lost its grip on the heartbeat (DESIGN.md §3.3).
         if let Some(aid) = active_attempt {
-            let lease = load_lease(&tx, &req.capsule_id, aid)?;
-            if lease.session_id != req.session_id {
-                return Err(StoreError::CrossSession);
-            }
+            load_lease_owner_allow_expired(&tx, &req.capsule_id, aid, &req.session_id)?;
             close_attempt(
                 &tx,
                 &req.capsule_id,
@@ -1766,11 +1761,9 @@ fn retain_available(
         .collect())
 }
 
-/// Load and deserialize the `Lease` for one attempt. Underlying loader for
-/// `load_live_lease_for_session` (which `attest` / `heartbeat` / `land`
-/// compose with) and called directly by `abandon` (which must remain callable
-/// on an expired lease). Centralized so the SQL and the JSON-shape contract
-/// live in one place.
+/// Raw lease loader; centralizes the SQL + JSON-shape contract. Prefer the
+/// named wrappers (`load_live_lease_for_session`, `load_lease_owner_allow_expired`)
+/// at call sites — they spell out the lease invariant being asserted.
 fn load_lease(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1784,12 +1777,8 @@ fn load_lease(
     Ok(json::from_str(&lease_json)?)
 }
 
-/// Load the lease and verify the caller owns it (matching `session_id`) AND
-/// it has not expired. Used by `attest` / `heartbeat` / `land` — the
-/// operations whose preconditions require a live lease in the calling session.
-/// `abandon` deliberately calls `load_lease` directly with only an inline
-/// session-match check, since it must remain callable on an expired lease so
-/// the worker can self-abandon.
+/// Lease invariant for `attest` / `heartbeat` / `land`: caller owns it AND
+/// it has not expired.
 fn load_live_lease_for_session(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1803,6 +1792,21 @@ fn load_live_lease_for_session(
     }
     if now > lease.expires_at {
         return Err(StoreError::LeaseExpired(format_iso8601(lease.expires_at)?));
+    }
+    Ok(lease)
+}
+
+/// Lease invariant for `abandon`: caller owns it; expiry is not checked, so
+/// a worker can self-abandon after losing its heartbeat grip (DESIGN.md §3.3).
+fn load_lease_owner_allow_expired(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+    attempt_id: i64,
+    session_id: &str,
+) -> Result<capsule_core::Lease> {
+    let lease = load_lease(tx, capsule_id, attempt_id)?;
+    if lease.session_id != session_id {
+        return Err(StoreError::CrossSession);
     }
     Ok(lease)
 }
