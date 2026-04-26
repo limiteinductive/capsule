@@ -215,9 +215,18 @@ fn witness_protection_leak(witness: Option<&RefLine<'_>>) -> bool {
 }
 
 fn base_non_fast_forward(base: Option<&RefLine<'_>>) -> bool {
-    rejected_with(base, git_reject::FETCH_FIRST)
-        || rejected_with(base, git_reject::NON_FAST_FORWARD)
-        || rejected_with(base, git_reject::NON_FAST_FORWARD_SPACE)
+    // Inlined rather than fanning out three `rejected_with` calls so the
+    // `flag == '!'` check runs once across the equivalent rejection reasons.
+    base.is_some_and(|l| {
+        l.flag == '!'
+            && [
+                git_reject::FETCH_FIRST,
+                git_reject::NON_FAST_FORWARD,
+                git_reject::NON_FAST_FORWARD_SPACE,
+            ]
+            .iter()
+            .any(|n| l.summary.contains(n))
+    })
 }
 
 /// Stderr-only fallback when porcelain stdout did not carry per-ref reasons
