@@ -178,9 +178,17 @@ fn classify_push(
 ) -> Result<LandOutcome> {
     let base_dst = format!("refs/heads/{base_ref}");
     let witness_dst = format!("refs/heads/{witness_branch}");
-    let lines: Vec<RefLine<'_>> = stdout.lines().filter_map(parse_ref_line).collect();
-    let witness = lines.iter().find(|l| l.dst == witness_dst);
-    let base = lines.iter().find(|l| l.dst == base_dst);
+    let mut witness: Option<RefLine<'_>> = None;
+    let mut base: Option<RefLine<'_>> = None;
+    for line in stdout.lines().filter_map(parse_ref_line) {
+        if line.dst == witness_dst {
+            witness = Some(line);
+        } else if line.dst == base_dst {
+            base = Some(line);
+        }
+    }
+    let witness = witness.as_ref();
+    let base = base.as_ref();
 
     if success {
         let (base_created, base_changed) = ref_change(base);
