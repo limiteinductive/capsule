@@ -989,8 +989,7 @@ impl Store {
                 // the snapshot we'd audit (`null`) is stale — return CasLost
                 // and let the operator retry rather than emit a misleading
                 // `not_frozen` audit row.
-                let cur_pending = load_pending_land_json(&tx, &req.capsule_id)?;
-                if cur_pending.is_some() {
+                if is_pending_land_set_in_tx(&tx, &req.capsule_id)? {
                     tx.commit()?;
                     return Ok(ReconcileOutcome::CasLost);
                 }
@@ -1796,6 +1795,23 @@ fn pending_land_snapshot_unchanged(
     Ok(cur.as_deref() == Some(snapshot_json))
 }
 
+/// SQL-side existence check for the §7.2 reclaim/abandon freeze flag,
+/// projecting `pending_land_json IS NOT NULL` so the JSON payload never
+/// crosses into Rust when only the boolean matters. Standalone in-tx
+/// boolean checks share this; wider precondition reads project the same
+/// expression inline because they already fetch adjacent columns.
+fn is_pending_land_set_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    capsule_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1",
+        params![capsule_id],
+        |r| r.get(0),
+    )
+    .or_not_found(capsule_id)
+}
+
 /// Reject any state change that would race with an in-flight land. Read +
 /// check share one tx snapshot so a concurrent `land` between the two reads
 /// can't produce `Ok(false)` here when `PendingLandFrozen` is the right
@@ -1805,14 +1821,7 @@ fn assert_not_pending_land_frozen_in_tx(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
 ) -> Result<()> {
-    let frozen: bool = tx
-        .query_row(
-            "SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1",
-            params![capsule_id],
-            |r| r.get(0),
-        )
-        .or_not_found(capsule_id)?;
-    if frozen {
+    if is_pending_land_set_in_tx(tx, capsule_id)? {
         return Err(StoreError::PendingLandFrozen(capsule_id.into()));
     }
     Ok(())
