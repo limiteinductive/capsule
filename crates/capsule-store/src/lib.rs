@@ -2658,12 +2658,18 @@ mod tests {
         assert!(v.get("lease_expires_at").is_none(), "old key must not return");
     }
 
+    /// `attempt_attested` event payload (DESIGN §6): `{verified_sha, exit_code,
+    /// command, log_ref, duration_ms}`. The full `Verification` struct also
+    /// carries `at/attestor/attempt_id`, but those duplicate the event row's
+    /// own `at/actor/attempt_id` columns, so the payload omits them.
+    ///
+    /// `ExitCode` is `#[serde(untagged)]`, so the wire shape varies by variant:
+    /// `Code(0)` → JSON number, `Sentinel("timeout")` → JSON string. External
+    /// readers key on these. The companion test
+    /// `attempt_attested_event_payload_serializes_sentinel_exit_code` pins the
+    /// sentinel arm; this one pins the integer arm and the full key set.
     #[test]
     fn attempt_attested_event_payload_matches_design_spec() {
-        // DESIGN.md §6 attempt_attested payload: {verified_sha, exit_code,
-        // command, log_ref, duration_ms}. The full Verification struct (with
-        // at/attestor/attempt_id) lives in capsule.verification_json — those
-        // three would duplicate the event row's at/actor/attempt_id columns.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
@@ -2688,15 +2694,11 @@ mod tests {
         assert_eq!(v["verified_sha"], FAKE_SHA);
         assert_eq!(v["duration_ms"], 7);
         assert_eq!(v["command"], "true");
-        // ExitCode is `#[serde(untagged)]`: Code(0) → JSON number 0.
         assert_eq!(v["exit_code"], 0);
     }
 
     #[test]
     fn attempt_attested_event_payload_serializes_sentinel_exit_code() {
-        // Pin the other arm of `ExitCode`: Sentinel("timeout") → JSON string.
-        // Untagged-enum stability matters because the event payload is the
-        // wire format readers depend on.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
