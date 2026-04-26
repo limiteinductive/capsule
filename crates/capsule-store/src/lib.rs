@@ -420,8 +420,9 @@ impl Store {
 
         let branch = format!("capsules/{}/a{}", req.capsule_id, next_id);
         let witness_branch = format!("capsule-witness/{}/a{}", req.capsule_id, next_id);
+        // Lease is the canonical home for owner from claim through land.
         let lease = Lease {
-            owner: req.owner.clone(),
+            owner: req.owner,
             session_id: req.session_id.clone(),
             acquired_at: now,
             expires_at: expires,
