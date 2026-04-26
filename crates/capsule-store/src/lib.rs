@@ -1926,7 +1926,7 @@ impl LandableSnapshot {
         let aid = cap.active_attempt?;
         let v = cap.verification.take()?;
         let pos = cap.attempts.iter().position(|a| a.id == aid)?;
-        let att = cap.attempts.remove(pos);
+        let att = cap.attempts.swap_remove(pos);
         Some(Self {
             base_ref: cap.base_ref,
             witness_branch: att.witness_branch,

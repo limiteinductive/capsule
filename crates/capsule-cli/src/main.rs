@@ -648,12 +648,13 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     // Pre-flight: confirm active attempt exists for this session, read ttl.
     let pre = open_store(dir)?;
     let capsule = pre.get_capsule(&args.capsule_id)?;
-    let attempt = capsule.active_attempt_record().ok_or_else(|| {
+    let active_attempt_id = capsule.active_attempt;
+    let attempt = capsule.into_active_attempt().ok_or_else(|| {
         // Distinguish "no active attempt" (claimable) from "active_attempt
         // points at a row that does not exist" (corrupt state). The latter
         // is unreachable in well-formed state, but `claim` cannot repair it,
         // so a "run claim" hint would be actively misleading.
-        if let Some(aid) = capsule.active_attempt {
+        if let Some(aid) = active_attempt_id {
             anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
         } else {
             anyhow::anyhow!("capsule has no active attempt; run `capsule claim`")
@@ -666,8 +667,8 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
         );
     }
     let ttl = attempt.lease.ttl_sec.max(3);
-    let attempt_branch = attempt.branch.clone();
-    let attempt_base_sha = attempt.base_sha.clone();
+    let attempt_branch = attempt.branch;
+    let attempt_base_sha = attempt.base_sha;
     let attempt_num = attempt.id;
     drop(pre);
 

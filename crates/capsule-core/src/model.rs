@@ -312,6 +312,16 @@ impl Capsule {
         let aid = self.active_attempt?;
         self.attempts.iter().find(|a| a.id == aid)
     }
+
+    /// Consuming sibling of `active_attempt_record`. Returns the matching
+    /// `Attempt` by value so callers can move owned fields out (branch,
+    /// base_sha, etc.) without cloning. Same `None` cases as the borrowing
+    /// form: no `active_attempt`, or `active_attempt` points at a missing row.
+    pub fn into_active_attempt(mut self) -> Option<Attempt> {
+        let aid = self.active_attempt?;
+        let pos = self.attempts.iter().position(|a| a.id == aid)?;
+        Some(self.attempts.swap_remove(pos))
+    }
 }
 
 #[cfg(test)]
