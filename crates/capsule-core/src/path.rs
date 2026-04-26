@@ -25,6 +25,11 @@ impl CanonicalPath {
     /// Canonicalize a repo-relative path: reject empty/absolute/`..`, normalize
     /// separators to `/`, drop empty and `.` components, strip trailing `/`,
     /// apply Unicode NFC to each component (DESIGN.md §7.0).
+    ///
+    /// Single-pass build into one `String` buffer: components are NFC-extended
+    /// inline rather than collected into an intermediate `Vec<String>` and
+    /// `join`-ed. The `..` check sits inside the loop because ASCII dots are
+    /// NFC-stable, so seeing `".."` pre-NFC is equivalent to seeing it post-NFC.
     pub fn new(input: &str) -> Result<Self, CanonicalizeError> {
         if input.is_empty() {
             return Err(CanonicalizeError::Empty);
@@ -32,18 +37,25 @@ impl CanonicalPath {
         if input.starts_with('/') {
             return Err(CanonicalizeError::Absolute);
         }
-        let parts: Vec<String> = input
+        let mut out = String::with_capacity(input.len()); // hint only; NFC may grow
+        let mut had_any = false;
+        for p in input
             .split(['/', '\\'])
             .filter(|p| !p.is_empty() && *p != ".")
-            .map(|p| p.nfc().collect::<String>())
-            .collect();
-        if parts.iter().any(|p| p == "..") {
-            return Err(CanonicalizeError::DotDot);
+        {
+            if p == ".." {
+                return Err(CanonicalizeError::DotDot);
+            }
+            if had_any {
+                out.push('/');
+            }
+            had_any = true;
+            out.extend(p.nfc());
         }
-        if parts.is_empty() {
+        if !had_any {
             return Err(CanonicalizeError::Empty);
         }
-        Ok(Self(parts.join("/")))
+        Ok(Self(out))
     }
 
     pub fn as_str(&self) -> &str {
