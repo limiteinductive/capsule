@@ -70,12 +70,13 @@ impl CanonicalPath {
 
     /// Path-component-wise prefix overlap. `src/foo` overlaps `src/foo/bar.rs`
     /// (one is a prefix of the other when split on `/`), but not `src/foobar`.
+    ///
+    /// Allocation-free by construction: `zip` stops at the shorter iterator,
+    /// so this compares exactly `min(len(a), len(b))` components — same answer
+    /// as an explicit prefix check, no intermediate `Vec`s. Called per
+    /// (in-flight × claimed) scope pair on every `claim`, so the saving
+    /// matters at scale.
     pub fn overlaps(&self, other: &Self) -> bool {
-        // Allocation-free: zip stops at the shorter iterator, so we compare
-        // exactly min(len(a), len(b)) components — equivalent to the explicit
-        // prefix check but without the intermediate `Vec`s. Called per
-        // (in-flight × claimed) scope pair on every `claim`, so the saving
-        // matters at scale.
         self.0
             .split('/')
             .zip(other.0.split('/'))

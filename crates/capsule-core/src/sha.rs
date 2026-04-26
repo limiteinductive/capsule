@@ -57,9 +57,10 @@ mod tests {
         assert_eq!(validate("abc"), Err(ShaError::BadLength(3)));
     }
 
+    /// Pin BadLength on the 64-char SHA-256 form so loosening the validator
+    /// when we move off SHA-1 is a deliberate change, not a silent regression.
     #[test]
     fn long_rejected() {
-        // 64-char SHA-256 form — accept later if we move off SHA-1.
         let long = "0".repeat(64);
         assert_eq!(validate(&long), Err(ShaError::BadLength(64)));
     }
@@ -69,10 +70,12 @@ mod tests {
         assert_eq!(validate(""), Err(ShaError::BadLength(0)));
     }
 
+    /// Uppercase hex must surface as `NotLowercase`, not a generic non-hex
+    /// error: callers can then suggest `.to_lowercase()` instead of sending
+    /// the user hunting for a "non-hex" character that's actually fine modulo
+    /// case.
     #[test]
     fn uppercase_rejected_with_dedicated_variant() {
-        // Distinct error helps the caller suggest .to_lowercase() rather than
-        // hunting for a "non-hex" character that's actually fine modulo case.
         assert_eq!(
             validate("0123456789ABCDEF0123456789abcdef01234567"),
             Err(ShaError::NotLowercase)
