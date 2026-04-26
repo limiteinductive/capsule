@@ -1570,15 +1570,15 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
             capsule_core::AttemptOutcome::Expired,
             &now_str,
         )?;
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE capsule
                 SET status='planned',
                     active_attempt=NULL,
                     verification_json=NULL,
                     updated_at=?1
               WHERE id=?2",
-            params![now_str, capsule_id],
-        )?;
+        )?
+        .execute(params![now_str, capsule_id])?;
         let payload = json::json!({
             "at": now_str,
             "prior_lease_expires_at": expires_at_str,
@@ -2396,7 +2396,8 @@ fn abandon_on_witness_mismatch(
 
 /// Mark an attempt terminal by setting `outcome` and `closed_at`. Caller
 /// must pass a terminal `AttemptOutcome` (`Landed`/`Abandoned`/`Expired`);
-/// `closed_at` is meaningless for `InFlight`/`Released`.
+/// `closed_at` is meaningless for `InFlight`/`Released`. Cached: shared by
+/// four callers and runs inside `reclaim_expired_in_tx`'s per-attempt loop.
 fn close_attempt(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -2408,11 +2409,11 @@ fn close_attempt(
         outcome.is_terminal(),
         "close_attempt called with non-terminal outcome {outcome:?}",
     );
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE attempt SET outcome=?1, closed_at=?2
          WHERE capsule_id=?3 AND attempt_id=?4",
-        params![outcome.as_wire_str(), now_str, capsule_id, attempt_id],
-    )?;
+    )?
+    .execute(params![outcome.as_wire_str(), now_str, capsule_id, attempt_id])?;
     Ok(())
 }
 
