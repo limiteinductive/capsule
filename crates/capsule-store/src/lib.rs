@@ -185,8 +185,8 @@ impl Store {
     /// Create a new capsule. Caller supplies the id (typically a uuid). All
     /// fields validated; status starts at `planned`.
     pub fn create_capsule(&mut self, c: NewCapsule) -> Result<Capsule> {
-        // Validate by borrow so `c.id` survives for either the error variant
-        // or the move into `Capsule.id` below.
+        // Use an explicit branch so the invalid-id path can move `c.id` into
+        // the error while the success path can move it into `Capsule.id`.
         if let Err(e) = capsule_core::id::validate(&c.id) {
             return Err(StoreError::InvalidId(c.id, e.to_string()));
         }
