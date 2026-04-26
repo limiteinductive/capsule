@@ -100,7 +100,8 @@ fn check_git() -> Option<String> {
             )
         }
     };
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // Keep the lossy output as Cow so valid UTF-8 avoids an owned copy.
+    let text = String::from_utf8_lossy(&out.stdout);
     match parse_git_version(&text) {
         Some((major, minor)) if (major, minor) < (2, 13) => Some(format!(
             "git {major}.{minor} detected; capsule requires >= 2.13 for `--force-with-lease`"

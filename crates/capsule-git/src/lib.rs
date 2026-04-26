@@ -141,8 +141,11 @@ pub fn land_push(
         .stdout(Stdio::piped())
         .output()?;
 
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // `classify_push` borrows; only the failure-fallback paths inside
+    // `classify_failure_from_stderr` allocate owned copies for storage in
+    // `GitError::Failed`/`LandOutcome::OtherFailure`.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let code = out.status.code().unwrap_or(-1);
 
     classify_push(
