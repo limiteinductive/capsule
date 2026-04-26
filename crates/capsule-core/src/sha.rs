@@ -26,13 +26,11 @@ pub fn validate(s: &str) -> Result<(), ShaError> {
         return Err(ShaError::BadLength(s.len()));
     }
     for (i, b) in s.bytes().enumerate() {
-        if b.is_ascii_digit() || (b'a'..=b'f').contains(&b) {
-            continue;
+        match b {
+            b'0'..=b'9' | b'a'..=b'f' => {}
+            b'A'..=b'F' => return Err(ShaError::NotLowercase),
+            _ => return Err(ShaError::NonHex(i)),
         }
-        if (b'A'..=b'F').contains(&b) {
-            return Err(ShaError::NotLowercase);
-        }
-        return Err(ShaError::NonHex(i));
     }
     Ok(())
 }
