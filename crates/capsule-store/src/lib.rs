@@ -1121,27 +1121,7 @@ impl Store {
     }
 
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
-        // Snapshot the parent row + the per-attempt rows inside one
-        // SQLite read transaction so a concurrent writer can't slip a
-        // commit between the two reads. Without this wrap, the parent
-        // read and the attempt read run as independent statements that
-        // each pick their own snapshot — a writer (e.g. `claim`)
-        // committing in between yields a Capsule whose two halves were
-        // observed at different points in time. The two halves remain
-        // consistent within a write (claim updates parent.active_attempt
-        // and inserts the attempt row in one tx), but the rehydration
-        // can mix a pre-write parent with post-write attempts (or vice
-        // versa) and emit a struct that never existed atomically in the
-        // store. `list_capsules` is already snapshotted via its own
-        // `transaction()`; this brings the single-capsule read path to
-        // parity.
-        //
-        // `unchecked_transaction` accepts `&self.conn`. The "unchecked"
-        // refers to compile-time borrow tracking, not runtime safety —
-        // SQLite still rejects nested transactions on the same conn.
-        // `Transaction`'s `Drop` rolls back on scope exit, which is the
-        // right semantics for this read-only tx; no `commit()` needed.
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.snapshot_read_tx()?;
         let row: RowCapsule = tx
             .query_row(
                 &format!("{} WHERE id = ?1", RowCapsule::SELECT_BASE),
@@ -1150,6 +1130,23 @@ impl Store {
             )
             .or_not_found(id)?;
         row.into_capsule(&tx)
+    }
+
+    /// Open a read-only `Transaction` over `&self.conn` so a multi-statement
+    /// read sees one snapshot — without this, separate statements each pick
+    /// their own and a concurrent writer (e.g. `claim`) committing between
+    /// them yields a hybrid view (pre-write parent + post-write attempts, or
+    /// vice versa) that never existed atomically in the store. Brings the
+    /// single-capsule read path to parity with `list_capsules`, which already
+    /// wraps its reads in a `transaction()`.
+    ///
+    /// `unchecked_transaction` is the rusqlite escape hatch for `&Connection`
+    /// callers — "unchecked" refers to compile-time borrow tracking, not
+    /// runtime safety; SQLite still rejects nested transactions on the same
+    /// connection. The `Transaction`'s `Drop` rolls back on scope exit, the
+    /// right semantics for a read-only tx — no `commit()` needed.
+    fn snapshot_read_tx(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.unchecked_transaction()?)
     }
 }
 
@@ -2095,19 +2092,21 @@ impl RowCapsule {
 /// the column list and the `Attempt` field assignments would silently corrupt
 /// rehydration. Sibling of `RowCapsule::SELECT_BASE` / `RowCapsule::from_row`.
 ///
-/// The two-pass shape (collect raw rows first, then build `Attempt`) is
-/// deliberate: the closure passed to `query_map` returns `rusqlite::Result`,
-/// but `json::from_str` and `parse_iso8601` produce other error types — so
-/// the JSON/ISO-8601 decode lives outside the closure.
+/// Streamed rather than `query_map`-collected: `query_map`'s closure must
+/// return `rusqlite::Result`, but `into_attempt` raises `StoreError` (JSON +
+/// ISO-8601 decode), so a one-pass `while let Some(row) = rows.next()?` lets
+/// both error kinds short-circuit the loop without an intermediate Vec.
 fn load_attempts_for_capsule(
     conn: &Connection,
     capsule_id: &str,
 ) -> Result<Vec<capsule_core::Attempt>> {
     let mut stmt = conn.prepare(RowAttempt::SELECT)?;
-    let rows = stmt
-        .query_map(params![capsule_id], RowAttempt::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(RowAttempt::into_attempt).collect()
+    let mut rows = stmt.query(params![capsule_id])?;
+    let mut attempts = Vec::new();
+    while let Some(row) = rows.next()? {
+        attempts.push(RowAttempt::from_row(row)?.into_attempt()?);
+    }
+    Ok(attempts)
 }
 
 struct RowAttempt {
