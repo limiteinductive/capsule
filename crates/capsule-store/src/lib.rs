@@ -1834,15 +1834,18 @@ fn creates_cycle(
 /// Reachability is reflexive: `reachable(tx, x, x)` returns true (the
 /// graph-theory definition — `creates_cycle` relies on this so the
 /// self-dep case is not a separate branch). Preserve this when refactoring.
+///
+/// `seen` is populated at push-time, not pop-time. Each reachable capsule is
+/// enqueued at most once, dropping the pop-time `seen.contains` check and
+/// avoiding duplicate enqueues for diamond-shaped subgraphs.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<String> = HashSet::new();
     let mut q: VecDeque<String> = VecDeque::new();
-    q.push_back(from.to_string());
+    let from_owned = from.to_string();
+    seen.insert(from_owned.clone());
+    q.push_back(from_owned);
     while let Some(node) = q.pop_front() {
-        if seen.contains(&node) {
-            continue;
-        }
         if node == target {
             return Ok(true);
         }
@@ -1853,13 +1856,13 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
                 |r| r.get(0),
             )
             .optional()?;
-        seen.insert(node);
         let Some(deps_json) = deps_json else {
             continue;
         };
         let deps: Vec<String> = json::from_str(&deps_json)?;
         for d in deps {
             if !seen.contains(&d) {
+                seen.insert(d.clone());
                 q.push_back(d);
             }
         }
@@ -3444,6 +3447,17 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::DependencyCycle(_, _)));
+    }
+
+    /// Reflexivity pin: `reachable(tx, x, x)` returns `true` even when `x`
+    /// has no row in `capsule`. The reflexive case must short-circuit before
+    /// the DB read — `creates_cycle(self, self)` relies on this so the
+    /// self-dep path doesn't need a separate branch in `add_dep`.
+    #[test]
+    fn reachable_reflexive_short_circuits_before_db_read() {
+        let mut s = tmp_store();
+        let tx = s.conn.transaction().unwrap();
+        assert!(reachable(&tx, "ghost", "ghost").unwrap());
     }
 
     #[test]
