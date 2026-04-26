@@ -1,8 +1,13 @@
 //! Git object-id (SHA) validation. Capsule currently targets SHA-1 git
-//! (DESIGN.md §3.1), so a verified_sha is exactly 40 lowercase hex chars —
-//! `git rev-parse` and `git ls-remote` both emit that form. Validating up-front
-//! at `attest` time turns "garbage in `verified_sha`" from an opaque `git push`
-//! failure at land time into an actionable error at the protocol boundary.
+//! (DESIGN.md §3.1), so any sha on the wire is exactly 40 lowercase hex
+//! chars — `git rev-parse` and `git ls-remote` both emit that form.
+//!
+//! Called at every protocol boundary that hands a sha to git: `claim`
+//! (`base_sha` → `git worktree add` + `LandPush` prior-base) and `attest`
+//! (`verified_sha` → `git push <sha>:refs/heads/...`). Validating up-front
+//! turns "garbage sha" from an opaque `git push` failure at land time into
+//! an actionable error at the boundary; the SQL CHECK constraints can't
+//! express the 40-lowercase-hex shape.
 
 use thiserror::Error;
 

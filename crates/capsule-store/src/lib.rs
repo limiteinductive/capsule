@@ -374,11 +374,6 @@ impl Store {
     pub fn claim(&mut self, req: ClaimRequest) -> Result<capsule_core::Attempt> {
         use capsule_core::{Attempt, AttemptOutcome, Lease};
 
-        // Validate base_sha format up-front. The value flows into
-        // `git worktree add -b <branch> <path> <base_sha>` (capsule-cli's
-        // worktree isolation) and into the LandPush prior-base computation,
-        // so garbage here surfaces as an opaque git failure later. Catch it
-        // at the protocol boundary alongside the verified_sha check in attest.
         capsule_core::sha::validate(&req.base_sha)?;
 
         let (now, now_str) = now_pair()?;
@@ -386,11 +381,8 @@ impl Store {
 
         let tx = self.conn.transaction()?;
 
-        // Reclaim every expired lease across the store before evaluating this
-        // claim. Skips capsules with pending_land != null (§7.2 reclaim freeze).
         reclaim_expired_in_tx(&tx, now)?;
 
-        // Re-read after reclaim.
         let (status_str, _active_attempt, pending, depends_on_json, scope_json): (
             String,
             Option<i64>,
@@ -495,10 +487,6 @@ impl Store {
     pub fn attest(&mut self, req: AttestRequest) -> Result<AttestAck> {
         use capsule_core::Verification;
 
-        // Validate verified_sha format up-front. The DB CHECK constraints
-        // can't express "40 lowercase hex" and the value flows through to
-        // `git push <sha>:refs/heads/...` at land time, where a malformed
-        // sha surfaces as an opaque push failure. Catch it here.
         capsule_core::sha::validate(&req.verified_sha)?;
 
         let (now, now_str) = now_pair()?;
@@ -522,8 +510,6 @@ impl Store {
         load_live_lease_for_session(&tx, &req.capsule_id, aid, &req.session_id, now)?;
 
         let acceptance: Acceptance = json::from_str(&acceptance_json)?;
-        // From here `verification` is the canonical attestation record: move
-        // owned request fields into it after the live-lease lookup above.
         let verification = Verification {
             at: now,
             attestor: req.session_id,
