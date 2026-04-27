@@ -3983,9 +3983,13 @@ mod tests {
         assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
+    /// Crash before push. Witness absent → clear, capsule stays accepted.
+    /// Pin the `pending_land_cleared` payload (DESIGN.md §6: `{reason, by}`)
+    /// so non-spec extras like `stderr` cannot creep back in, and pin
+    /// `payload.by == event.actor` so the `by` audit duplicate stays
+    /// consistent with its row column.
     #[test]
     fn reconcile_cleared_when_witness_absent() {
-        // Crash before push. Witness absent → clear, capsule stays accepted.
         let id = "rec2";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
@@ -4006,11 +4010,6 @@ mod tests {
         assert_eq!(c.status, Status::Accepted);
         assert!(c.pending_land.is_none());
 
-        // DESIGN.md §6 pending_land_cleared payload: {reason, by}. Pin shape
-        // so non-spec extras (like `stderr`) cannot creep back in. Also pin
-        // payload.by == event.actor so the two cannot silently drift apart —
-        // `by` is duplicate of the row column per DESIGN, but only useful if
-        // it stays consistent.
         let (payload, actor): (String, String) = s
             .conn
             .query_row(
@@ -4029,9 +4028,12 @@ mod tests {
         assert_eq!(v["by"], actor);
     }
 
+    /// Witness exists at some other sha — protection leak / corruption.
+    /// The setup writes a `noise.txt` commit and pushes its sha as the
+    /// witness ref, simulating divergence between PendingLand's
+    /// `verified_sha` and the actual witness tip.
     #[test]
     fn reconcile_abandoned_when_witness_at_different_sha() {
-        // Witness exists at some other sha — protection leak / corruption.
         let id = "rec3";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
@@ -4039,7 +4041,6 @@ mod tests {
         s.claim(claim_req(id, "sess1")).unwrap();
         attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
-        // Push a *different* commit at the witness ref.
         std::fs::write(work.join("noise.txt"), "noise\n").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "noise"]);
@@ -4081,11 +4082,13 @@ mod tests {
         assert!(v.get("found_sha").is_none());
     }
 
+    /// Operator invokes force-unfreeze on a capsule with no pending_land.
+    /// Returns `NotFrozen` but still emits `force_unfreeze_invoked` so the
+    /// audit log captures the attempt; `snapshot=null` in the payload, and
+    /// no `reconciler_ran` row is emitted because the reconciler scope is
+    /// gated on `pending_land != null` (DESIGN §7.1.2).
     #[test]
     fn force_unfreeze_on_non_frozen_capsule_audits_operator_action() {
-        // Operator invokes force-unfreeze on a capsule with no pending_land.
-        // Returns NotFrozen but still emits force_unfreeze_invoked so the
-        // audit log captures the attempt. snapshot=null in the payload.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let outcome = s
@@ -4105,8 +4108,6 @@ mod tests {
         assert_eq!(v["post_action_outcome"], "not_frozen");
         assert!(v["snapshot"].is_null(), "snapshot must be null when nothing was frozen");
 
-        // No reconciler_ran for the no-op reconcile path (reconciler scope is
-        // gated on pending_land != null per DESIGN §7.1.2).
         let count: i64 = s
             .conn
             .query_row(
