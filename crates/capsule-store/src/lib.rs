@@ -80,6 +80,12 @@ pub enum StoreError {
          (DESIGN.md §7.1.2 — operator escape hatch demands explicit confirmation)"
     )]
     ForceUnfreezeNotConfirmed,
+    #[error(
+        "deploy verify gate: no recorded pass — run `capsule deploy verify --hermetic` \
+         (or `--remote <url>`) before landing, or pass --skip-deploy-verify-gate \
+         (DESIGN.md §8.2)"
+    )]
+    DeployVerifyMissing,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -620,6 +626,14 @@ impl Store {
     pub fn land(&mut self, req: LandRequest) -> Result<LandAck> {
         use capsule_git::{land_push, ls_remote_branch, LandOutcome as GitOutcome};
 
+        // ---- Step 0: deploy-verify gate (DESIGN.md §8.2). ----
+        // Refuse to land in production until the ACL suite is recorded as
+        // passing for this deployment. Bypass requires explicit caller
+        // assertion (CLI's --skip-deploy-verify-gate is audit-logged).
+        if !req.skip_deploy_verify_gate && !self.check_deploy_verify_pass()? {
+            return Err(StoreError::DeployVerifyMissing);
+        }
+
         // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
         let cap = self.get_capsule(&req.capsule_id)?;
         let Some(LandableSnapshot {
@@ -920,6 +934,29 @@ impl Store {
         self.reconcile_inner(req, /* operator: */ None)
     }
 
+    /// Record that the deploy-verify ACL suite (DESIGN §8.2) passed for
+    /// this store. Single-row table — overwrites any prior pass. The
+    /// presence of a row is the gate `Store::land` checks.
+    pub fn record_deploy_verify_pass(&mut self, mode: &str, base_ref: &str) -> Result<()> {
+        let (_, now_str) = now_pair()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO deploy_verify_pass(id, at, mode, base_ref) \
+             VALUES (1, ?1, ?2, ?3)",
+            params![now_str, mode, base_ref],
+        )?;
+        Ok(())
+    }
+
+    /// True iff `record_deploy_verify_pass` has been called on this store.
+    pub fn check_deploy_verify_pass(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM deploy_verify_pass WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Operator escape hatch (DESIGN.md §7.1.2). Same decision tree as
     /// `reconcile`, but emits a mandatory `force_unfreeze_invoked` event
     /// (DESIGN §6) and requires the operator to assert `lander_confirmed_dead`.
@@ -1184,6 +1221,10 @@ pub struct LandRequest {
     /// Working directory the `git push` is invoked from — must have
     /// `verified_sha` in its object database (typically the lander's clone).
     pub repo_dir: PathBuf,
+    /// Bypass the DESIGN §8.2 deploy-verify gate. Tests and development
+    /// flows pass `true`; production landers must pre-record a deploy-verify
+    /// pass via `capsule deploy verify`.
+    pub skip_deploy_verify_gate: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3852,6 +3893,7 @@ mod tests {
                 lander: "test-lander".into(),
                 remote: bare.to_str().unwrap().into(),
                 repo_dir: work,
+                skip_deploy_verify_gate: true,
             })
             .unwrap();
 
@@ -3901,6 +3943,7 @@ mod tests {
             lander: "test-lander".into(),
             remote: bare.to_str().unwrap().into(),
             repo_dir,
+            skip_deploy_verify_gate: true,
         };
         s.land(land_req(work.clone())).unwrap();
         let err = s.land(land_req(work)).unwrap_err();
@@ -4278,6 +4321,21 @@ mod tests {
             format_iso8601(trailing_zero).unwrap(),
             "2024-06-15T12:00:00.120000000Z",
         );
+    }
+
+    /// `parse_iso8601` accepts two repo-local forms: 4-digit year from
+    /// `format_iso8601` (DB column writes — created_at, last_heartbeat, etc.)
+    /// and 6-digit padded year from `time::serde::iso8601` (timestamps inside
+    /// JSON columns). The 6-digit form is load-bearing: `reclaim_expired_in_tx`
+    /// and the live-lease checks read `json_extract(lease_json, '$.expires_at')`
+    /// and feed the result here, so swapping to `Rfc3339` (which rejects
+    /// `+0YYYYY` years) would silently break lease expiry sweeps.
+    #[test]
+    fn parse_iso8601_accepts_both_4digit_and_6digit_year_forms() {
+        let four_digit = "1970-01-01T00:00:00.000000000Z";
+        let six_digit = "+001970-01-01T00:00:00.000000000Z";
+        assert_eq!(parse_iso8601(four_digit), OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(parse_iso8601(six_digit), OffsetDateTime::UNIX_EPOCH);
     }
 
     /// Pin the `parse_wire` panic message: kind label is per-call-site
