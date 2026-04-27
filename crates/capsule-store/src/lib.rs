@@ -4155,6 +4155,13 @@ mod tests {
         .unwrap()
     }
 
+    /// Happy-path land: §7.1.2 step 3's atomic push lands `main` at
+    /// `verified_sha` and writes the witness ref at the same sha; step
+    /// 4's reconcile flips status → `landed`, populates `landing`,
+    /// clears `pending_land`, and closes the attempt with
+    /// `AttemptOutcome::Landed`. Asserts span both sides of the
+    /// boundary — git rev-parse on the bare repo proves the push, then
+    /// `get_capsule` proves the DB committed.
     #[test]
     fn land_happy_path_advances_base_ref_and_writes_landing() {
         let id = "land1";
@@ -4186,13 +4193,11 @@ mod tests {
             }
         }
 
-        // Bare repo should now have main at verified_sha + the witness branch.
         let bare_main = git(&bare, &["rev-parse", "main"]);
         assert_eq!(bare_main, verified_sha);
         let witness = git(&bare, &["rev-parse", &format!("capsule-witness/{id}/a1")]);
         assert_eq!(witness, verified_sha);
 
-        // DB: status=landed, landing populated, pending_land cleared, attempt closed.
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Landed);
         assert!(c.landing.is_some());
