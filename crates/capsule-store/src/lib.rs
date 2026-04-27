@@ -3666,6 +3666,12 @@ mod tests {
         );
     }
 
+    /// Empty amend (all fields `None`) is a full no-op: scalar fields and
+    /// `updated_at` are unchanged, AND no `capsule_amended` event is emitted.
+    /// The audit-trail invariant matters for downstream consumers (event
+    /// streams, reviewer dashboards) that count amend events; a refactor
+    /// hoisting `insert_event` above the `update.is_empty()` short-circuit
+    /// would silently emit zero-diff audit rows.
     #[test]
     fn amend_noop_when_all_none() {
         let mut s = tmp_store();
@@ -3679,6 +3685,15 @@ mod tests {
             .unwrap();
         assert_eq!(before.title, after.title);
         assert_eq!(before.updated_at, after.updated_at);
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE capsule_id = ?1 AND kind = 'capsule_amended'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "empty amend must not emit a zero-diff event");
     }
 
     #[test]
