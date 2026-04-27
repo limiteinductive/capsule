@@ -3975,13 +3975,11 @@ mod tests {
         git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
         git(&work, &["push", "origin", "main"]);
 
-        // Worker creates a new commit; this is the verified_sha.
         std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "feature"]);
         let verified_sha = git(&work, &["rev-parse", "HEAD"]);
         let attempt_branch = format!("capsules/{capsule_id}/a1");
-        // Push to the per-attempt branch so the bare repo has the object.
         git(
             &work,
             &[
