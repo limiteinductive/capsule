@@ -3732,6 +3732,17 @@ mod tests {
         assert!(reachable(&tx, "ghost", "ghost").unwrap());
     }
 
+    /// Missing capsule rows are leaves, not errors. Pins the
+    /// `json_each` join behavior that makes stale ids return clean
+    /// `false` instead of panic/Err — a plausible "fail-fast on stale
+    /// id" refactor would silently break this contract.
+    #[test]
+    fn reachable_missing_row_yields_no_neighbors() {
+        let mut s = tmp_store();
+        let tx = s.conn.transaction().unwrap();
+        assert!(!reachable(&tx, "ghost", "target").unwrap());
+    }
+
     #[test]
     fn add_dep_cycle_rejected() {
         let mut s = tmp_store();
