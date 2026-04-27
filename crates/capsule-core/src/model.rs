@@ -373,6 +373,34 @@ mod tests {
         }
     }
 
+    /// `ExitCode` is `#[serde(untagged)]` and rides through SQLite inside
+    /// `verification_json` — the on-disk audit record (DESIGN §6). The
+    /// `ExpectExit` test above pins the same contract for the spec side;
+    /// this one pins it for the persisted side, where dropping `untagged`
+    /// would make existing bare-scalar audit rows unreadable and change
+    /// future row shape. Numbers → `Code`, strings → `Sentinel` (including
+    /// the numeric-string `"0"`).
+    #[test]
+    fn exit_code_untagged_serde_round_trip() {
+        let code: ExitCode = serde_json::from_str("0").unwrap();
+        assert!(matches!(code, ExitCode::Code(0)));
+        assert_eq!(serde_json::to_string(&code).unwrap(), "0");
+
+        let sentinel: ExitCode = serde_json::from_str("\"timeout\"").unwrap();
+        match sentinel {
+            ExitCode::Sentinel(ref s) => assert_eq!(s, "timeout"),
+            ExitCode::Code(_) => panic!("expected Sentinel"),
+        }
+        assert_eq!(serde_json::to_string(&sentinel).unwrap(), "\"timeout\"");
+
+        let numeric_string: ExitCode = serde_json::from_str("\"0\"").unwrap();
+        match numeric_string {
+            ExitCode::Sentinel(ref s) => assert_eq!(s, "0"),
+            ExitCode::Code(_) => panic!("expected Sentinel for \"0\""),
+        }
+        assert_eq!(serde_json::to_string(&numeric_string).unwrap(), "\"0\"");
+    }
+
     #[test]
     fn exit_code_display() {
         assert_eq!(ExitCode::Code(0).to_string(), "0");
