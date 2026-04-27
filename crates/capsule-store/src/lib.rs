@@ -3234,6 +3234,8 @@ mod tests {
         assert_eq!(y.active_attempt, Some(1));
     }
 
+    /// `claimed` is active → excluded; `conflict` overlaps `claimed` →
+    /// excluded; only `free` survives.
     #[test]
     fn list_filter_available() {
         let mut s = tmp_store();
@@ -3249,22 +3251,21 @@ mod tests {
             })
             .unwrap();
         let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
-        // `claimed` is active → excluded; `conflict` overlaps `claimed` → excluded.
         assert_eq!(ids, vec!["free"]);
     }
 
+    /// Pin the contract: `UnmetDeps`'s Vec follows the capsule's
+    /// `depends_on` order, even when SQLite is free to return rows in
+    /// any order. Regression-guards the `json_each + ORDER BY j.key`
+    /// refactor. Input order is deliberately non-alphabetical to
+    /// detect any sorting drift.
     #[test]
     fn claim_unmet_deps_preserve_input_order() {
-        // Pin the contract: `UnmetDeps`'s Vec follows the capsule's
-        // depends_on order, even when SQLite is free to return rows in
-        // any order. Regression-guards the json_each + ORDER BY j.key
-        // refactor.
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
         make_capsule(&mut s, "c", "src/c");
         let mut child = new_capsule_args("child", "src/child");
-        // Deliberate non-alphabetical input order to detect any sorting drift.
         child.depends_on = vec!["c".into(), "a".into(), "b".into()];
         s.create_capsule(child).unwrap();
 
@@ -3275,10 +3276,10 @@ mod tests {
         }
     }
 
+    /// A dep id that does not resolve to any capsule must be reported as
+    /// unmet (matches the prior `Option<String> ⇒ None` branch).
     #[test]
     fn claim_unmet_deps_includes_missing_ids() {
-        // A dep id that does not resolve to any capsule must be reported as
-        // unmet (matches the prior `Option<String> ⇒ None` branch).
         let mut s = tmp_store();
         let mut child = new_capsule_args("child", "src/child");
         child.depends_on = vec!["ghost".into()];
@@ -3290,6 +3291,8 @@ mod tests {
         }
     }
 
+    /// `dep` is planned with no deps → eligible. `child`'s deps are unmet
+    /// (its dep `dep` is planned, not landed) → excluded.
     #[test]
     fn list_filter_available_excludes_unmet_deps() {
         let mut s = tmp_store();
@@ -3305,19 +3308,19 @@ mod tests {
             })
             .unwrap();
         let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
-        // `dep` is planned with no deps → eligible. `child` deps unmet → excluded.
         assert_eq!(ids, vec!["dep"]);
     }
 
+    /// Pin the `WHERE status = ?1` SQL arm of `list_capsules`. The other
+    /// `list_filter_*` tests use `..Default::default()` which leaves
+    /// `status` as `None` and exercises only the unbound arm. This test
+    /// moves p1 to abandoned via claim+abandon while p2 stays planned,
+    /// then asserts each status filter returns only its bucket.
     #[test]
     fn list_filter_status_pins_bound_arm() {
-        // Pin the `WHERE status = ?1` SQL arm of list_capsules. The other
-        // list_filter_* tests use `..Default::default()` which leaves
-        // `status` as `None` and exercises only the unbound arm.
         let mut s = tmp_store();
         make_capsule(&mut s, "p1", "src/p1");
         make_capsule(&mut s, "p2", "src/p2");
-        // Move p1 to abandoned via a claim+abandon round-trip; p2 stays planned.
         s.claim(claim_req("p1", "sess1")).unwrap();
         s.abandon(AbandonRequest {
             capsule_id: "p1".into(),
