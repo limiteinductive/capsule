@@ -135,9 +135,9 @@ mod tests {
         assert!(!cp("src/Foo").overlaps(&cp("src/foo")));
     }
 
+    /// Identity: a path always overlaps itself, regardless of depth.
     #[test]
     fn overlap_self_with_self() {
-        // Identity: a path always overlaps itself, regardless of depth.
         assert!(cp("a").overlaps(&cp("a")));
         assert!(cp("a/b/c").overlaps(&cp("a/b/c")));
     }
@@ -147,9 +147,9 @@ mod tests {
         assert!(!cp("a/b").overlaps(&cp("c/d")));
     }
 
+    /// Match exists across the lists at non-aligned indices: a[0] overlaps b[1].
     #[test]
     fn any_overlap_detects_cross_list_match() {
-        // Match exists across the lists at non-aligned indices: a[0] overlaps b[1].
         let a = vec![cp("src/foo"), cp("docs")];
         let b = vec![cp("tests"), cp("src/foo/bar.rs")];
         assert!(CanonicalPath::any_overlap(&a, &b));
@@ -170,9 +170,9 @@ mod tests {
         assert!(!CanonicalPath::any_overlap(&a, &b));
     }
 
+    /// 'é' as decomposed (e + combining acute) vs precomposed.
     #[test]
     fn nfc_normalizes_decomposed_to_composed() {
-        // 'é' as decomposed (e + combining acute) vs precomposed.
         let decomposed = "src/cafe\u{0301}";
         let composed = "src/caf\u{00e9}";
         let a = CanonicalPath::new(decomposed).unwrap();
