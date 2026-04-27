@@ -4641,6 +4641,14 @@ mod tests {
         );
     }
 
+    /// Operator force-unfreezes a frozen capsule whose witness already
+    /// landed (push succeeded, DB commit didn't): outcome is `Landed`,
+    /// `landed_by` carries the operator id. Pins the §6
+    /// `force_unfreeze_invoked` payload as
+    /// `{operator, post_action_outcome, reason, snapshot}` with snapshot
+    /// being the parsed `PendingLand` JSON — `witness_branch` is the
+    /// key an operator actually references when investigating, so the
+    /// assert hits that field rather than just `is_object()`.
     #[test]
     fn force_unfreeze_lands_when_witness_at_verified_sha() {
         let id = "force1";
@@ -4666,8 +4674,6 @@ mod tests {
         assert_eq!(c.status, Status::Landed);
         assert_eq!(c.landing.as_ref().unwrap().landed_by, "operator-jane");
 
-        // DESIGN.md §6 force_unfreeze_invoked payload:
-        // {operator, reason, snapshot, post_action_outcome}.
         let (payload, actor): (String, String) = s
             .conn
             .query_row(
@@ -4686,11 +4692,12 @@ mod tests {
             vec!["operator", "post_action_outcome", "reason", "snapshot"]
         );
         assert_eq!(v["operator"], "operator-jane");
-        assert_eq!(v["operator"], actor); // actor row column carries the same id
+        assert_eq!(
+            v["operator"], actor,
+            "actor row column must duplicate payload.operator"
+        );
         assert_eq!(v["reason"], "lander pid 12345 unresponsive >30m");
         assert_eq!(v["post_action_outcome"], "landed");
-        // snapshot is the parsed PendingLand JSON — pin a key the operator
-        // would actually reference when investigating.
         assert!(v["snapshot"]["witness_branch"].is_string());
     }
 
