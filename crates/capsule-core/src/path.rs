@@ -182,6 +182,25 @@ mod tests {
         assert_eq!(cp(r"a/b\c").as_str(), "a/b/c");
     }
 
+    /// Inputs made only of `.` and separators canonicalize to no components
+    /// and must surface as `Empty` rather than a stored `""`. The
+    /// `"//"` precedence assertion pins that `Absolute` (early guard)
+    /// wins over `Empty` (late guard) when both would otherwise fire.
+    #[test]
+    fn rejects_inputs_that_strip_to_zero_components() {
+        for input in [".", "./", "././", "./././", r"\", r".\."] {
+            let got = CanonicalPath::new(input);
+            assert!(
+                matches!(got, Err(CanonicalizeError::Empty)),
+                "expected Empty for {input:?}, got {got:?}"
+            );
+        }
+        assert!(matches!(
+            CanonicalPath::new("//"),
+            Err(CanonicalizeError::Absolute)
+        ));
+    }
+
     /// 'é' as decomposed (e + combining acute) vs precomposed.
     #[test]
     fn nfc_normalizes_decomposed_to_composed() {
