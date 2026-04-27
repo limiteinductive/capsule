@@ -479,6 +479,26 @@ mod tests {
         );
     }
 
+    /// Outside-the-store paths are accepted (with a stderr warning, not
+    /// bail) — the policy is advisory once the override lands fully
+    /// outside the `.capsule` subtree. Pin the acceptance so a future
+    /// tightening to "must live under <cap>/worktrees" is a deliberate
+    /// change rather than a silent rejection of valid out-of-tree
+    /// overrides (e.g. `--worktree-dir=/tmp/scratch`).
+    #[test]
+    fn override_outside_store_accepted_with_warning() {
+        let td = tempdir().unwrap();
+        let main = make_main_root(&td);
+        let cap = main.join(".capsule");
+        fs::create_dir_all(&cap).unwrap();
+        let cap = fs::canonicalize(&cap).unwrap();
+        let outside = td.path().join("scratch/wt");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        let got = validate_worktree_dir_override(&outside, &main, &cap).unwrap();
+        let expected_parent = fs::canonicalize(outside.parent().unwrap()).unwrap();
+        assert_eq!(got, expected_parent.join("wt"));
+    }
+
     /// `cap/worktrees/../foreign/x` with `foreign` existing — verifies that
     /// `fs::canonicalize` collapses `..` so the validation sees the real
     /// target (inside the store, outside worktrees) and rejects it.
