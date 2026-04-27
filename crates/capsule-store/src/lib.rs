@@ -1686,12 +1686,12 @@ fn assert_session_owns_attempt(
     attempt_id: i64,
     session_id: &str,
 ) -> Result<()> {
-    let owner: String = tx.query_row(
-        "SELECT json_extract(lease_json, '$.session_id')
-         FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-        params![capsule_id, attempt_id],
-        |r| r.get(0),
-    )?;
+    let owner: String = tx
+        .prepare_cached(
+            "SELECT json_extract(lease_json, '$.session_id')
+             FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        )?
+        .query_row(params![capsule_id, attempt_id], |r| r.get(0))?;
     if owner != session_id {
         return Err(StoreError::CrossSession);
     }
@@ -1732,13 +1732,15 @@ fn assert_live_lease_for_session(
     session_id: &str,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let (owner, expires_at_str): (String, String) = tx.query_row(
-        "SELECT json_extract(lease_json, '$.session_id'),
-                json_extract(lease_json, '$.expires_at')
-         FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-        params![capsule_id, attempt_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (owner, expires_at_str): (String, String) = tx
+        .prepare_cached(
+            "SELECT json_extract(lease_json, '$.session_id'),
+                    json_extract(lease_json, '$.expires_at')
+             FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        )?
+        .query_row(params![capsule_id, attempt_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
     if owner != session_id {
         return Err(StoreError::CrossSession);
     }
