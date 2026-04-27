@@ -425,11 +425,12 @@ mod tests {
     /// flag `*` on both lines). Pinned to fill the (true, true) corner of
     /// `Advanced { base_ref_created, witness_created }` — the existing
     /// `classifies_advanced` only covers (false, true).
+    ///
+    /// The `<sha>:refs/heads/...` source side mirrors `land_push`'s actual
+    /// refspec; `parse_ref_line` ignores it, but pinning the production
+    /// shape keeps the fixture honest.
     #[test]
     fn classifies_advanced_both_refs_created() {
-        // Source side is the verified_sha (matches `land_push`'s actual
-        // `<sha>:refs/heads/...` refspec); `parse_ref_line` ignores it but
-        // pinning the production shape keeps the fixture honest.
         let stdout = "To /tmp/remote.git\n\
             *\t0123456789abcdef0123456789abcdef01234567:refs/heads/main\t[new branch]\n\
             *\t0123456789abcdef0123456789abcdef01234567:refs/heads/capsule-witness/foo/a1\t[new branch]\n\
