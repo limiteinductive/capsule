@@ -414,14 +414,15 @@ mod tests {
         assert_eq!(fs::read_to_string(&gi).unwrap(), "node_modules\n");
     }
 
+    /// Store dir == worktree root: stripping the worktree prefix would yield
+    /// an empty pattern, which `format_gitignore_dir_pattern` rejects rather
+    /// than emit a `/` rule that would ignore the entire repo.
     #[test]
     fn init_gitignore_refuses_store_dir_equals_worktree_root() {
         let tmp = TempDir::new().unwrap();
         git_init(tmp.path());
         let gi = tmp.path().join(".gitignore");
         fs::write(&gi, "node_modules\n").unwrap();
-        // Store dir == worktree root: stripping the worktree prefix gives
-        // an empty path, which `format_gitignore_dir_pattern` rejects.
         let store = tmp.path().to_path_buf();
 
         let r = run_at(tmp.path(), store, false).unwrap();
