@@ -3122,6 +3122,25 @@ mod tests {
         );
     }
 
+    /// `attest` validates `verified_sha` before capsule lookup, so malformed
+    /// input returns `InvalidSha` even when the capsule does not exist.
+    #[test]
+    fn attest_invalid_sha_outranks_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .attest(AttestRequest {
+                capsule_id: "ghost".into(),
+                session_id: "sess1".into(),
+                verified_sha: "abc".into(),
+                command: "true".into(),
+                exit_code: capsule_core::ExitCode::Code(0),
+                duration_ms: 1,
+                log_ref: "file:///dev/null".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
+    }
+
     /// Symmetric with attest: base_sha flows into `git worktree add ... <sha>`
     /// (capsule-cli isolation) and into LandPush prior-base computation.
     /// Reject at the protocol boundary.
@@ -3142,6 +3161,24 @@ mod tests {
             matches!(err, StoreError::InvalidSha(_)),
             "expected InvalidSha, got: {err:?}"
         );
+    }
+
+    /// Symmetric with `attest_invalid_sha_outranks_not_found`: `claim`
+    /// validates `base_sha` before capsule lookup, so malformed input
+    /// returns `InvalidSha` even when the capsule does not exist.
+    #[test]
+    fn claim_invalid_sha_outranks_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .claim(ClaimRequest {
+                capsule_id: "ghost".into(),
+                owner: "o".into(),
+                session_id: "sess1".into(),
+                lease_ttl_sec: 300,
+                base_sha: "deadbeef".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
     }
 
     #[test]
