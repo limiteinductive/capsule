@@ -219,23 +219,23 @@ impl Store {
             return Err(StoreError::DuplicateId(capsule.id));
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO capsule (
                 id, title, description, acceptance_json, scope_json, base_ref,
                 depends_on_json, status, active_attempt, verification_json,
                 pending_land_json, landing_json, created_at, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planned', NULL, NULL, NULL, NULL, ?8, ?8)",
-            params![
-                capsule.id,
-                capsule.title,
-                capsule.description,
-                json::to_string(&capsule.acceptance)?,
-                json::to_string(&capsule.scope_prefixes)?,
-                capsule.base_ref,
-                json::to_string(&capsule.depends_on)?,
-                now_str,
-            ],
-        )?;
+        )?
+        .execute(params![
+            capsule.id,
+            capsule.title,
+            capsule.description,
+            json::to_string(&capsule.acceptance)?,
+            json::to_string(&capsule.scope_prefixes)?,
+            capsule.base_ref,
+            json::to_string(&capsule.depends_on)?,
+            now_str,
+        ])?;
 
         insert_event(
             &tx,
@@ -422,26 +422,26 @@ impl Store {
         };
         let lease_json = json::to_string(&lease)?;
 
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO attempt (
                 capsule_id, attempt_id, lease_json, branch, witness_branch,
                 base_sha, tip_sha, last_heartbeat, outcome, opened_at, closed_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'in_flight', ?7, NULL)",
-            params![
-                req.capsule_id,
-                next_id,
-                lease_json,
-                branch,
-                witness_branch,
-                req.base_sha,
-                now_str,
-            ],
-        )?;
+        )?
+        .execute(params![
+            req.capsule_id,
+            next_id,
+            lease_json,
+            branch,
+            witness_branch,
+            req.base_sha,
+            now_str,
+        ])?;
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE capsule SET status='active', active_attempt=?1, updated_at=?2 WHERE id=?3",
-            params![next_id, now_str, req.capsule_id],
-        )?;
+        )?
+        .execute(params![next_id, now_str, req.capsule_id])?;
 
         let claimed_payload = json::to_value(ClaimedPayload {
             attempt_id: next_id,
@@ -523,19 +523,17 @@ impl Store {
             Status::Active
         };
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE capsule SET verification_json=?1, status=?2, updated_at=?3 WHERE id=?4",
-            params![
-                verification_json,
-                new_status.as_wire_str(),
-                now_str,
-                req.capsule_id,
-            ],
-        )?;
-        tx.execute(
-            "UPDATE attempt SET tip_sha=?1 WHERE capsule_id=?2 AND attempt_id=?3",
-            params![verification.verified_sha, req.capsule_id, aid],
-        )?;
+        )?
+        .execute(params![
+            verification_json,
+            new_status.as_wire_str(),
+            now_str,
+            req.capsule_id,
+        ])?;
+        tx.prepare_cached("UPDATE attempt SET tip_sha=?1 WHERE capsule_id=?2 AND attempt_id=?3")?
+            .execute(params![verification.verified_sha, req.capsule_id, aid])?;
         let event_payload = json::to_value(AttestedPayload {
             verified_sha: &verification.verified_sha,
             exit_code: &verification.exit_code,
@@ -674,10 +672,10 @@ impl Store {
             let pending_value = json::to_value(&pending)?;
             pending_json = pending_value.to_string();
 
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
-                params![pending_json, now_str, req.capsule_id],
-            )?;
+            )?
+            .execute(params![pending_json, now_str, req.capsule_id])?;
             insert_event(
                 &tx,
                 &now_str,
@@ -797,14 +795,14 @@ impl Store {
             )?;
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE capsule
                 SET status='abandoned',
                     active_attempt=NULL,
                     updated_at=?1
               WHERE id=?2",
-            params![now_str, req.capsule_id],
-        )?;
+        )?
+        .execute(params![now_str, req.capsule_id])?;
         let payload = json::json!({ "reason": req.reason });
         insert_event(
             &tx,
@@ -2301,10 +2299,8 @@ fn persist_dep_change(
     event_kind: EventKind,
     dep_id: &str,
 ) -> Result<()> {
-    tx.execute(
-        "UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3",
-        params![deps_json, now_str, capsule_id],
-    )?;
+    tx.prepare_cached("UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3")?
+        .execute(params![deps_json, now_str, capsule_id])?;
     let payload = json::json!({ "dep_id": dep_id });
     insert_event(tx, now_str, capsule_id, None, actor::SYSTEM, event_kind, &payload)?;
     Ok(())
@@ -2327,15 +2323,15 @@ fn finalize_landed(
     let landing_value = json::to_value(landing)?;
     let landing_json = landing_value.to_string();
     let attempt_id = landing.attempt_id as i64;
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE capsule
             SET status='landed',
                 landing_json=?1,
                 pending_land_json=NULL,
                 updated_at=?2
           WHERE id=?3",
-        params![landing_json, now_str, capsule_id],
-    )?;
+    )?
+    .execute(params![landing_json, now_str, capsule_id])?;
     close_attempt(
         tx,
         capsule_id,
@@ -2366,14 +2362,14 @@ fn abandon_on_witness_mismatch(
     attempt_id: i64,
     now_str: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE capsule
             SET status='abandoned',
                 pending_land_json=NULL,
                 updated_at=?1
           WHERE id=?2",
-        params![now_str, capsule_id],
-    )?;
+    )?
+    .execute(params![now_str, capsule_id])?;
     close_attempt(
         tx,
         capsule_id,
@@ -2445,10 +2441,8 @@ fn clear_pending_land(
     by: &str,
     reason: PendingLandClearedReason,
 ) -> Result<()> {
-    tx.execute(
-        "UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2",
-        params![now_str, capsule_id],
-    )?;
+    tx.prepare_cached("UPDATE capsule SET pending_land_json=NULL, updated_at=?1 WHERE id=?2")?
+        .execute(params![now_str, capsule_id])?;
     let payload = json::json!({
         "reason": reason.as_wire_str(),
         "by": by,
