@@ -4108,9 +4108,14 @@ mod tests {
 
     // ---- reconciler / force-unfreeze tests ----
 
-    /// Simulate a crash between `land`'s git push (step 3) and DB commit
-    /// (step 4) by writing PendingLand directly + executing the push out
-    /// of band, leaving status=accepted with pending_land set.
+    /// Drive the §7.1.2 land-crash decision tree from a test by writing
+    /// `PendingLand` straight into `capsule.pending_land_json` (skipping
+    /// `Store::land`, which would also commit `Landing` on success), then
+    /// either running the real atomic land push (`do_push = true`, what
+    /// `Store::land`'s step 3 does) or fabricating a divergent witness ref
+    /// at `push_witness_at` to simulate protection leak / corruption
+    /// (decision-tree branch 3). Leaves `status=accepted` with
+    /// `pending_land` set so reconcile sees the crash window.
     #[allow(clippy::too_many_arguments)]
     fn simulate_land_crash(
         s: &Store,
@@ -4122,8 +4127,6 @@ mod tests {
         do_push: bool,
         push_witness_at: Option<&str>,
     ) {
-        // Force PendingLand into the DB without going through Store::land()
-        // (which would also commit Landing on success).
         let pending = PendingLand {
             at: OffsetDateTime::now_utc(),
             attempt_id: 1,
@@ -4142,7 +4145,6 @@ mod tests {
             .unwrap();
 
         if do_push {
-            // Real atomic land push (this is what Store::land's step 3 does).
             let outcome = capsule_git::land_push(
                 work,
                 bare.to_str().unwrap(),
@@ -4156,8 +4158,6 @@ mod tests {
                 capsule_git::LandOutcome::Advanced { .. } | capsule_git::LandOutcome::NoOp
             ));
         } else if let Some(other_sha) = push_witness_at {
-            // Manually create the witness ref at a *different* sha to simulate
-            // protection leak / corruption (decision-tree branch 3).
             git(
                 work,
                 &[
