@@ -2255,12 +2255,13 @@ impl RowAttempt {
     }
 }
 
-// Wire string round-trips live on the enum (capsule_core::model). The SQL CHECK
-// constraints on `capsule.status` and `attempt.outcome` enforce membership, so
-// a parse failure here ⇒ DB corruption (or migration mismatch) — panic with
-// the offending value to surface it loudly. These helpers exist so callers
-// don't have to write `.unwrap_or_else(...)` at every read site.
-
+/// Read-side wire-string parser shared by `parse_status` and `parse_outcome`.
+///
+/// Wire round-trips live on the enums in `capsule_core::model`; the SQL CHECK
+/// constraints on `capsule.status` and `attempt.outcome` enforce membership, so
+/// a `None` here ⇒ DB corruption (or migration mismatch). Panics loudly with
+/// the offending value rather than letting callers paper over it with their
+/// own `.unwrap_or_else(...)` at every read site.
 fn parse_wire<T>(kind: &str, value: &str, parse: impl FnOnce(&str) -> Option<T>) -> T {
     parse(value).unwrap_or_else(|| panic!("unknown {kind} in DB: {value}"))
 }
