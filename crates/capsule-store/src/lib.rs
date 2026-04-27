@@ -4235,4 +4235,48 @@ mod tests {
         // would actually reference when investigating.
         assert!(v["snapshot"]["witness_branch"].is_string());
     }
+
+    /// `format_iso8601` and `parse_iso8601` are a tied pair: every timestamp
+    /// column written via `format_iso8601` is read back via `parse_iso8601`,
+    /// so they jointly own the DB-row timestamp serialization boundary.
+    /// The semantic round-trip alone is too weak — a unilateral switch of
+    /// either end to `Rfc3339` would still round-trip while silently
+    /// changing the canonical string shape (RFC3339 trims trailing
+    /// fractional zeros, while `Iso8601::DEFAULT` keeps fixed 9-digit
+    /// fractional seconds). Pin both: parse compatibility on diverse
+    /// timestamps AND the canonical emitted form on a couple of fixed
+    /// inputs, so a future change to either side trips a test before it
+    /// produces rows the other side parses as a different
+    /// `OffsetDateTime`, or breaks an external consumer that expects the
+    /// canonical shape (audit log readers, `attempt_expired` event payload
+    /// passthrough).
+    #[test]
+    fn iso8601_format_parse_round_trip() {
+        // Trailing-zero fractional: under `Rfc3339` this would emit `.12`;
+        // under `Iso8601::DEFAULT` the trailing zeros are preserved.
+        let trailing_zero = time::macros::datetime!(2024-06-15 12:00:00.120000000 UTC);
+        let cases = [
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::now_utc(),
+            time::macros::datetime!(2099-12-31 23:59:59.123456789 UTC),
+            time::macros::datetime!(0001-01-01 00:00:00 UTC),
+            trailing_zero,
+        ];
+        for t in cases {
+            let s = format_iso8601(t).expect("format_iso8601");
+            let parsed = parse_iso8601(&s);
+            assert_eq!(parsed, t, "round-trip drift via {s}");
+        }
+
+        // Canonical shape pins: a unilateral RFC3339 switch passes the
+        // semantic round-trip above but trips here.
+        assert_eq!(
+            format_iso8601(OffsetDateTime::UNIX_EPOCH).unwrap(),
+            "1970-01-01T00:00:00.000000000Z",
+        );
+        assert_eq!(
+            format_iso8601(trailing_zero).unwrap(),
+            "2024-06-15T12:00:00.120000000Z",
+        );
+    }
 }
