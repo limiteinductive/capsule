@@ -170,6 +170,18 @@ mod tests {
         assert!(!CanonicalPath::any_overlap(&a, &b));
     }
 
+    /// The doc-comment on `new` says "normalize separators to `/`" — the
+    /// implementation splits on both `/` and `\` so a Windows-style path
+    /// pasted into a scope arg canonicalizes losslessly. Pin both pure and
+    /// mixed-separator inputs so a future tightening to `/`-only is a
+    /// deliberate change (it would silently regress canonicalization for
+    /// any caller relying on the wider split set).
+    #[test]
+    fn backslash_separator_normalized_to_slash() {
+        assert_eq!(cp(r"a\b\c").as_str(), "a/b/c");
+        assert_eq!(cp(r"a/b\c").as_str(), "a/b/c");
+    }
+
     /// 'é' as decomposed (e + combining acute) vs precomposed.
     #[test]
     fn nfc_normalizes_decomposed_to_composed() {
