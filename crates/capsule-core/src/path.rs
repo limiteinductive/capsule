@@ -37,7 +37,7 @@ impl CanonicalPath {
         if input.starts_with('/') {
             return Err(CanonicalizeError::Absolute);
         }
-        let mut out = String::with_capacity(input.len()); // hint only; NFC may grow
+        let mut out = String::with_capacity(input.len());
         let mut had_any = false;
         for p in input
             .split(['/', '\\'])
