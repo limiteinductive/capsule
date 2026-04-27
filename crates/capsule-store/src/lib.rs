@@ -3046,6 +3046,39 @@ mod tests {
         assert_eq!(ack.new_status, Status::Active);
     }
 
+    /// Failed attestations are retryable while the attempt remains Active.
+    /// A later attest in the same live lease overwrites `capsule.verification`;
+    /// per-attempt history lives in events, not the capsule row.
+    #[test]
+    fn attest_retryable_after_fail_overwrites_verification() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let req = |sha: &str, code: i32| AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: sha.into(),
+            command: "cmd".into(),
+            exit_code: capsule_core::ExitCode::Code(code),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        };
+        let other_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let ack1 = s.attest(req(FAKE_SHA, 1)).unwrap();
+        assert!(!ack1.accepted);
+        assert_eq!(ack1.new_status, Status::Active);
+
+        let ack2 = s.attest(req(other_sha, 0)).unwrap();
+        assert!(ack2.accepted);
+        assert_eq!(ack2.new_status, Status::Accepted);
+
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Accepted);
+        let v = c.verification.expect("verification must persist after pass");
+        assert_eq!(v.verified_sha, other_sha);
+        assert!(matches!(v.exit_code, capsule_core::ExitCode::Code(0)));
+    }
+
     #[test]
     fn attest_after_accepted_rejected() {
         let mut s = tmp_store();
