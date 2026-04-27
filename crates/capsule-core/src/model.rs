@@ -781,5 +781,78 @@ mod tests {
         assert_eq!(parsed.expires_at, lease.expires_at);
         assert_eq!(parsed.ttl_sec, lease.ttl_sec);
     }
+
+    /// `Capsule` carries seven optional fields tagged
+    /// `#[serde(default, skip_serializing_if = ...)]`. The two attributes
+    /// pin two independent invariants — split into two tests so a refactor
+    /// that drops one but not the other surfaces precisely.
+    ///
+    /// (a) `skip_serializing_if`: producer omits the key when empty/None,
+    ///     keeping hand-authored / CLI-emitted capsule JSON minimal.
+    /// (b) `default`: consumer accepts JSON missing those keys, so a
+    ///     hand-authored minimal capsule and a future schema-migration
+    ///     read of an older record both deserialize cleanly.
+    #[test]
+    fn capsule_json_omits_empty_optionals() {
+        let cap = synthetic_capsule(None, vec![]);
+        let v = serde_json::to_value(&cap).unwrap();
+        let obj = v.as_object().expect("capsule serializes as JSON object");
+        for key in [
+            "scope_prefixes",
+            "depends_on",
+            "active_attempt",
+            "attempts",
+            "verification",
+            "pending_land",
+            "landing",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "expected {key} omitted from minimal capsule JSON, got {v}",
+            );
+        }
+        for required in [
+            "id",
+            "title",
+            "description",
+            "acceptance",
+            "base_ref",
+            "status",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                obj.contains_key(required),
+                "expected required key {required} present, got {v}",
+            );
+        }
+    }
+
+    /// Hand-typed minimal JSON missing the seven optional keys must
+    /// deserialize via `#[serde(default)]` — distinct from the omits
+    /// test, which round-trips an already-omitted form (and so would
+    /// pass even if `default` were removed). Pin defaults for every
+    /// optional so dropping `default` from any one field fails here.
+    #[test]
+    fn capsule_json_defaults_missing_optionals() {
+        let json = serde_json::json!({
+            "id": "c",
+            "title": "t",
+            "description": "d",
+            "acceptance": {"run": "true", "expect_exit": 0},
+            "base_ref": "main",
+            "status": "planned",
+            "created_at": "+001970-01-01T00:00:00.000000000Z",
+            "updated_at": "+001970-01-01T00:00:00.000000000Z",
+        });
+        let parsed: Capsule = serde_json::from_value(json).unwrap();
+        assert!(parsed.scope_prefixes.is_empty());
+        assert!(parsed.depends_on.is_empty());
+        assert!(parsed.active_attempt.is_none());
+        assert!(parsed.attempts.is_empty());
+        assert!(parsed.verification.is_none());
+        assert!(parsed.pending_land.is_none());
+        assert!(parsed.landing.is_none());
+    }
 }
 
