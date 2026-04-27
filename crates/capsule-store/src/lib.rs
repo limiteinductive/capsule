@@ -3309,6 +3309,22 @@ mod tests {
         assert!(matches!(err, StoreError::CrossSession));
     }
 
+    /// Heartbeat on a never-claimed capsule must report `WrongStatus`.
+    /// Pins the pre-lease status guard before session/attempt checks.
+    #[test]
+    fn heartbeat_wrong_status_for_planned() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let err = s.heartbeat("x", "sess1").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::WrongStatus { op: "heartbeat", current_status: "planned", .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
     /// Pin precedence: a wrong-session caller whose lease has ALSO expired
     /// must see CrossSession, not LeaseExpired. They don't own the lease,
     /// period — the expiry is irrelevant context, and leaking it would let
