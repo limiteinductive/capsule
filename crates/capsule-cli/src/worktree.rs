@@ -352,15 +352,15 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Last assertion is the sibling-prefix regression guard: `/a/bad` must
+    /// NOT be considered within `/a/b`. `Path::starts_with` is component-aware,
+    /// so this guards against a future regression to string-prefix matching.
     #[test]
     fn path_within_basic() {
         assert!(path_within(Path::new("/a/b/c"), Path::new("/a/b")));
         assert!(path_within(Path::new("/a/b"), Path::new("/a/b")));
         assert!(!path_within(Path::new("/a/b"), Path::new("/a/b/c")));
         assert!(!path_within(Path::new("/x"), Path::new("/y")));
-        // Sibling-prefix regression: `/a/bad` must NOT be considered within
-        // `/a/b`. `Path::starts_with` is component-aware, so this guards
-        // against a future regression to string-prefix matching.
         assert!(!path_within(Path::new("/a/bad"), Path::new("/a/b")));
     }
 
@@ -394,6 +394,12 @@ mod tests {
         assert!(err.to_string().contains("inside .git"));
     }
 
+    /// Two contracts pinned at once:
+    /// 1. `allowed` does not exist — exercises the parent-canonicalize branch
+    ///    so that the validator works for paths the caller plans to create.
+    /// 2. The returned path is full-path equal (not just `file_name` equal):
+    ///    a regression in parent canonicalization would still pass a
+    ///    `file_name`-only check.
     #[test]
     fn override_allows_default_subtree() {
         let td = tempdir().unwrap();
@@ -403,11 +409,8 @@ mod tests {
         fs::create_dir_all(&cap).unwrap();
         fs::create_dir_all(allowed.parent().unwrap()).unwrap();
         let cap = fs::canonicalize(&cap).unwrap();
-        // `allowed` itself does not exist — exercises the parent-canonicalize branch.
         assert!(!allowed.exists());
         let got = validate_worktree_dir_override(&allowed, &main, &cap).unwrap();
-        // Full-path equality (not just file_name): a regression in parent
-        // canonicalization would still pass a file_name-only check.
         assert_eq!(got, cap.join("worktrees/foo-a1"));
     }
 
@@ -439,6 +442,9 @@ mod tests {
         );
     }
 
+    /// `cap/worktrees/../foreign/x` with `foreign` existing — verifies that
+    /// `fs::canonicalize` collapses `..` so the validation sees the real
+    /// target (inside the store, outside worktrees) and rejects it.
     #[test]
     fn override_traversal_via_dotdot_is_canonicalized() {
         let td = tempdir().unwrap();
@@ -446,9 +452,6 @@ mod tests {
         let cap = main.join(".capsule");
         fs::create_dir_all(&cap).unwrap();
         let cap = fs::canonicalize(&cap).unwrap();
-        // `cap/worktrees/../foreign/x` with `foreign` existing — verifies
-        // that fs::canonicalize collapses `..` so the validation sees the
-        // real target (inside the store, outside worktrees) and rejects.
         let foreign = cap.join("foreign");
         fs::create_dir_all(&foreign).unwrap();
         let traversal = cap.join("worktrees/../foreign/x");
