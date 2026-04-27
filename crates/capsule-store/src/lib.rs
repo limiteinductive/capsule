@@ -2783,8 +2783,6 @@ mod tests {
             WitnessState::Different(s) => assert_eq!(s, other_sha),
             WitnessState::Absent | WitnessState::AtVerifiedSha(_) => panic!("expected Different"),
         }
-        // Absent precedence: observed == ZERO_OID short-circuits even when
-        // `verified` is also ZERO_OID — so Absent wins, not AtVerifiedSha.
         assert!(matches!(
             WitnessState::classify(capsule_git::ZERO_OID.to_string(), capsule_git::ZERO_OID),
             WitnessState::Absent
