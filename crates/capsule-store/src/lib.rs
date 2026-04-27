@@ -3124,6 +3124,37 @@ mod tests {
         assert!(matches!(err, StoreError::WrongStatus { op: "attest", .. }));
     }
 
+    /// Accepted outranks cross-session for attest retries.
+    /// Caller recovery depends on seeing WrongStatus(Accepted), not CrossSession.
+    #[test]
+    fn attest_wrong_status_outranks_cross_session() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let req = |sid: &str| AttestRequest {
+            capsule_id: "x".into(),
+            session_id: sid.into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 100,
+            log_ref: "file:///dev/null".into(),
+        };
+        s.attest(req("sess1")).unwrap();
+        let err = s.attest(req("sess2")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::WrongStatus {
+                    ref capsule_id,
+                    op: "attest",
+                    current_status: "accepted",
+                } if capsule_id == "x"
+            ),
+            "got {err:?}"
+        );
+    }
+
     /// Garbage `verified_sha` should fail at the protocol boundary (here),
     /// not later as an opaque `git push <garbage>:refs/heads/...` failure.
     #[test]
