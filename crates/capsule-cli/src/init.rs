@@ -384,4 +384,56 @@ mod tests {
         assert_eq!(parse_git_version("git version a.b.c"), None);
         assert_eq!(parse_git_version("git version 2.x"), None);
     }
+
+    /// Pin the two `maybe_update_gitignore` safety guards beyond the
+    /// `--no-gitignore` and not-in-worktree skips already covered: store
+    /// dir resolves outside the worktree, and store dir equals the
+    /// worktree root (would shadow the entire repo). Each test pre-seeds
+    /// `.gitignore` with a sentinel and asserts the file is byte-identical
+    /// afterwards, so the guard is proven not just to skip a *create* but
+    /// also to refuse to *append* into an existing `.gitignore`.
+    #[test]
+    fn init_gitignore_refuses_store_dir_outside_worktree() {
+        let tmp_wt = TempDir::new().unwrap();
+        git_init(tmp_wt.path());
+        let gi = tmp_wt.path().join(".gitignore");
+        fs::write(&gi, "node_modules\n").unwrap();
+        let tmp_outside = TempDir::new().unwrap();
+        let store = tmp_outside.path().join(".capsule");
+
+        let r = run_at(tmp_wt.path(), store, false).unwrap();
+
+        assert!(r.gitignore_updated.is_none());
+        assert!(
+            r.gitignore_skipped
+                .as_deref()
+                .is_some_and(|s| s.contains("outside the worktree")),
+            "skip reason: {:?}",
+            r.gitignore_skipped
+        );
+        assert_eq!(fs::read_to_string(&gi).unwrap(), "node_modules\n");
+    }
+
+    #[test]
+    fn init_gitignore_refuses_store_dir_equals_worktree_root() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let gi = tmp.path().join(".gitignore");
+        fs::write(&gi, "node_modules\n").unwrap();
+        // Store dir == worktree root: stripping the worktree prefix gives
+        // an empty path, which `format_gitignore_dir_pattern` rejects.
+        let store = tmp.path().to_path_buf();
+
+        let r = run_at(tmp.path(), store, false).unwrap();
+
+        assert!(r.gitignore_updated.is_none());
+        assert!(
+            r.gitignore_skipped
+                .as_deref()
+                .is_some_and(|s| s.contains("refusing to ignore the repo")),
+            "skip reason: {:?}",
+            r.gitignore_skipped
+        );
+        assert_eq!(fs::read_to_string(&gi).unwrap(), "node_modules\n");
+    }
 }
