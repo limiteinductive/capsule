@@ -559,6 +559,56 @@ mod tests {
         assert!(!AttemptOutcome::Released.is_terminal());
     }
 
+    /// Two parallel wire forms exist for `Status` and `AttemptOutcome`:
+    /// serde enum serialization (`rename_all = ...`), used wherever the
+    /// enum is emitted as JSON (e.g. via the `Capsule`/`Attempt` derives
+    /// on the CLI `--json` path), and the explicit `as_wire_str`, used
+    /// at SQL boundaries (`capsule.status` / `attempt.outcome` TEXT
+    /// columns and CHECK constraints). The two must agree both ways,
+    /// or JSON-emitted state drifts from `WHERE status = '...'` queries
+    /// — and a `#[serde(alias = ...)]` / asymmetric `deserialize_with`
+    /// could let in values the SQL CHECK would refuse. Pin Serialize
+    /// and Deserialize every variant so a `rename_all` change, a
+    /// per-variant `#[serde(rename)]`, or an asymmetric attr surfaces
+    /// here rather than at runtime.
+    #[test]
+    fn status_serde_form_matches_as_wire_str() {
+        for v in [
+            Status::Planned,
+            Status::Active,
+            Status::Accepted,
+            Status::Landed,
+            Status::Abandoned,
+        ] {
+            let expected = serde_json::Value::String(v.as_wire_str().into());
+            assert_eq!(serde_json::to_value(v).unwrap(), expected, "ser for {v:?}");
+            assert_eq!(
+                serde_json::from_value::<Status>(expected).unwrap(),
+                v,
+                "de for {v:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_outcome_serde_form_matches_as_wire_str() {
+        for v in [
+            AttemptOutcome::InFlight,
+            AttemptOutcome::Released,
+            AttemptOutcome::Expired,
+            AttemptOutcome::Abandoned,
+            AttemptOutcome::Landed,
+        ] {
+            let expected = serde_json::Value::String(v.as_wire_str().into());
+            assert_eq!(serde_json::to_value(v).unwrap(), expected, "ser for {v:?}");
+            assert_eq!(
+                serde_json::from_value::<AttemptOutcome>(expected).unwrap(),
+                v,
+                "de for {v:?}",
+            );
+        }
+    }
+
     fn synthetic_attempt(id: AttemptId) -> Attempt {
         let now = OffsetDateTime::UNIX_EPOCH;
         Attempt {
