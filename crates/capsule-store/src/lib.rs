@@ -4182,9 +4182,15 @@ mod tests {
         assert_eq!(outcome, ReconcileOutcome::NotFrozen);
     }
 
+    /// Crash window: §7.1.2 step 3 (push) succeeded, step 4 (DB commit)
+    /// didn't. Reconcile must promote `accepted+pending_land` →
+    /// `landed`, attribute the landing to `reconciler`, and emit the
+    /// §6 `reconciler_ran` audit row with the canonical
+    /// `{decision, witness_remote_state}` shape — sha embedded in
+    /// `witness_remote_state` so audit rows stay self-contained
+    /// without re-joining `PendingLand`.
     #[test]
     fn reconcile_landed_when_witness_at_verified_sha() {
-        // Push happened, DB commit didn't.
         let id = "rec1";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
@@ -4207,8 +4213,6 @@ mod tests {
         assert!(c.pending_land.is_none());
         assert_eq!(c.landing.as_ref().unwrap().landed_by, "reconciler");
 
-        // DESIGN.md §6 reconciler_ran: {decision, witness_remote_state}.
-        // Pin emission + payload shape for the Landed outcome.
         let v = read_event_payload(&s, id, "reconciler_ran");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -4216,9 +4220,6 @@ mod tests {
         assert_eq!(keys, vec!["decision", "witness_remote_state"]);
         assert_eq!(v["decision"], "landed");
         assert_eq!(v["witness_remote_state"]["state"], "at_verified_sha");
-        // Pin sha presence so audit rows stay self-contained without
-        // requiring readers to re-join PendingLand to learn what the
-        // observed witness sha was.
         assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
