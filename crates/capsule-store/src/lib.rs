@@ -4279,4 +4279,20 @@ mod tests {
             "2024-06-15T12:00:00.120000000Z",
         );
     }
+
+    /// Pin the `parse_wire` panic message: kind label is per-call-site
+    /// (distinct between `parse_status` and `parse_outcome`) and the
+    /// offending value reaches the panic. A refactor that drops either
+    /// halves the diagnostic the operator sees on a CHECK-violating row.
+    #[test]
+    #[should_panic(expected = "unknown status in DB: not-a-real-status")]
+    fn parse_status_panics_with_kind_and_value_on_unknown_input() {
+        let _ = parse_status("not-a-real-status");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown attempt outcome in DB: not-a-real-outcome")]
+    fn parse_outcome_panics_with_kind_and_value_on_unknown_input() {
+        let _ = parse_outcome("not-a-real-outcome");
+    }
 }
