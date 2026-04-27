@@ -437,4 +437,27 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&gi).unwrap(), "node_modules\n");
     }
+
+    /// Sibling to `init_gitignore_without_trailing_newline_keeps_existing_intact`:
+    /// when `.gitignore` already ends with `\n`, appending `.capsule/` must
+    /// NOT insert an extra blank line. Together the two tests pin the
+    /// `current.ends_with('\n')` branch of the prepend-newline guard from
+    /// both sides — this one fixes false-positives, the sibling fixes
+    /// false-negatives.
+    #[test]
+    fn init_gitignore_with_trailing_newline_does_not_double_blank() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let gi = tmp.path().join(".gitignore");
+        fs::write(&gi, "node_modules\n").unwrap();
+
+        let store = tmp.path().join(".capsule");
+        let r = run_at(tmp.path(), store, false).unwrap();
+        assert!(r.gitignore_updated.is_some());
+
+        assert_eq!(
+            fs::read_to_string(&gi).unwrap(),
+            "node_modules\n.capsule/\n",
+        );
+    }
 }
