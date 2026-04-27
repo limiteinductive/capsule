@@ -3904,6 +3904,29 @@ mod tests {
         assert!(c.depends_on.is_empty());
     }
 
+    /// `remove_dep` is intentionally lenient: unlike `add_dep`, it does not
+    /// validate the target exists. Removing an absent edge is a no-op and
+    /// must not emit a `DependencyRemoved` event.
+    #[test]
+    fn remove_dep_missing_target_noop_no_event() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        s.remove_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "ghost".into(),
+        })
+        .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE capsule_id = ?1 AND kind = 'dependency_removed'",
+                params!["a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "absent-edge remove must not emit a dep_removed event");
+    }
+
     #[test]
     fn dep_ops_noop_on_terminal_capsules() {
         let mut s = tmp_store();
