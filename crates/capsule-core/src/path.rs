@@ -213,14 +213,19 @@ mod tests {
         assert_eq!(parsed.as_str(), "src/foo");
     }
 
-    /// 'é' as decomposed (e + combining acute) vs precomposed.
+    /// 'é' as decomposed (e + combining acute) vs precomposed. Asserting
+    /// only `a == b` would also pass an NFD impl (both inputs decompose);
+    /// pin the stored form to NFC so a refactor to `.nfd()` is a deliberate
+    /// change rather than a silent regression that lets visually equivalent
+    /// paths persist under different bytes and bypass byte-wise overlap.
     #[test]
     fn nfc_normalizes_decomposed_to_composed() {
         let decomposed = "src/cafe\u{0301}";
         let composed = "src/caf\u{00e9}";
         let a = CanonicalPath::new(decomposed).unwrap();
         let b = CanonicalPath::new(composed).unwrap();
-        assert_eq!(a.as_str(), b.as_str());
+        assert_eq!(a.as_str(), composed);
+        assert_eq!(b.as_str(), composed);
         assert!(a.overlaps(&b));
     }
 }
