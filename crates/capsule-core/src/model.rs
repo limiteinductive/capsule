@@ -505,6 +505,23 @@ mod tests {
         assert_eq!(AttemptOutcome::from_wire("not_an_outcome"), None);
     }
 
+    /// Wire parsing is intentionally case-sensitive. CLI filters
+    /// (`parse_status_arg`) must reject non-canonical values instead of
+    /// accepting `"Active"` and later constructing a `WHERE status = 'Active'`
+    /// query that can never match the lowercase schema values.
+    #[test]
+    fn from_wire_is_case_sensitive() {
+        for s in ["Active", "PLANNED", "Accepted"] {
+            assert!(Status::from_wire(s).is_none(), "Status::from_wire({s:?})");
+        }
+        for s in ["In_Flight", "IN_FLIGHT", "Expired"] {
+            assert!(
+                AttemptOutcome::from_wire(s).is_none(),
+                "AttemptOutcome::from_wire({s:?})",
+            );
+        }
+    }
+
     /// The four tests below pin set-membership predicates over `Status` and
     /// `AttemptOutcome`. Each predicate is an exhaustive match — adding a
     /// future variant fails compile until it's classified, so these tests
