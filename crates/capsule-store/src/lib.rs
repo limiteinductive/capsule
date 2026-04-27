@@ -3535,6 +3535,28 @@ mod tests {
         assert_eq!(c.status, Status::Planned);
     }
 
+    /// Expired attempts remain audit history, so reclaim must not reuse
+    /// their id. Reuse would collide with git refs derived from
+    /// `(capsule_id, attempt_id)`.
+    #[test]
+    fn claim_after_reclaim_allocates_new_attempt_id() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        s.reclaim("x").unwrap();
+        let a = s.claim(claim_req("x", "sess2")).unwrap();
+        assert_eq!(a.id, 2);
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.attempts.len(), 2);
+        assert_eq!(c.attempts[0].id, 1);
+        assert_eq!(
+            c.attempts[0].outcome,
+            capsule_core::AttemptOutcome::Expired
+        );
+        assert_eq!(c.attempts[1].id, 2);
+    }
+
     #[test]
     fn amend_planned_changes_all_fields() {
         let mut s = tmp_store();
