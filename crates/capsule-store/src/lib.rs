@@ -1900,6 +1900,12 @@ fn creates_cycle(
 /// `depends_on_json`, so the deps array stays inside SQLite — no
 /// `serde_json::from_str` per pop. A missing row (capsule not in DB) yields
 /// zero join rows, matching the prior `.optional()` skip path.
+///
+/// The explicit `drop(stmt)` after the per-pop `query_map` releases the
+/// `prepare_cached` borrow on `tx` before the next pop's `prepare_cached`
+/// call. A trailing-expression block scope hit `clippy::let_and_return`
+/// vs E0597 (the `Rows` iterator borrows `stmt`); explicit drop is the
+/// cleanest form.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<String> = HashSet::new();
@@ -1910,11 +1916,6 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
         if node == target {
             return Ok(true);
         }
-        // `prepare_cached` borrows `tx` until the stmt is dropped; the
-        // explicit `drop(stmt)` releases that borrow before the next pop's
-        // `prepare_cached` call. A trailing-expression block scope ran into
-        // `clippy::let_and_return` vs E0597 (the `Rows` iterator borrows
-        // `stmt`) — explicit drop is the cleanest form.
         let mut stmt = tx.prepare_cached(
             "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
              WHERE c.id = ?1",
