@@ -698,5 +698,38 @@ mod tests {
         assert!(landing.advanced_base_ref);
         assert_eq!(landing.landed_by, "reconciler");
     }
+
+    /// `Lease::acquired_at` and `expires_at` use `time::serde::iso8601`,
+    /// which emits a JSON *string* with a 6-digit padded year prefix
+    /// (`"+0YYYYY-MM-DDTHH:MM:SS.fffffffffZ"`). Dropping the annotation
+    /// silently falls back to the time crate's default — a bare JSON
+    /// array of struct fields — and the persisted `lease_json` contract
+    /// breaks: SQLite `json_extract($.expires_at)` returns a JSON array
+    /// instead of a string, which downstream `parse_iso8601` then panics
+    /// on. Pin the field shape (string + canonical bytes) and the value
+    /// round-trip so the regression surfaces here.
+    ///
+    /// The `+002024` prefix is distinct from capsule-store's
+    /// `format_iso8601` helper (4-digit year) — both formats are accepted
+    /// by `parse_iso8601`. Don't "normalize" them.
+    #[test]
+    fn lease_serde_iso8601_round_trip() {
+        let lease = Lease {
+            owner: "alice".into(),
+            session_id: "session-1".into(),
+            acquired_at: time::macros::datetime!(2024-06-15 12:00:00 UTC),
+            expires_at: time::macros::datetime!(2024-06-15 12:05:00 UTC),
+            ttl_sec: 300,
+        };
+        let v: serde_json::Value = serde_json::to_value(&lease).unwrap();
+        assert_eq!(v["acquired_at"], "+002024-06-15T12:00:00.000000000Z");
+        assert_eq!(v["expires_at"], "+002024-06-15T12:05:00.000000000Z");
+        let parsed: Lease = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.owner, lease.owner);
+        assert_eq!(parsed.session_id, lease.session_id);
+        assert_eq!(parsed.acquired_at, lease.acquired_at);
+        assert_eq!(parsed.expires_at, lease.expires_at);
+        assert_eq!(parsed.ttl_sec, lease.ttl_sec);
+    }
 }
 
