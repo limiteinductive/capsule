@@ -4244,6 +4244,44 @@ mod tests {
         );
     }
 
+    /// Auto-reclaim must skip frozen capsules even after lease expiry.
+    /// The land step-4 reconciler is the only path allowed to resolve
+    /// `pending_land_json`; this pins the SQL freeze guard.
+    #[test]
+    fn reclaim_skips_frozen_capsule_with_expired_lease() {
+        let id = "frzexp";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req_with_ttl(id, "sess1", 1)).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        // do_push:false — only `pending_land_json` matters here; reconcile is
+        // not exercised.
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        // list_capsules runs reclaim_expired_in_tx as part of its read.
+        let _ = s.list_capsules(ListFilter::default()).unwrap();
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Accepted, "frozen capsule must not be reclaimed");
+        assert_eq!(c.active_attempt, Some(1));
+        assert!(c.verification.is_some(), "verification must persist");
+        assert!(c.pending_land.is_some(), "pending_land must persist");
+
+        let expired_events: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE capsule_id = ?1 AND kind = 'attempt_expired'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_events, 0, "frozen sweep must not record expiry");
+    }
+
     /// Crash before push. Witness absent → clear, capsule stays accepted.
     /// Pin the `pending_land_cleared` payload (DESIGN.md §6: `{reason, by}`)
     /// so non-spec extras like `stderr` cannot creep back in, and pin
