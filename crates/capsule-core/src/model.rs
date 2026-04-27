@@ -749,6 +749,25 @@ mod tests {
         assert_eq!(landing.landed_by, "reconciler");
     }
 
+    /// `Attempt.tip_sha` (None until first push) and `closed_at` (None for
+    /// in-flight) are routinely None at every `--json` render. Pin the
+    /// shape: `skip_serializing_if` omits the keys for None (agent output
+    /// stays minimal), and `default` lets the omitted-key form deserialize
+    /// back to None.
+    #[test]
+    fn attempt_json_omits_and_defaults_none_optionals() {
+        let att = synthetic_attempt(1);
+        assert!(att.tip_sha.is_none() && att.closed_at.is_none());
+        let v = serde_json::to_value(&att).unwrap();
+        let obj = v.as_object().expect("attempt serializes as JSON object");
+        assert!(!obj.contains_key("tip_sha"), "got: {v}");
+        assert!(!obj.contains_key("closed_at"), "got: {v}");
+
+        let parsed: Attempt = serde_json::from_value(v).unwrap();
+        assert!(parsed.tip_sha.is_none());
+        assert!(parsed.closed_at.is_none());
+    }
+
     /// `Lease::acquired_at` and `expires_at` use `time::serde::iso8601`,
     /// which emits a JSON *string* with a 6-digit padded year prefix
     /// (`"+0YYYYY-MM-DDTHH:MM:SS.fffffffffZ"`). Dropping the annotation
@@ -830,9 +849,9 @@ mod tests {
 
     /// Hand-typed minimal JSON missing the seven optional keys must
     /// deserialize via `#[serde(default)]` — distinct from the omits
-    /// test, which round-trips an already-omitted form (and so would
-    /// pass even if `default` were removed). Pin defaults for every
-    /// optional so dropping `default` from any one field fails here.
+    /// test, which only serializes (and so would pass even if `default`
+    /// were removed). Pin defaults for every optional so dropping
+    /// `default` from any one field fails here.
     #[test]
     fn capsule_json_defaults_missing_optionals() {
         let json = serde_json::json!({
