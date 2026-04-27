@@ -347,6 +347,32 @@ impl Capsule {
 mod tests {
     use super::*;
 
+    /// `ExpectExit` is `#[serde(untagged)]` — the wire form is a bare
+    /// JSON number or a bare JSON string (no `{kind: ...}` tag). Pin
+    /// the contract: numbers → `Code`, strings → `Sentinel` (including
+    /// the numeric-string `"0"`, which `Code(i32)` rejects). A future
+    /// move to a tagged or stringly-typed wire form would silently
+    /// flip the decision for `"0"` and is the regression this guards.
+    #[test]
+    fn expect_exit_untagged_serde_round_trip() {
+        let code: ExpectExit = serde_json::from_str("0").unwrap();
+        assert!(matches!(code, ExpectExit::Code(0)));
+        assert_eq!(serde_json::to_string(&code).unwrap(), "0");
+
+        let sentinel: ExpectExit = serde_json::from_str("\"timeout\"").unwrap();
+        match sentinel {
+            ExpectExit::Sentinel(ref s) => assert_eq!(s, "timeout"),
+            ExpectExit::Code(_) => panic!("expected Sentinel"),
+        }
+        assert_eq!(serde_json::to_string(&sentinel).unwrap(), "\"timeout\"");
+
+        let numeric_string: ExpectExit = serde_json::from_str("\"0\"").unwrap();
+        match numeric_string {
+            ExpectExit::Sentinel(ref s) => assert_eq!(s, "0"),
+            ExpectExit::Code(_) => panic!("expected Sentinel for \"0\""),
+        }
+    }
+
     #[test]
     fn exit_code_display() {
         assert_eq!(ExitCode::Code(0).to_string(), "0");
