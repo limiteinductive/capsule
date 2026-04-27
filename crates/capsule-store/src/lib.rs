@@ -2718,6 +2718,38 @@ mod tests {
         );
     }
 
+    /// Direct truth-table for `WitnessState::classify`. Today it's only hit
+    /// through `Store::reconcile`, so a regression in the precedence (e.g.
+    /// reordering the if/else so observed == verified is checked before
+    /// observed == ZERO_OID) would slip past unit tests until an integration
+    /// test happened to exercise it. Pin all three branches + the
+    /// load-bearing Absent-wins precedence: ZERO_OID observed always
+    /// classifies as Absent, never as AtVerifiedSha, even in the degenerate
+    /// case where `verified` itself is ZERO_OID.
+    #[test]
+    fn witness_state_classify_truth_table() {
+        let verified = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        assert!(matches!(
+            WitnessState::classify(capsule_git::ZERO_OID.to_string(), verified),
+            WitnessState::Absent
+        ));
+        match WitnessState::classify(verified.to_string(), verified) {
+            WitnessState::AtVerifiedSha(s) => assert_eq!(s, verified),
+            WitnessState::Absent | WitnessState::Different(_) => panic!("expected AtVerifiedSha"),
+        }
+        let other_sha = "cafef00dcafef00dcafef00dcafef00dcafef00d";
+        match WitnessState::classify(other_sha.to_string(), verified) {
+            WitnessState::Different(s) => assert_eq!(s, other_sha),
+            WitnessState::Absent | WitnessState::AtVerifiedSha(_) => panic!("expected Different"),
+        }
+        // Absent precedence: observed == ZERO_OID short-circuits even when
+        // `verified` is also ZERO_OID — so Absent wins, not AtVerifiedSha.
+        assert!(matches!(
+            WitnessState::classify(capsule_git::ZERO_OID.to_string(), capsule_git::ZERO_OID),
+            WitnessState::Absent
+        ));
+    }
+
     #[test]
     fn create_and_get() {
         let mut s = tmp_store();
