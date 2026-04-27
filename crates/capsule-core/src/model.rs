@@ -574,5 +574,44 @@ mod tests {
         let cap = synthetic_capsule(Some(99), vec![synthetic_attempt(1)]);
         assert!(cap.active_attempt_record().is_none());
     }
+
+    /// Symmetric to `active_attempt_record_returns_matching_row` for the
+    /// consuming sibling. Pinned separately because `into_active_attempt`
+    /// uses `swap_remove` (O(1) but reorders), whereas `active_attempt_record`
+    /// scans linearly — the two could drift independently.
+    ///
+    /// The active attempt sits in the *middle* (id 2 of `[1,2,3]`) so a
+    /// hypothetically broken `pop()` or `first()`-style impl would fail this
+    /// test rather than coincidentally pass. The body also moves a non-`Copy`
+    /// field (`branch`) out of the returned `Attempt`, exercising the by-value
+    /// contract at the call site (the signature alone proves the type, not
+    /// that callers can move owned fields without cloning).
+    #[test]
+    fn into_active_attempt_returns_matching_row_by_value() {
+        let mut active = synthetic_attempt(2);
+        active.branch = "active-branch".into();
+        let cap = synthetic_capsule(
+            Some(2),
+            vec![synthetic_attempt(1), active, synthetic_attempt(3)],
+        );
+        let att = cap.into_active_attempt().expect("attempt 2 present");
+        assert_eq!(att.id, 2);
+        let branch: String = att.branch;
+        assert_eq!(branch, "active-branch");
+    }
+
+    #[test]
+    fn into_active_attempt_none_when_unset() {
+        let cap = synthetic_capsule(None, vec![synthetic_attempt(1)]);
+        assert!(cap.into_active_attempt().is_none());
+    }
+
+    /// Same state-shape violation as the borrowing form: `active_attempt`
+    /// points at an id with no row → `None`, not panic.
+    #[test]
+    fn into_active_attempt_none_when_missing_row() {
+        let cap = synthetic_capsule(Some(99), vec![synthetic_attempt(1)]);
+        assert!(cap.into_active_attempt().is_none());
+    }
 }
 
