@@ -159,7 +159,6 @@ fn validate_worktree_dir_override(
         bail!("--worktree-dir cannot be inside .git");
     }
     if path_within(&canonical, capsule_dir) {
-        // Allow the default subdir under capsule_dir, but not inside the store itself.
         let allowed_root = capsule_dir.join("worktrees");
         if !path_within(&canonical, &allowed_root) {
             bail!(
