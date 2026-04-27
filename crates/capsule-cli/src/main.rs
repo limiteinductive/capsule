@@ -681,13 +681,26 @@ fn pre_spawn_heartbeat(dir: &Path, capsule_id: &str, session: &str) -> Result<()
     Ok(())
 }
 
-/// Handle for the spawned heartbeat thread. Drop `stop` to wake the thread
-/// from its `recv_timeout` and let it exit; `join` it; then read `lease_lost`
-/// to decide whether to force a non-zero parent exit.
+/// Handle for the spawned heartbeat thread. Call `shutdown` to wake the thread
+/// (drops `stop`, the sender side of its `recv_timeout` channel), join it, and
+/// read whether the lease was lost during the run.
 struct HeartbeatThread {
     handle: std::thread::JoinHandle<Result<()>>,
     stop: std::sync::mpsc::Sender<()>,
     lease_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeartbeatThread {
+    fn shutdown(self) -> bool {
+        let Self {
+            handle,
+            stop,
+            lease_lost,
+        } = self;
+        drop(stop);
+        let _ = handle.join();
+        lease_lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Spawn the heartbeat-thread that pings the lease at `ttl/3` cadence on a
@@ -767,11 +780,9 @@ fn spawn_heartbeat_thread(
 /// second SQLite connection (WAL makes same-process dual connections safe), and
 /// forward the child's exit code. No custom signal handlers — terminal signals
 /// reach the child through process-group propagation; the heartbeat thread
-/// shuts down when the parent drops `stop_tx` (the `recv_timeout` returns
-/// `Disconnected` immediately).
+/// shuts down via `HeartbeatThread::shutdown` (its `recv_timeout` returns
+/// `Disconnected` once the sender is dropped).
 fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
-    use std::sync::atomic::Ordering;
-
     let SessionAttempt {
         ttl,
         branch: attempt_branch,
@@ -794,11 +805,7 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
 
     pre_spawn_heartbeat(dir, &args.capsule_id, &args.session)?;
 
-    let HeartbeatThread {
-        handle: hb_thread,
-        stop: stop_tx,
-        lease_lost,
-    } = spawn_heartbeat_thread(dir, args.capsule_id.clone(), args.session.clone(), ttl);
+    let hb = spawn_heartbeat_thread(dir, args.capsule_id.clone(), args.session.clone(), ttl);
 
     let (first, rest) = args.cmd.split_first().expect("clap required >= 1 arg");
     let mut command = std::process::Command::new(first);
@@ -812,9 +819,8 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     }
     let status = command.status();
 
-    drop(stop_tx); // signals heartbeat thread to wake immediately
-    let _ = hb_thread.join();
-    drop(isolate_state); // release runtime flock
+    let lease_lost = hb.shutdown();
+    drop(isolate_state);
 
     match status {
         Ok(s) => {
@@ -829,7 +835,7 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
                     1
                 }
             });
-            if lease_lost.load(Ordering::SeqCst) && code == 0 {
+            if lease_lost && code == 0 {
                 Ok(1)
             } else {
                 Ok(code)
