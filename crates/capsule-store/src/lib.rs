@@ -4450,6 +4450,27 @@ mod tests {
         assert!(matches!(err, StoreError::ForceUnfreezeNotConfirmed));
     }
 
+    /// Unconfirmed force-unfreeze requests must fail before capsule lookup,
+    /// preserving a stable error surface for unauthorized callers even when
+    /// the target capsule does not exist.
+    #[test]
+    fn force_unfreeze_confirm_outranks_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: "ghost".into(),
+                remote: "unused".into(),
+                operator: "op".into(),
+                reason: "test".into(),
+                lander_confirmed_dead: false,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ForceUnfreezeNotConfirmed),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn force_unfreeze_lands_when_witness_at_verified_sha() {
         let id = "force1";
