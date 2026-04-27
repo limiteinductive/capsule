@@ -3238,6 +3238,20 @@ mod tests {
         assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
     }
 
+    /// `claim` reports invalid lease TTL before capsule lookup, symmetric to
+    /// `claim_invalid_sha_outranks_not_found`.
+    #[test]
+    fn claim_invalid_lease_ttl_outranks_not_found() {
+        let mut s = tmp_store();
+        let mut req = claim_req("ghost", "sess1");
+        req.lease_ttl_sec = u64::MAX;
+        let err = s.claim(req).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidLeaseTtl(t) if t == u64::MAX),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn heartbeat_cross_session_rejected() {
         let mut s = tmp_store();
