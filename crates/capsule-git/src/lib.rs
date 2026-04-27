@@ -494,6 +494,19 @@ mod tests {
         assert_eq!(r, LandOutcome::BaseRefMoved);
     }
 
+    /// Fallback stderr classification must keep stdout precedence: witness
+    /// stale-info outranks base non-FF even when both messages appear. The
+    /// non-FF line is positioned FIRST so a position-based rewrite (last-wins,
+    /// rank-by-line) would also fail this, not just a swapped if/else-if.
+    #[test]
+    fn stderr_witness_stale_outranks_base_non_ff() {
+        let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
+                      hint: Updates were rejected because the remote contains work that ...\n\
+                      ! [rejected] witness -> witness (stale info)\n";
+        let r = classify_failure_from_stderr(stderr, 1).unwrap();
+        assert_eq!(r, LandOutcome::WitnessOidMismatch);
+    }
+
     /// Direct tests for `parse_ref_line`. Porcelain wrapper lines and blanks
     /// are not per-ref records, so `classify_push`'s `filter_map(parse_ref_line)`
     /// must skip them instead of treating them as candidate ref updates.
