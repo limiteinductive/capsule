@@ -35,10 +35,7 @@ pub fn validate(id: &str) -> Result<(), IdError> {
     if bytes[0] == b'.' || bytes[len - 1] == b'.' {
         return Err(IdError::EdgeDot);
     }
-    // Per-component `.lock` suffix is forbidden by git ref-name rules and
-    // would surface as an opaque push failure at land time. Verified with
-    // `git check-ref-format`; pinned by the `lock_suffix_rejected` test.
-    if len >= 5 && &bytes[len - 5..] == b".lock" {
+    if id.ends_with(".lock") {
         return Err(IdError::LockSuffix);
     }
     let mut prev_dot = false;
