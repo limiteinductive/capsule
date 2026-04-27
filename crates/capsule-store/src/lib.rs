@@ -839,8 +839,6 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         assert_not_pending_land_frozen_in_tx(&tx, capsule_id)?;
-        // Same SQL serves the before- and after-sweep reads; one cached
-        // statement amortizes parsing across both.
         let read_status = |id: &str| -> Result<String> {
             tx.prepare_cached("SELECT status FROM capsule WHERE id = ?1")?
                 .query_row(params![id], |r| r.get(0))
