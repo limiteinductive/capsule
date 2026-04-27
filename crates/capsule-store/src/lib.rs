@@ -4285,6 +4285,30 @@ mod tests {
         );
     }
 
+    /// Active but unattested capsules fail pre-tx with `NotLandable`,
+    /// preserving the caller hint to attest before landing.
+    #[test]
+    fn land_not_landable_for_active_unattested_capsule() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        assert_eq!(s.get_capsule("x").unwrap().status, Status::Active);
+        let err = s
+            .land(LandRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                lander: "test".into(),
+                remote: "unused".into(),
+                repo_dir: std::env::temp_dir(),
+                skip_deploy_verify_gate: true,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotLandable(ref id) if id == "x"),
+            "got {err:?}"
+        );
+    }
+
     // ---- reconciler / force-unfreeze tests ----
 
     /// Drive the §7.1.2 land-crash decision tree from a test by writing
