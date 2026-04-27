@@ -861,7 +861,7 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let Some(mut deps) = load_deps_for_mutation(&tx, &req.capsule_id)? else {
-            return Ok(()); // §7.1.3 explicit no-op on terminal
+            return Ok(());
         };
 
         if !capsule_exists(&tx, &req.depends_on)? {
@@ -900,7 +900,7 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let Some(mut deps) = load_deps_for_mutation(&tx, &req.capsule_id)? else {
-            return Ok(()); // §7.1.3 explicit no-op on terminal
+            return Ok(());
         };
 
         let before = deps.len();
