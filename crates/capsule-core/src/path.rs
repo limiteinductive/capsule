@@ -201,6 +201,18 @@ mod tests {
         ));
     }
 
+    /// Pin the public JSON shape: `CanonicalPath` is a bare string, not
+    /// a wrapped object. `Capsule.scope_prefixes` rides through `--json`
+    /// to agents — a refactor that switched the inner type to a struct
+    /// (or wrapped this in an enum) would silently break that contract.
+    #[test]
+    fn canonical_path_json_wire_shape_is_bare_string() {
+        let p = CanonicalPath::new("src/foo").unwrap();
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#""src/foo""#);
+        let parsed: CanonicalPath = serde_json::from_str(r#""src/foo""#).unwrap();
+        assert_eq!(parsed.as_str(), "src/foo");
+    }
+
     /// 'é' as decomposed (e + combining acute) vs precomposed.
     #[test]
     fn nfc_normalizes_decomposed_to_composed() {
