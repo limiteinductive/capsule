@@ -2996,10 +2996,10 @@ mod tests {
         assert!(matches!(err, StoreError::WrongStatus { op: "attest", .. }));
     }
 
+    /// Garbage `verified_sha` should fail at the protocol boundary (here),
+    /// not later as an opaque `git push <garbage>:refs/heads/...` failure.
     #[test]
     fn attest_rejects_malformed_verified_sha() {
-        // Garbage `verified_sha` should fail at the protocol boundary (here),
-        // not later as an opaque `git push <garbage>:refs/heads/...` failure.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
@@ -3020,11 +3020,11 @@ mod tests {
         );
     }
 
+    /// Symmetric with attest: base_sha flows into `git worktree add ... <sha>`
+    /// (capsule-cli isolation) and into LandPush prior-base computation.
+    /// Reject at the protocol boundary.
     #[test]
     fn claim_rejects_malformed_base_sha() {
-        // Symmetric with attest: base_sha flows into `git worktree add ... <sha>`
-        // (capsule-cli isolation) and into LandPush prior-base computation.
-        // Reject at the protocol boundary.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let err = s
@@ -3051,15 +3051,15 @@ mod tests {
         assert!(matches!(err, StoreError::CrossSession));
     }
 
+    /// Pin precedence: a wrong-session caller whose lease has ALSO expired
+    /// must see CrossSession, not LeaseExpired. They don't own the lease,
+    /// period — the expiry is irrelevant context, and leaking it would let
+    /// a foreign session probe lease state. Heartbeat is the cleanest
+    /// probe: it does not run reclaim before loading the lease, so status
+    /// stays `active` and heartbeat's open-coded projection (session_id +
+    /// expires_at + ttl_sec via `json_extract`) is exercised end-to-end.
     #[test]
     fn cross_session_outranks_expired_lease() {
-        // Pin precedence: a wrong-session caller whose lease has ALSO expired
-        // must see CrossSession, not LeaseExpired. They don't own the lease,
-        // period — the expiry is irrelevant context, and leaking it would let
-        // a foreign session probe lease state. Heartbeat is the cleanest
-        // probe: it does not run reclaim before loading the lease, so status
-        // stays `active` and heartbeat's open-coded projection (session_id +
-        // expires_at + ttl_sec via `json_extract`) is exercised end-to-end.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
@@ -3071,14 +3071,14 @@ mod tests {
         );
     }
 
+    /// Parallel pin to `cross_session_outranks_expired_lease` for the
+    /// `assert_live_lease_for_session` helper. `attest` does not run
+    /// reclaim before lease load, so status stays `active` and the
+    /// CrossSession-before-LeaseExpired precedence is observable here too.
+    /// The two helpers are independently evolvable; without this pin a
+    /// future tweak could drift one without the other failing.
     #[test]
     fn attest_cross_session_outranks_expired_lease() {
-        // Parallel pin to `cross_session_outranks_expired_lease` for the
-        // `assert_live_lease_for_session` helper. `attest` does not run
-        // reclaim before lease load, so status stays `active` and the
-        // CrossSession-before-LeaseExpired precedence is observable here too.
-        // The two helpers are independently evolvable; without this pin a
-        // future tweak could drift one without the other failing.
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
