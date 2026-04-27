@@ -31,6 +31,12 @@ pub struct IsolateState {
 /// Lock-handoff order matters: the runtime lock is acquired *before* the
 /// setup lock is released, so a second `capsule work` invocation can never
 /// observe the worktree unlocked between the two.
+///
+/// Reuse semantics: when an existing registration matches `worktree_path`,
+/// the branch tip is **not** re-validated against `attempt_base_sha` —
+/// legitimate commits may have advanced it since the original add. When the
+/// registration exists but its directory is gone, fail fast with a remediation
+/// hint rather than letting the child's `chdir` surface as ENOENT.
 pub fn setup(
     capsule_dir: &Path,
     capsule_id: &str,
@@ -83,11 +89,7 @@ pub fn setup(
             git_worktree_add_existing_branch(&worktree_path, attempt_branch)
                 .context("git worktree add (existing branch)")?;
         }
-        // Reuse: tip not re-validated — legitimate commits may have advanced
-        // it since the original worktree add.
         (_, Some(registered_path), true) if Path::new(registered_path) == worktree_path => {}
-        // Stale registration: spawning the child would fail with ENOENT once
-        // we chdir; bail with a remediation hint up front.
         (_, Some(registered_path), false) if Path::new(registered_path) == worktree_path => {
             bail!(
                 "worktree for branch {attempt_branch} is registered at {registered_path} but \
