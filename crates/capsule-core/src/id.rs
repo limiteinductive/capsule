@@ -105,32 +105,32 @@ mod tests {
         assert!(matches!(validate("café"), Err(IdError::InvalidChar(_))));
     }
 
+    /// Verified: `git check-ref-format refs/heads/capsules/foo.lock/a1`
+    /// exits non-zero (per-component .lock-suffix is forbidden).
     #[test]
     fn lock_suffix_rejected() {
-        // Verified: `git check-ref-format refs/heads/capsules/foo.lock/a1`
-        // exits non-zero (per-component .lock-suffix is forbidden).
         assert_eq!(validate("foo.lock"), Err(IdError::LockSuffix));
         assert_eq!(validate("a.lock"), Err(IdError::LockSuffix));
     }
 
+    /// Only the exact ".lock" suffix is banned; ".locks" is fine.
     #[test]
     fn locks_plural_ok() {
-        // Only the exact ".lock" suffix is banned; ".locks" is fine.
         validate("foo.locks").unwrap();
     }
 
+    /// `.lock` only matters at the end of the component.
     #[test]
     fn lock_substring_in_middle_ok() {
-        // `.lock` only matters at the end of the component.
         validate("foo.lock.bar").unwrap();
     }
 
+    /// Single-pass validation reports the first defect positionally:
+    /// a `/` (invalid) at byte 1 wins over a `..` later in the string.
+    /// Either error is correct for boundary rejection; this test pins
+    /// the chosen ordering so future refactors don't drift.
     #[test]
     fn invalid_char_before_dotdot_reports_invalid_char() {
-        // Single-pass validation reports the first defect positionally:
-        // a `/` (invalid) at byte 1 wins over a `..` later in the string.
-        // Either error is correct for boundary rejection; this test pins
-        // the chosen ordering so future refactors don't drift.
         assert_eq!(validate("a/..b"), Err(IdError::InvalidChar(1)));
     }
 }
