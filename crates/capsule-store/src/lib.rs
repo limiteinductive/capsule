@@ -4124,6 +4124,45 @@ mod tests {
         assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
+    /// Frozen capsules reject `abandon` before session ownership is checked.
+    /// Preserves the §7.2 pending-land invariant for both wrong-session and
+    /// legitimate-session callers; recovery / `force_unfreeze` must resolve.
+    #[test]
+    fn abandon_frozen_outranks_cross_session() {
+        let id = "abf";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        let err = s
+            .abandon(AbandonRequest {
+                capsule_id: id.into(),
+                session_id: "wrong".into(),
+                reason: "r".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::PendingLandFrozen(ref cid) if cid == id),
+            "got {err:?}"
+        );
+
+        let err = s
+            .abandon(AbandonRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                reason: "r".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::PendingLandFrozen(ref cid) if cid == id),
+            "got {err:?}"
+        );
+    }
+
     /// Crash before push. Witness absent → clear, capsule stays accepted.
     /// Pin the `pending_land_cleared` payload (DESIGN.md §6: `{reason, by}`)
     /// so non-spec extras like `stderr` cannot creep back in, and pin
