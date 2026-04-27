@@ -99,7 +99,6 @@ fn check_git() -> Option<String> {
             )
         }
     };
-    // Keep the lossy output as Cow so valid UTF-8 avoids an owned copy.
     let text = String::from_utf8_lossy(&out.stdout);
     match parse_git_version(&text) {
         Some((major, minor)) if (major, minor) < (2, 13) => Some(format!(
@@ -142,6 +141,10 @@ fn format_gitignore_dir_pattern(rel: &Path) -> Option<String> {
 /// Append a rule for the store dir to the worktree-root `.gitignore`, idempotently.
 ///
 /// Returns `(Some(path), None)` on write, `(None, Some(reason))` on skip.
+///
+/// Both sides are canonicalized before comparison so symlink-y tmpdirs
+/// (e.g. macOS `/var/...` → `/private/var/...`) compare equal. The store
+/// dir is guaranteed to exist by now — `Store::open` creates it.
 fn maybe_update_gitignore(
     store_dir: &Path,
     worktree: Option<&Path>,
@@ -154,8 +157,6 @@ fn maybe_update_gitignore(
         return Ok((None, Some("not inside a git worktree".to_string())));
     };
 
-    // Canonicalize both sides so symlink-y tmpdirs (e.g. `/var/...` → `/private/var/...` on
-    // macOS) compare equal. Store dir exists by now — `Store::open` created it.
     let abs_store_dir = fs::canonicalize(store_dir)
         .with_context(|| format!("canonicalizing {}", store_dir.display()))?;
     let abs_worktree = fs::canonicalize(worktree)
@@ -293,10 +294,11 @@ mod tests {
         assert!(!tmp.path().join(".gitignore").exists());
     }
 
+    /// Tempdir without `git init` — capsule must still run, skip the
+    /// gitignore append, and emit the not-in-worktree warning.
     #[test]
     fn init_outside_worktree_skips_gitignore_and_warns() {
         let tmp = TempDir::new().unwrap();
-        // no git init
         let store = tmp.path().join(".capsule");
 
         let r = run_at(tmp.path(), store, false).unwrap();
