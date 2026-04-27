@@ -387,6 +387,28 @@ mod tests {
         assert_eq!(r, LandOutcome::BaseRefMoved);
     }
 
+    /// `base_non_fast_forward` checks three needles; `classifies_base_non_ff_from_stdout`
+    /// only covers `fetch first` (modern git). Pin the two legacy phrasings
+    /// — `non-fast-forward` (hyphen) and `non-fast forward` (space, per
+    /// `man git-push`) — so dropping older-git compatibility is deliberate.
+    #[test]
+    fn classifies_base_non_ff_legacy_hyphen_phrasing() {
+        let stdout = "To /tmp/remote.git\n\
+            !\tHEAD:refs/heads/main\t[rejected] (non-fast-forward)\n\
+            Done\n";
+        let r = classify_push(stdout, "", false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
+    #[test]
+    fn classifies_base_non_ff_legacy_space_phrasing() {
+        let stdout = "To /tmp/remote.git\n\
+            !\tHEAD:refs/heads/main\t[rejected] (non-fast forward)\n\
+            Done\n";
+        let r = classify_push(stdout, "", false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
     /// Synthesized: with `--atomic`, a witness stale-info would still appear
     /// even when base also failed. Witness wins (protection leak outranks
     /// caller-rebase).
