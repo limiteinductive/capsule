@@ -274,11 +274,8 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let status_str: String = tx
-            .query_row(
-                "SELECT status FROM capsule WHERE id = ?1",
-                params![&capsule_id],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT status FROM capsule WHERE id = ?1")?
+            .query_row(params![&capsule_id], |r| r.get(0))
             .or_not_found(&capsule_id)?;
         let status = parse_status(&status_str);
         if status != Status::Planned {
@@ -384,13 +381,14 @@ impl Store {
             String,
             String,
         ) = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT status, active_attempt, pending_land_json IS NOT NULL,
                         depends_on_json, scope_json
                  FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
+            )?
+            .query_row(params![req.capsule_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
             .or_not_found(&req.capsule_id)?;
 
         if frozen {
@@ -489,11 +487,12 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let (status_str, active_attempt, acceptance_json): (String, Option<i64>, String) = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT status, active_attempt, acceptance_json FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            )?
+            .query_row(params![req.capsule_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .or_not_found(&req.capsule_id)?;
 
         let status = parse_status(&status_str);
@@ -770,12 +769,13 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let (status_str, active_attempt, frozen): (String, Option<i64>, bool) = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT status, active_attempt, pending_land_json IS NOT NULL
                  FROM capsule WHERE id = ?1",
-                params![req.capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            )?
+            .query_row(params![req.capsule_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .or_not_found(&req.capsule_id)?;
 
         if frozen {
@@ -1082,7 +1082,8 @@ impl Store {
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
         let tx = self.snapshot_read_tx()?;
         let row: RowCapsule = tx
-            .query_row(RowCapsule::SELECT_BY_ID, params![id], RowCapsule::from_row)
+            .prepare_cached(RowCapsule::SELECT_BY_ID)?
+            .query_row(params![id], RowCapsule::from_row)
             .or_not_found(id)?;
         row.into_capsule(&tx)
     }
@@ -1867,11 +1868,8 @@ fn load_deps_for_mutation(
     capsule_id: &str,
 ) -> Result<Option<Vec<String>>> {
     let (status_str, deps_json): (String, String) = tx
-        .query_row(
-            "SELECT status, depends_on_json FROM capsule WHERE id = ?1",
-            params![capsule_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .prepare_cached("SELECT status, depends_on_json FROM capsule WHERE id = ?1")?
+        .query_row(params![capsule_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .or_not_found(capsule_id)?;
     if parse_status(&status_str).is_terminal() {
         return Ok(None);
