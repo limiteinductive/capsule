@@ -536,4 +536,19 @@ mod tests {
             | LandOutcome::BaseRefMoved) => panic!("expected OtherFailure, got {other:?}"),
         }
     }
+
+    /// Non-branch porcelain destinations must not drive per-ref
+    /// classification. Stale-info on a tag dst whose name matches the witness
+    /// branch must NOT register as a DESIGN §3.1 protection leak; the real
+    /// `refs/heads/main` non-FF line drives the outcome instead.
+    #[test]
+    fn classify_push_only_refs_heads_destinations_drive_outcome() {
+        let stdout = "To /tmp/remote.git\n\
+            !\trefs/heads/x:refs/tags/capsule-witness/foo/a1\t[rejected] (stale info)\n\
+            !\trefs/heads/x:refs/notes/capsule-witness/foo/a1\t[rejected] (stale info)\n\
+            !\tHEAD:refs/heads/main\t[rejected] (fetch first)\n\
+            Done\n";
+        let r = classify_push(stdout, "", false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
 }
