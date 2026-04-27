@@ -342,4 +342,16 @@ mod tests {
         );
         assert_eq!(parse_git_version("nope"), None);
     }
+
+    /// Malformed-version-string corners: prefix matches but the value is
+    /// missing or non-numeric. Each must yield `None` (caller treats it as
+    /// "git version unknown") rather than a partial `Some((major, 0))` that
+    /// would silently bypass version-floor checks.
+    #[test]
+    fn parse_git_version_rejects_malformed() {
+        assert_eq!(parse_git_version("git version "), None);
+        assert_eq!(parse_git_version("git version 2"), None);
+        assert_eq!(parse_git_version("git version a.b.c"), None);
+        assert_eq!(parse_git_version("git version 2.x"), None);
+    }
 }
