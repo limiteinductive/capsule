@@ -333,6 +333,36 @@ mod tests {
         );
     }
 
+    /// `maybe_update_gitignore` prepends a `\n` before writing its rule when
+    /// the existing file has content but no trailing newline — without this
+    /// guard the new entry would concatenate with the last line, producing a
+    /// malformed `existing_rule.capsule/` token that git would silently
+    /// ignore. Pin both branches:
+    /// 1. Existing content ends without `\n` → result has the existing line
+    ///    intact AND `.capsule/` on its own line (i.e. the prepended `\n`
+    ///    landed).
+    /// 2. The total line count goes up by exactly one (no extra blank).
+    #[test]
+    fn init_gitignore_without_trailing_newline_keeps_existing_intact() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let gi = tmp.path().join(".gitignore");
+        fs::write(&gi, "node_modules").unwrap();
+        assert!(!fs::read_to_string(&gi).unwrap().ends_with('\n'));
+
+        let store = tmp.path().join(".capsule");
+        let r = run_at(tmp.path(), store, false).unwrap();
+        assert!(r.gitignore_updated.is_some());
+
+        let contents = fs::read_to_string(&gi).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["node_modules", ".capsule/"],
+            "unexpected .gitignore contents: {contents:?}"
+        );
+    }
+
     #[test]
     fn parse_git_version_samples() {
         assert_eq!(parse_git_version("git version 2.43.0\n"), Some((2, 43)));
