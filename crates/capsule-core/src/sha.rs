@@ -89,11 +89,11 @@ mod tests {
         assert_eq!(validate(&s), Err(ShaError::NonHex(5)));
     }
 
+    /// Length gate runs first: ill-sized inputs surface as `BadLength`
+    /// regardless of per-byte case/hex defects, so callers see one clear
+    /// "wrong shape" error instead of a misleading "non-hex" hint at byte N.
     #[test]
     fn bad_length_outranks_per_byte_defects() {
-        // Callers turn ShaError variants into actionable messages; for
-        // malformed lengths, length is the primary issue regardless of
-        // byte contents.
         assert_eq!(validate("ABCDEF"), Err(ShaError::BadLength(6)));
         assert_eq!(validate("abcg"), Err(ShaError::BadLength(4)));
     }
