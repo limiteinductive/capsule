@@ -3847,6 +3847,33 @@ mod tests {
         assert!(c.depends_on.is_empty());
     }
 
+    /// Terminal capsules short-circuit before dep-target validation. An
+    /// `add_dep` from an abandoned capsule to a missing target is Ok, not
+    /// DepNotFound — the terminal check in `load_deps_for_mutation` runs
+    /// first.
+    #[test]
+    fn add_dep_terminal_outranks_dep_not_found() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        s.claim(claim_req("a", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "a".into(),
+            session_id: "sess1".into(),
+            reason: "r".into(),
+        })
+        .unwrap();
+        let res = s.add_dep(DepRequest {
+            capsule_id: "a".into(),
+            depends_on: "ghost".into(),
+        });
+        assert!(
+            res.is_ok(),
+            "terminal add_dep should no-op before target validation, got {res:?}"
+        );
+        let c = s.get_capsule("a").unwrap();
+        assert!(c.depends_on.is_empty());
+    }
+
     // ---- land() integration tests against a real local bare repo. ----
 
     fn git(cwd: &std::path::Path, args: &[&str]) -> String {
