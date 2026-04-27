@@ -4106,6 +4106,51 @@ mod tests {
         ));
     }
 
+    /// Step 0 deploy-verify gate runs before capsule lookup. Without a recorded
+    /// pass, `land()` must report `DeployVerifyMissing` even for an unknown
+    /// capsule.
+    #[test]
+    fn land_deploy_verify_gate_outranks_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .land(LandRequest {
+                capsule_id: "ghost".into(),
+                session_id: "sess1".into(),
+                lander: "test".into(),
+                remote: "unused".into(),
+                repo_dir: std::env::temp_dir(),
+                skip_deploy_verify_gate: false,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DeployVerifyMissing),
+            "got {err:?}"
+        );
+    }
+
+    /// Symmetric to `land_deploy_verify_gate_outranks_not_found`: a recorded
+    /// pass clears step 0, so `NotFound` resurfaces for an unknown capsule —
+    /// proves the gate is not unconditionally hard-failing `land`.
+    #[test]
+    fn land_deploy_verify_gate_clears_after_recorded_pass() {
+        let mut s = tmp_store();
+        s.record_deploy_verify_pass("hermetic", "main").unwrap();
+        let err = s
+            .land(LandRequest {
+                capsule_id: "ghost".into(),
+                session_id: "sess1".into(),
+                lander: "test".into(),
+                remote: "unused".into(),
+                repo_dir: std::env::temp_dir(),
+                skip_deploy_verify_gate: false,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound(ref id) if id == "ghost"),
+            "got {err:?}"
+        );
+    }
+
     // ---- reconciler / force-unfreeze tests ----
 
     /// Drive the §7.1.2 land-crash decision tree from a test by writing
