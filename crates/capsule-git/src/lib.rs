@@ -473,6 +473,30 @@ mod tests {
         assert_eq!(r, LandOutcome::NoOp);
     }
 
+    /// `classify_failure_from_stderr` is the fallback when stdout has no
+    /// per-ref porcelain line. Pin the stderr-only witness-stale path
+    /// (STALE_INFO → WitnessOidMismatch) and the aggregate updates-rejected
+    /// base-ref path (UPDATES_REJECTED → BaseRefMoved) so future tightening
+    /// to "stdout only" surfaces as a test failure rather than a silent
+    /// classification drop.
+    #[test]
+    fn stderr_only_witness_stale_classifies_witness_oid_mismatch() {
+        let stdout = "To /tmp/remote.git\nDone\n";
+        let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
+                      ! [rejected] witness -> witness (stale info)\n";
+        let r = classify_push(stdout, stderr, false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::WitnessOidMismatch);
+    }
+
+    #[test]
+    fn stderr_only_updates_rejected_classifies_base_ref_moved() {
+        let stdout = "To /tmp/remote.git\nDone\n";
+        let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
+                      hint: Updates were rejected because the remote contains work that ...\n";
+        let r = classify_push(stdout, stderr, false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
     #[test]
     fn other_failure_when_unrecognized() {
         let r = classify_push(
