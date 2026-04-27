@@ -982,32 +982,8 @@ impl Store {
 
         let pending_json = load_pending_land_json(&self.conn, &req.capsule_id)?;
         let Some(snapshot_json) = pending_json else {
-            // Reconciler is a no-op when nothing is frozen (DESIGN §7.1.2 —
-            // reconciler scope is gated on pending_land != null), so no
-            // reconciler_ran event. But if an operator invoked force-unfreeze
-            // on a non-frozen capsule, we still record the operator action
-            // so the audit log captures the attempt.
             if let Some((op, reason)) = operator.as_ref() {
-                let tx = self.conn.transaction()?;
-                // Re-check inside tx: a concurrent lander could have set
-                // pending_land between the outside read and now. If it did,
-                // the snapshot we'd audit (`null`) is stale — return CasLost
-                // and let the operator retry rather than emit a misleading
-                // `not_frozen` audit row.
-                if is_pending_land_set_in_tx(&tx, &req.capsule_id)? {
-                    tx.commit()?;
-                    return Ok(ReconcileOutcome::CasLost);
-                }
-                emit_force_unfreeze_invoked(
-                    &tx,
-                    &now_str,
-                    &req.capsule_id,
-                    op,
-                    reason,
-                    None,
-                    ReconcileOutcome::NotFrozen,
-                )?;
-                tx.commit()?;
+                return self.audit_force_unfreeze_on_unfrozen(&now_str, &req.capsule_id, op, reason);
             }
             return Ok(ReconcileOutcome::NotFrozen);
         };
@@ -1110,6 +1086,40 @@ impl Store {
 
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// `force_unfreeze` invoked on a capsule with no `pending_land`: the
+    /// reconciler itself is a no-op (DESIGN §7.1.2 — reconciler scope is
+    /// gated on `pending_land != null`, so no `reconciler_ran` row), but
+    /// §6 still requires a `force_unfreeze_invoked` audit row whenever
+    /// the operator invokes the escape hatch. Re-check `pending_land`
+    /// inside the tx — a concurrent lander may have set it between the
+    /// outer-tx read and now; if so the `null` snapshot we'd record is
+    /// stale, surface `CasLost` and let the operator retry rather than
+    /// emit a misleading `not_frozen` audit row.
+    fn audit_force_unfreeze_on_unfrozen(
+        &mut self,
+        now_str: &str,
+        capsule_id: &str,
+        op: &str,
+        reason: &str,
+    ) -> Result<ReconcileOutcome> {
+        let tx = self.conn.transaction()?;
+        if is_pending_land_set_in_tx(&tx, capsule_id)? {
+            tx.commit()?;
+            return Ok(ReconcileOutcome::CasLost);
+        }
+        emit_force_unfreeze_invoked(
+            &tx,
+            now_str,
+            capsule_id,
+            op,
+            reason,
+            None,
+            ReconcileOutcome::NotFrozen,
+        )?;
+        tx.commit()?;
+        Ok(ReconcileOutcome::NotFrozen)
     }
 
     pub fn get_capsule(&self, id: &str) -> Result<Capsule> {
