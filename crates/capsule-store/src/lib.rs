@@ -573,11 +573,8 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         let (status_str, active_attempt): (String, Option<i64>) = tx
-            .query_row(
-                "SELECT status, active_attempt FROM capsule WHERE id = ?1",
-                params![capsule_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT status, active_attempt FROM capsule WHERE id = ?1")?
+            .query_row(params![capsule_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .or_not_found(capsule_id)?;
 
         let status = parse_status(&status_str);
@@ -1770,14 +1767,16 @@ fn project_live_lease_for_renewal(
     session_id: &str,
     now: OffsetDateTime,
 ) -> Result<u64> {
-    let (owner, expires_at_str, ttl_sec): (String, String, i64) = tx.query_row(
-        "SELECT json_extract(lease_json, '$.session_id'),
-                json_extract(lease_json, '$.expires_at'),
-                json_extract(lease_json, '$.ttl_sec')
-         FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
-        params![capsule_id, attempt_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let (owner, expires_at_str, ttl_sec): (String, String, i64) = tx
+        .prepare_cached(
+            "SELECT json_extract(lease_json, '$.session_id'),
+                    json_extract(lease_json, '$.expires_at'),
+                    json_extract(lease_json, '$.ttl_sec')
+             FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+        )?
+        .query_row(params![capsule_id, attempt_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
     if owner != session_id {
         return Err(StoreError::CrossSession);
     }
