@@ -278,30 +278,39 @@ fn git_branch_exists(branch: &str) -> Result<bool> {
 
 /// `git worktree list --porcelain` — return the worktree path registered for
 /// `branch`, if any.
-///
-/// Tracks `current_path` as `&str` borrowed from `out` so only the matched
-/// entry pays a `String` allocation. The prior shape pushed an owned `String`
-/// for every `worktree ` line, even though every record except at most one is
-/// discarded on the way to the match.
-///
-/// Porcelain record format: blank lines separate records, so the empty-line
-/// arm clears `current_path` to avoid carrying it into the next record.
 fn git_worktree_list_for_branch(branch: &str) -> Result<Option<String>> {
     let out = run_git_capture(&["worktree", "list", "--porcelain"])
         .context("git worktree list --porcelain")?;
+    Ok(parse_worktree_list_for_branch(&out, branch).map(str::to_string))
+}
+
+/// Pure parser for `git worktree list --porcelain` output.
+///
+/// Tracks `current_path` as `&str` borrowed from `porcelain` so only the
+/// matched entry pays a `String` allocation in the caller. The prior shape
+/// pushed an owned `String` for every `worktree ` line, even though every
+/// record except at most one is discarded on the way to the match.
+///
+/// Porcelain record format: each record begins with `worktree <path>` and
+/// ends with a blank line; the `branch refs/heads/<name>` line, when
+/// present, follows `worktree`. Detached HEADs emit `detached` instead of
+/// `branch`. The empty-line arm clears `current_path` to avoid carrying
+/// a stale path into the next record (matters when a malformed `branch`
+/// line appears outside any record).
+fn parse_worktree_list_for_branch<'a>(porcelain: &'a str, branch: &str) -> Option<&'a str> {
     let mut current_path: Option<&str> = None;
-    for line in out.lines() {
+    for line in porcelain.lines() {
         if let Some(rest) = line.strip_prefix("worktree ") {
             current_path = Some(rest);
         } else if let Some(name) = line.strip_prefix("branch refs/heads/") {
             if name == branch {
-                return Ok(current_path.map(str::to_string));
+                return current_path;
             }
         } else if line.is_empty() {
             current_path = None;
         }
     }
-    Ok(None)
+    None
 }
 
 fn git_worktree_add_new_branch(path: &Path, branch: &str, base_sha: &str) -> Result<()> {
@@ -460,5 +469,106 @@ mod tests {
         fs::create_dir_all(cap.join("worktrees")).unwrap();
         let err = validate_worktree_dir_override(&traversal, &main, &cap).unwrap_err();
         assert!(err.to_string().contains("inside the capsule store"));
+    }
+
+    /// Empirical fixture: three records (main + one branch worktree + one
+    /// detached). Pinned shape: blank-line separated, `worktree` line first,
+    /// `branch refs/heads/<name>` line within the record. The detached
+    /// record emits `detached` instead of `branch`.
+    const PORCELAIN: &str = "\
+worktree /repo/main
+HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+branch refs/heads/main
+
+worktree /repo/wt-feature
+HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+branch refs/heads/feature
+
+worktree /repo/wt-detached
+HEAD cccccccccccccccccccccccccccccccccccccccc
+detached
+
+";
+
+    #[test]
+    fn parse_worktree_list_returns_path_for_match() {
+        assert_eq!(
+            parse_worktree_list_for_branch(PORCELAIN, "feature"),
+            Some("/repo/wt-feature")
+        );
+    }
+
+    #[test]
+    fn parse_worktree_list_returns_path_for_first_record() {
+        assert_eq!(
+            parse_worktree_list_for_branch(PORCELAIN, "main"),
+            Some("/repo/main")
+        );
+    }
+
+    #[test]
+    fn parse_worktree_list_unknown_branch_is_none() {
+        assert_eq!(
+            parse_worktree_list_for_branch(PORCELAIN, "nope"),
+            None
+        );
+    }
+
+    /// Detached records have no `branch` line, so they must never match,
+    /// regardless of how the caller spells the query.
+    #[test]
+    fn parse_worktree_list_detached_record_never_matches() {
+        assert_eq!(
+            parse_worktree_list_for_branch(PORCELAIN, "detached"),
+            None
+        );
+    }
+
+    /// Stray `branch` line outside any record (regression guard for the
+    /// empty-line reset of `current_path`): without the reset, the orphan
+    /// branch would inherit the previous record's path and the function
+    /// would return `Some("/repo/main")` — the caller would then treat
+    /// `/repo/main` as the registered worktree for `orphan`, which is a
+    /// real correctness bug. The reset zeros `current_path` at the blank
+    /// line, so the orphan resolves to `None` instead.
+    #[test]
+    fn parse_worktree_list_orphan_branch_line_yields_none_path() {
+        let stray = "\
+worktree /repo/main
+branch refs/heads/main
+
+branch refs/heads/orphan
+";
+        assert_eq!(parse_worktree_list_for_branch(stray, "orphan"), None);
+    }
+
+    /// Records may carry extra porcelain keys (`locked`, `prunable`, `bare`)
+    /// alongside `worktree` / `branch`. The parser ignores unknown lines
+    /// other than the empty-line record separator, so extra keys must not
+    /// disrupt the match. Pinned so a future shape change to the matcher
+    /// (e.g. switching to a strict line-by-line state machine) doesn't
+    /// silently regress on real-world porcelain.
+    #[test]
+    fn parse_worktree_list_extra_keys_in_record_ignored() {
+        let porcelain = "\
+worktree /repo/wt-locked
+HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+branch refs/heads/feature
+locked
+prunable
+
+";
+        assert_eq!(
+            parse_worktree_list_for_branch(porcelain, "feature"),
+            Some("/repo/wt-locked")
+        );
+    }
+
+    /// Empty input → `None` (consistent with `lines()` over an empty string
+    /// yielding zero items). Pinned because `git worktree list --porcelain`
+    /// can in principle emit an empty body.
+    #[test]
+    fn parse_worktree_list_empty_input_is_none() {
+        assert_eq!(parse_worktree_list_for_branch("", "main"), None);
     }
 }
