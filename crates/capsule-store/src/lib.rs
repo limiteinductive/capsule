@@ -2989,13 +2989,15 @@ mod tests {
         assert!(matches!(err, StoreError::ScopeConflict(_, _)));
     }
 
+    /// `heartbeat` extends the lease by re-stamping `now + ttl_sec` with the
+    /// fixed-at-claim TTL. The 10ms sleep is required for the strict-`>`
+    /// assertion: claim and heartbeat both compute `now + ttl`, so without a
+    /// gap they could land on the same instant.
     #[test]
     fn heartbeat_advances_lease() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let a1 = s.claim(claim_req("x", "sess1")).unwrap();
-        // Brief sleep so the heartbeat-derived expires is strictly later than
-        // the claim-derived one (both are now + ttl, ttl is fixed at claim).
         std::thread::sleep(std::time::Duration::from_millis(10));
         let ack = s.heartbeat("x", "sess1").unwrap();
         assert!(ack.lease_expires_at > a1.lease.expires_at);
