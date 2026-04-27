@@ -3525,7 +3525,6 @@ mod tests {
             capsule_core::AttemptOutcome::Abandoned
         );
 
-        // Overlapping capsule can now claim.
         make_capsule(&mut s, "y", "src/api/users.ts");
         s.claim(claim_req("y", "sess2")).unwrap();
     }
