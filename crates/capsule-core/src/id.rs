@@ -143,14 +143,14 @@ mod tests {
         assert_eq!(validate("a/..b"), Err(IdError::InvalidChar(1)));
     }
 
-    /// Pin cross-branch error precedence for ambiguous ids so refactors
-    /// don't silently change which `IdError` callers see: EdgeDot beats
-    /// LockSuffix (`.lock` has a leading `.` and matches the `.lock`
-    /// suffix check), and LockSuffix beats DoubleDot (`a..lock` matches
-    /// the `.lock` suffix check and also contains `..`).
+    /// Pins early-gate precedence: `.lock` is checked before byte
+    /// validation, so trailing-dot, double-dot, and invalid-byte ids
+    /// that still end in `.lock` surface per the gate order
+    /// (EdgeDot → LockSuffix → loop).
     #[test]
-    fn precedence_edgedot_then_locksuffix_then_doubledot() {
+    fn precedence_lock_suffix_beats_later_checks() {
         assert_eq!(validate(".lock"), Err(IdError::EdgeDot));
         assert_eq!(validate("a..lock"), Err(IdError::LockSuffix));
+        assert_eq!(validate("a$.lock"), Err(IdError::LockSuffix));
     }
 }
