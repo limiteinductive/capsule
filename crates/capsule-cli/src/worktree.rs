@@ -22,6 +22,15 @@ pub struct IsolateState {
     _runtime_lock: File,
 }
 
+/// Materialize (or reuse) a worktree for `attempt_branch` and lock it for the
+/// child's lifetime.
+///
+/// The bare-repo check precedes `git rev-parse --show-toplevel` because the
+/// latter errors out in bare repos with a less actionable message.
+///
+/// Lock-handoff order matters: the runtime lock is acquired *before* the
+/// setup lock is released, so a second `capsule work` invocation can never
+/// observe the worktree unlocked between the two.
 pub fn setup(
     capsule_dir: &Path,
     capsule_id: &str,
@@ -33,8 +42,6 @@ pub fn setup(
     let canonical_capsule_dir = fs::canonicalize(capsule_dir)
         .with_context(|| format!("canonicalize capsule dir {}", capsule_dir.display()))?;
 
-    // Bare-repo check before `git rev-parse --show-toplevel`: the latter errors
-    // out in bare repos with a less actionable message.
     if git_is_bare()? {
         bail!(
             "--isolate=worktree requires a working repository; this is a bare repo. \
@@ -107,8 +114,6 @@ pub fn setup(
         }
     }
 
-    // Runtime lock acquired before the setup lock is released, so a second
-    // `capsule work` invocation can never observe the worktree unlocked.
     let runtime_lock_path =
         locks_dir.join(format!("worktree-run-{capsule_id}-a{attempt_num}.lock"));
     let runtime_lock = acquire_runtime_lock(&runtime_lock_path, &worktree_path)?;
@@ -121,15 +126,16 @@ pub fn setup(
     })
 }
 
+/// Validate a `--worktree-dir` override. Rejects relative paths up-front:
+/// `fs::canonicalize` would resolve them against the process cwd, which is
+/// unpredictable when `capsule work` is invoked by an agent from a variable
+/// working directory — silently landing the worktree in a surprising location.
+/// Force the caller to be explicit.
 fn validate_worktree_dir_override(
     p: &Path,
     main_root: &Path,
     capsule_dir: &Path,
 ) -> Result<PathBuf> {
-    // Reject relative paths up-front. `fs::canonicalize` would resolve them
-    // against the process cwd, which is unpredictable when `capsule work` is
-    // invoked by an agent from a variable working directory — silently landing
-    // the worktree in a surprising location. Force the caller to be explicit.
     if !p.is_absolute() {
         bail!(
             "--worktree-dir must be an absolute path (got {}); relative paths would resolve \
