@@ -497,6 +497,29 @@ mod tests {
         assert_eq!(r, LandOutcome::BaseRefMoved);
     }
 
+    /// Direct tests for `parse_ref_line`. Porcelain wrapper lines and blanks
+    /// are not per-ref records, so `classify_push`'s `filter_map(parse_ref_line)`
+    /// must skip them instead of treating them as candidate ref updates.
+    #[test]
+    fn parse_ref_line_skips_headers_and_blanks() {
+        assert!(parse_ref_line("").is_none());
+        assert!(parse_ref_line("To /tmp/remote.git").is_none());
+        assert!(parse_ref_line("Done").is_none());
+    }
+
+    /// `splitn(3, '\t')` keeps the third field optional: a porcelain line
+    /// without a trailing summary tab still parses, with `summary == ""`.
+    /// Pinned so a refactor to a stricter three-field requirement doesn't
+    /// silently drop legitimate per-ref records.
+    #[test]
+    fn parse_ref_line_accepts_missing_summary_field() {
+        let line = "*\tHEAD:refs/heads/main";
+        let r = parse_ref_line(line).expect("should parse");
+        assert_eq!(r.flag, '*');
+        assert_eq!(r.dst, "refs/heads/main");
+        assert_eq!(r.summary, "");
+    }
+
     #[test]
     fn other_failure_when_unrecognized() {
         let r = classify_push(
