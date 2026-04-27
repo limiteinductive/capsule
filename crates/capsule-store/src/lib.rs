@@ -4509,7 +4509,11 @@ mod tests {
     /// Witness exists at some other sha — protection leak / corruption.
     /// The setup writes a `noise.txt` commit and pushes its sha as the
     /// witness ref, simulating divergence between PendingLand's
-    /// `verified_sha` and the actual witness tip.
+    /// `verified_sha` and the actual witness tip. Pins the §6
+    /// `operational_incident` payload as the wrapper shape
+    /// `{kind, detail: {witness_branch, expected_sha, found_sha, by}}` —
+    /// pre-fix code emitted those keys flat at the top level, which
+    /// would shadow `kind`/`detail` consumers.
     #[test]
     fn reconcile_abandoned_when_witness_at_different_sha() {
         let id = "rec3";
@@ -4545,9 +4549,6 @@ mod tests {
         assert_eq!(c.status, Status::Abandoned);
         assert!(c.pending_land.is_none());
 
-        // DESIGN.md §6 operational_incident payload: {kind, detail}.
-        // Pin the wrapper shape — pre-fix code emitted flat
-        // {kind, witness_branch, expected_sha, found_sha, by}.
         let v = read_event_payload(&s, id, "operational_incident");
         assert_eq!(v["kind"], "witness_oid_mismatch");
         let detail = v.get("detail").expect("missing detail wrapper");
@@ -4555,9 +4556,14 @@ mod tests {
         assert!(detail.get("witness_branch").is_some());
         assert!(detail.get("expected_sha").is_some());
         assert_eq!(detail["found_sha"], other_sha);
-        // Old flat keys must not return at top level.
-        assert!(v.get("witness_branch").is_none());
-        assert!(v.get("found_sha").is_none());
+        assert!(
+            v.get("witness_branch").is_none(),
+            "old flat key must not regress to top level"
+        );
+        assert!(
+            v.get("found_sha").is_none(),
+            "old flat key must not regress to top level"
+        );
     }
 
     /// Operator invokes force-unfreeze on a capsule with no pending_land.
