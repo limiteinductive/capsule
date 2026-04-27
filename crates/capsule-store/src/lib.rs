@@ -3265,9 +3265,7 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
-        // Capture `$.expires_at` exactly as stored, before reclaim closes the
-        // attempt and the row is gone from the live join.
-        let stored_expires_at: String = s
+        let expires_at_before_reclaim: String = s
             .conn
             .query_row(
                 "SELECT json_extract(lease_json, '$.expires_at')
@@ -3285,7 +3283,7 @@ mod tests {
             .get("prior_lease_expires_at")
             .and_then(|v| v.as_str())
             .expect("prior_lease_expires_at must be a string");
-        assert_eq!(payload_str, stored_expires_at);
+        assert_eq!(payload_str, expires_at_before_reclaim);
     }
 
     #[test]
