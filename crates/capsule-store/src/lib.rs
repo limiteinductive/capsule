@@ -1544,10 +1544,12 @@ fn emit_operational_incident(
 /// from `json_extract`, same canonical form `format_iso8601` would produce).
 ///
 /// The candidate query projects only `$.expires_at` from `lease_json` — full
-/// lease blob stays inside SQLite. The expiry compare still happens in Rust
-/// via `parse_iso8601`, not as a SQL lex-compare on the stored string,
-/// because `Iso8601::DEFAULT` uses `SubsecondDigits::OneOrMore` and may
-/// elide trailing zeros.
+/// lease blob stays inside SQLite. The expiry compare happens in Rust via
+/// `parse_iso8601`, not as a SQL lex-compare on the stored string: the
+/// json_extract'd string is `time::serde::iso8601`'s `+0YYYYY` form while
+/// `now_str` is `format_iso8601`'s 4-digit form, and `+` (0x2B) lex-sorts
+/// before any digit, so a live future-expiry lease would lex-compare older
+/// than `now_str` and be reclaimed prematurely.
 fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) -> Result<()> {
     let now_str = format_iso8601(now)?;
 
@@ -4335,6 +4337,24 @@ mod tests {
         let six_digit = "+001970-01-01T00:00:00.000000000Z";
         assert_eq!(parse_iso8601(four_digit), OffsetDateTime::UNIX_EPOCH);
         assert_eq!(parse_iso8601(six_digit), OffsetDateTime::UNIX_EPOCH);
+    }
+
+    /// Pin why `reclaim_expired_in_tx` must compare parsed timestamps, not
+    /// strings. `format_iso8601` emits 4-digit years, while
+    /// `time::serde::iso8601` emits `+0YYYYY` years; `+` sorts before digits,
+    /// so a live future lease can lex-compare as older than `now_str`.
+    #[test]
+    fn parse_iso8601_year_padding_inverts_lex_compare() {
+        let now_4digit = "2024-12-31T00:00:00.000000000Z";
+        let future_6digit = "+002025-01-01T00:00:00.000000000Z";
+        assert!(
+            future_6digit < now_4digit,
+            "serde future timestamp sorts before 4-digit now"
+        );
+        assert!(
+            parse_iso8601(future_6digit) > parse_iso8601(now_4digit),
+            "parsed future timestamp is after now"
+        );
     }
 
     /// Pin the `parse_wire` panic message: kind label is per-call-site
