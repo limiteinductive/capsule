@@ -3835,6 +3835,42 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound(_)));
     }
 
+    /// Empty amend still validates capsule state before no-oping.
+    /// Pins `NotAmendable` precedence for non-Planned capsules.
+    #[test]
+    fn amend_noop_on_non_planned_returns_not_amendable() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let err = s
+            .amend(AmendRequest {
+                capsule_id: "x".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotAmendable(ref id, "active") if id == "x"),
+            "got {err:?}"
+        );
+    }
+
+    /// Symmetric pin: empty amend on an unknown capsule still surfaces
+    /// `NotFound`, never silent success.
+    #[test]
+    fn amend_noop_unknown_capsule_returns_not_found() {
+        let mut s = tmp_store();
+        let err = s
+            .amend(AmendRequest {
+                capsule_id: "ghost".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound(ref id) if id == "ghost"),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn add_dep_records_edge() {
         let mut s = tmp_store();
