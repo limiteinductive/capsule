@@ -1624,11 +1624,11 @@ fn find_scope_conflict(
 /// Monotonically increasing per capsule; gaps are allowed (an aborted claim
 /// leaves a row that future claims do not reuse).
 fn next_attempt_id(tx: &rusqlite::Transaction<'_>, capsule_id: &str) -> Result<i64> {
-    let next = tx.query_row(
-        "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
-        params![capsule_id],
-        |r| r.get(0),
-    )?;
+    let next = tx
+        .prepare_cached(
+            "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
+        )?
+        .query_row(params![capsule_id], |r| r.get(0))?;
     Ok(next)
 }
 
@@ -1703,13 +1703,14 @@ fn load_land_preconditions(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
 ) -> Result<(String, Option<i64>, bool, Option<String>)> {
-    tx.query_row(
+    tx.prepare_cached(
         "SELECT status, active_attempt, pending_land_json IS NOT NULL,
                 json_extract(verification_json, '$.verified_sha')
          FROM capsule WHERE id = ?1",
-        params![capsule_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )
+    )?
+    .query_row(params![capsule_id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
     .or_not_found(capsule_id)
 }
 
@@ -1797,12 +1798,9 @@ fn load_pending_land_json(
     conn: &rusqlite::Connection,
     capsule_id: &str,
 ) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT pending_land_json FROM capsule WHERE id = ?1",
-        params![capsule_id],
-        |r| r.get(0),
-    )
-    .or_not_found(capsule_id)
+    conn.prepare_cached("SELECT pending_land_json FROM capsule WHERE id = ?1")?
+        .query_row(params![capsule_id], |r| r.get(0))
+        .or_not_found(capsule_id)
 }
 
 /// CAS check on `pending_land_json`: true iff the in-tx column still equals
@@ -1822,12 +1820,11 @@ fn pending_land_snapshot_unchanged(
     capsule_id: &str,
     snapshot_json: &str,
 ) -> Result<bool> {
-    tx.query_row(
+    tx.prepare_cached(
         "SELECT pending_land_json IS NOT NULL AND pending_land_json = ?2
          FROM capsule WHERE id = ?1",
-        params![capsule_id, snapshot_json],
-        |r| r.get(0),
-    )
+    )?
+    .query_row(params![capsule_id, snapshot_json], |r| r.get(0))
     .or_not_found(capsule_id)
 }
 
@@ -1840,12 +1837,9 @@ fn is_pending_land_set_in_tx(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
 ) -> Result<bool> {
-    tx.query_row(
-        "SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1",
-        params![capsule_id],
-        |r| r.get(0),
-    )
-    .or_not_found(capsule_id)
+    tx.prepare_cached("SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1")?
+        .query_row(params![capsule_id], |r| r.get(0))
+        .or_not_found(capsule_id)
 }
 
 /// Reject any state change that would race with an in-flight land. Read +
@@ -2291,11 +2285,9 @@ fn decode_opt_json<T: serde::de::DeserializeOwned>(s: Option<String>) -> Result<
 /// `.optional()? .unwrap_or(false)` indirection the callsite-once row-presence
 /// shape needed disappears — one `query_row` returning `bool` suffices.
 fn capsule_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool> {
-    Ok(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM capsule WHERE id = ?1)",
-        params![id],
-        |r| r.get(0),
-    )?)
+    Ok(tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM capsule WHERE id = ?1)")?
+        .query_row(params![id], |r| r.get(0))?)
 }
 
 /// Persist a dependency-edge change: write the new `depends_on_json` and
