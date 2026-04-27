@@ -4261,6 +4261,31 @@ mod tests {
         );
     }
 
+    /// `claim` rejects frozen capsules with `PendingLandFrozen`, not
+    /// `WrongStatus(Accepted)`. Frozen capsules are mid-land; callers use
+    /// this error to trigger reconciliation instead of normal status handling.
+    #[test]
+    fn claim_frozen_outranks_wrong_status() {
+        let id = "frzcl";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        // Both gates would fire post-attest+freeze: status is Accepted (would
+        // emit WrongStatus) and pending_land is set (emits PendingLandFrozen).
+        // Pin that the freeze gate wins.
+        assert_eq!(s.get_capsule(id).unwrap().status, Status::Accepted);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        let err = s.claim(claim_req(id, "sess2")).unwrap_err();
+        assert!(
+            matches!(err, StoreError::PendingLandFrozen(ref cid) if cid == id),
+            "got {err:?}"
+        );
+    }
+
     /// Auto-reclaim must skip frozen capsules even after lease expiry.
     /// The land step-4 reconciler is the only path allowed to resolve
     /// `pending_land_json`; this pins the SQL freeze guard.
