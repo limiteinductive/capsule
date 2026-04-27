@@ -954,3 +954,20 @@ impl serde::Serialize for CapsuleSummaries<'_> {
         seq.end()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ScopeList` is interpolated between literal `[` and `]` in
+    /// `print_capsule_summary_line`. Pin separator (multi), no-comma at
+    /// length 1, and `[]` (not `[,]`) at length 0.
+    #[test]
+    fn scope_list_display_comma_joined_no_trailing() {
+        let p1 = CanonicalPath::new("src/foo").unwrap();
+        let p2 = CanonicalPath::new("docs").unwrap();
+        assert_eq!(format!("{}", ScopeList(&[])), "");
+        assert_eq!(format!("{}", ScopeList(std::slice::from_ref(&p1))), "src/foo");
+        assert_eq!(format!("{}", ScopeList(&[p1, p2])), "src/foo,docs");
+    }
+}
