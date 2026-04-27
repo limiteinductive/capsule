@@ -3043,6 +3043,26 @@ mod tests {
         );
     }
 
+    /// Only Landed deps are met. Accepted deps are not on `base_ref` yet
+    /// (DESIGN §7.1.3), so claim must still report them as unmet.
+    #[test]
+    fn claim_unmet_deps_includes_accepted_dep() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "dep", "src/dep");
+        s.claim(claim_req("dep", "sess1")).unwrap();
+        attest_pass(&mut s, "dep", FAKE_SHA);
+
+        let mut child = new_capsule_args("child", "src/child");
+        child.depends_on = vec!["dep".into()];
+        s.create_capsule(child).unwrap();
+
+        let err = s.claim(claim_req("child", "sess2")).unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnmetDeps(_, ref deps) if deps.as_slice() == ["dep"]),
+            "got {err:?}"
+        );
+    }
+
     /// `heartbeat` extends the lease by re-stamping `now + ttl_sec` with the
     /// fixed-at-claim TTL. The 10ms sleep is required for the strict-`>`
     /// assertion: claim and heartbeat both compute `now + ttl`, so without a
