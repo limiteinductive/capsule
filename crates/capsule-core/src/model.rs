@@ -749,6 +749,29 @@ mod tests {
         assert_eq!(landing.landed_by, "reconciler");
     }
 
+    /// `advanced_base_ref` is the caller's post-push observation, not derived
+    /// from `verified_sha != prior_base_sha`. Pins the case missed by
+    /// `_carries_fields_and_drops_lander`, where distinct SHAs plus
+    /// `advanced=true` would still pass an implementation that inferred
+    /// the flag.
+    #[test]
+    fn pending_land_into_landing_honors_advanced_arg_not_field_diff() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pending = PendingLand {
+            at: now,
+            attempt_id: 1,
+            verified_sha: "v".repeat(40),
+            prior_base_sha: "p".repeat(40),
+            witness_branch: "w".into(),
+            lander: "l".into(),
+        };
+        let landing = pending.into_landing(now, false, "r".into());
+        assert!(
+            !landing.advanced_base_ref,
+            "advanced_base_ref must come from the arg, not from verified != prior",
+        );
+    }
+
     /// `Attempt.tip_sha` (None until first push) and `closed_at` (None for
     /// in-flight) are routinely None at every `--json` render. Pin the
     /// shape: `skip_serializing_if` omits the keys for None (agent output
