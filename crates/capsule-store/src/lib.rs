@@ -3025,6 +3025,24 @@ mod tests {
         );
     }
 
+    /// Pins error precedence: `WrongStatus` outranks `UnmetDeps` for claim.
+    #[test]
+    fn claim_wrong_status_outranks_unmet_deps() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "child", "src/api");
+        s.claim(claim_req("child", "sess1")).unwrap();
+        make_capsule(&mut s, "dep", "src/dep");
+        s.add_dep(dep_req("child", "dep")).unwrap();
+        let err = s.claim(claim_req("child", "sess2")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::WrongStatus { op: "claim", current_status: "active", .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
     /// `heartbeat` extends the lease by re-stamping `now + ttl_sec` with the
     /// fixed-at-claim TTL. The 10ms sleep is required for the strict-`>`
     /// assertion: claim and heartbeat both compute `now + ttl`, so without a
