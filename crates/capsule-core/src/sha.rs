@@ -88,4 +88,13 @@ mod tests {
         s.replace_range(5..6, "g");
         assert_eq!(validate(&s), Err(ShaError::NonHex(5)));
     }
+
+    #[test]
+    fn bad_length_outranks_per_byte_defects() {
+        // Callers turn ShaError variants into actionable messages; for
+        // malformed lengths, length is the primary issue regardless of
+        // byte contents.
+        assert_eq!(validate("ABCDEF"), Err(ShaError::BadLength(6)));
+        assert_eq!(validate("abcg"), Err(ShaError::BadLength(4)));
+    }
 }
