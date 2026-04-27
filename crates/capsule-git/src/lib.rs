@@ -420,6 +420,30 @@ mod tests {
         );
     }
 
+    /// Initial-deploy path: the project is brand-new on the remote, so both
+    /// `base_ref` and the witness ref are created by this push (porcelain
+    /// flag `*` on both lines). Pinned to fill the (true, true) corner of
+    /// `Advanced { base_ref_created, witness_created }` — the existing
+    /// `classifies_advanced` only covers (false, true).
+    #[test]
+    fn classifies_advanced_both_refs_created() {
+        // Source side is the verified_sha (matches `land_push`'s actual
+        // `<sha>:refs/heads/...` refspec); `parse_ref_line` ignores it but
+        // pinning the production shape keeps the fixture honest.
+        let stdout = "To /tmp/remote.git\n\
+            *\t0123456789abcdef0123456789abcdef01234567:refs/heads/main\t[new branch]\n\
+            *\t0123456789abcdef0123456789abcdef01234567:refs/heads/capsule-witness/foo/a1\t[new branch]\n\
+            Done\n";
+        let r = classify_push(stdout, "", true, 0, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(
+            r,
+            LandOutcome::Advanced {
+                base_ref_created: true,
+                witness_created: true,
+            }
+        );
+    }
+
     #[test]
     fn classifies_noop() {
         let r = classify_push(NOOP_STDOUT, "", true, 0, "main", "capsule-witness/foo/a1").unwrap();
