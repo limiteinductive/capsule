@@ -2996,6 +2996,25 @@ mod tests {
         assert!(matches!(err, StoreError::ScopeConflict(_, _)));
     }
 
+    /// Pins error precedence: unmet deps are reported before scope conflicts,
+    /// even when the capsule also overlaps an in-flight sibling.
+    #[test]
+    fn claim_unmet_deps_outranks_scope_conflict() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "sibling", "src/api");
+        s.claim(claim_req("sibling", "sess1")).unwrap();
+
+        let mut child = new_capsule_args("child", "src/api/sub");
+        child.depends_on = vec!["ghost".into()];
+        s.create_capsule(child).unwrap();
+
+        let err = s.claim(claim_req("child", "sess2")).unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnmetDeps(_, ref deps) if deps == &vec!["ghost".to_string()]),
+            "got {err:?}"
+        );
+    }
+
     /// `heartbeat` extends the lease by re-stamping `now + ttl_sec` with the
     /// fixed-at-claim TTL. The 10ms sleep is required for the strict-`>`
     /// assertion: claim and heartbeat both compute `now + ttl`, so without a
