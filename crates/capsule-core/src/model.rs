@@ -613,5 +613,36 @@ mod tests {
         let cap = synthetic_capsule(Some(99), vec![synthetic_attempt(1)]);
         assert!(cap.into_active_attempt().is_none());
     }
+
+    /// `PendingLand::into_landing` is the §7.1.2 step-4 promotion: it
+    /// moves verified_sha / prior_base_sha / attempt_id / witness_branch
+    /// into Landing, takes `at` / `advanced_base_ref` / `landed_by` as
+    /// arguments, and drops `self.lander` (intentional — the reconciler
+    /// or operator on `force_unfreeze` records itself as `landed_by`,
+    /// not the original lander). Pin the move-and-drop contract so a
+    /// future re-add of `lander` to Landing is a deliberate change.
+    #[test]
+    fn pending_land_into_landing_carries_fields_and_drops_lander() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let verified = "v".repeat(40);
+        let prior = "p".repeat(40);
+        let pending = PendingLand {
+            at: now,
+            attempt_id: 7,
+            verified_sha: verified.clone(),
+            prior_base_sha: prior.clone(),
+            witness_branch: "capsule-witness/foo/a7".into(),
+            lander: "worker-A".into(),
+        };
+        let land_at = now + time::Duration::seconds(5);
+        let landing = pending.into_landing(land_at, true, "reconciler".into());
+        assert_eq!(landing.at, land_at);
+        assert_eq!(landing.landed_sha, verified);
+        assert_eq!(landing.prior_base_sha, prior);
+        assert_eq!(landing.attempt_id, 7);
+        assert_eq!(landing.witness_branch, "capsule-witness/foo/a7");
+        assert!(landing.advanced_base_ref);
+        assert_eq!(landing.landed_by, "reconciler");
+    }
 }
 
