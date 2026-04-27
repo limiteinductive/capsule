@@ -283,6 +283,9 @@ fn git_branch_exists(branch: &str) -> Result<bool> {
 /// entry pays a `String` allocation. The prior shape pushed an owned `String`
 /// for every `worktree ` line, even though every record except at most one is
 /// discarded on the way to the match.
+///
+/// Porcelain record format: blank lines separate records, so the empty-line
+/// arm clears `current_path` to avoid carrying it into the next record.
 fn git_worktree_list_for_branch(branch: &str) -> Result<Option<String>> {
     let out = run_git_capture(&["worktree", "list", "--porcelain"])
         .context("git worktree list --porcelain")?;
@@ -295,7 +298,6 @@ fn git_worktree_list_for_branch(branch: &str) -> Result<Option<String>> {
                 return Ok(current_path.map(str::to_string));
             }
         } else if line.is_empty() {
-            // Blank lines separate porcelain records; don't carry a path into the next one.
             current_path = None;
         }
     }

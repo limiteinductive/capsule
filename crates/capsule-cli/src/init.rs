@@ -206,8 +206,8 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // `detect_worktree` reads process cwd; these tests mutate it. Serialize so
-    // `cargo test` with the default multi-thread runner doesn't race.
+    /// `detect_worktree` reads process cwd; these tests mutate it. Serialize
+    /// so `cargo test` with the default multi-thread runner doesn't race.
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn git_init(dir: &Path) {
@@ -228,16 +228,17 @@ mod tests {
         res
     }
 
+    /// Pin three shapes:
+    /// - Empty path = worktree root → `None` (refuse; would shadow whole repo).
+    /// - Single component → trailing `/` only.
+    /// - Nested → `/`-separated, single trailing `/`.
     #[test]
     fn format_gitignore_dir_pattern_shape() {
-        // Empty path = worktree root: refuse (would shadow whole repo).
         assert_eq!(format_gitignore_dir_pattern(Path::new("")), None);
-        // Single component: trailing `/` only.
         assert_eq!(
             format_gitignore_dir_pattern(Path::new(".capsule")).as_deref(),
             Some(".capsule/"),
         );
-        // Nested: `/`-separated, single trailing `/`.
         assert_eq!(
             format_gitignore_dir_pattern(Path::new("var/cap")).as_deref(),
             Some("var/cap/"),
