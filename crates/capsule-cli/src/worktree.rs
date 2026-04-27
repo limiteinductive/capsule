@@ -616,4 +616,23 @@ prunable
     fn parse_worktree_list_empty_input_is_none() {
         assert_eq!(parse_worktree_list_for_branch("", "main"), None);
     }
+
+    /// Branch-name match is `==`, not a prefix: `capsules/<id>/a1` must
+    /// not match `branch refs/heads/capsules/<id>/a10`.
+    #[test]
+    fn parse_worktree_list_branch_match_does_not_prefix_match() {
+        let porcelain = "\
+worktree /repo/wt-a10
+branch refs/heads/capsules/abc/a10
+
+";
+        assert_eq!(
+            parse_worktree_list_for_branch(porcelain, "capsules/abc/a10"),
+            Some("/repo/wt-a10")
+        );
+        assert_eq!(
+            parse_worktree_list_for_branch(porcelain, "capsules/abc/a1"),
+            None
+        );
+    }
 }
