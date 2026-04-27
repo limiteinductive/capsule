@@ -21,10 +21,7 @@ pub type Result<T> = std::result::Result<T, GitError>;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
-// Compile-time pin: ZERO_OID conforms to `sha::validate` (40 lowercase hex).
-// The runtime test elsewhere only checked `len == 40`; this catches a typo
-// (e.g. an `O` in place of `0`) at build time instead.
-const _: () = match capsule_core::sha::validate(ZERO_OID) {
+const _ZERO_OID_SATISFIES_SHA_VALIDATE: () = match capsule_core::sha::validate(ZERO_OID) {
     Ok(()) => (),
     Err(_) => panic!("ZERO_OID does not satisfy sha::validate"),
 };
