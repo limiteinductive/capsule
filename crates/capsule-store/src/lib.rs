@@ -3100,32 +3100,52 @@ mod tests {
         );
     }
 
+    fn claim_with_ttl(s: &mut Store, capsule_id: &str, ttl_sec: u64) -> Result<()> {
+        let mut req = claim_req(capsule_id, "sess1");
+        req.lease_ttl_sec = ttl_sec;
+        s.claim(req).map(|_| ())
+    }
+
+    /// Pre-fix, `req.lease_ttl_sec as i64` wrapped for ttl > i64::MAX,
+    /// producing a negative `time::Duration` → expires_at < now → lease
+    /// born already-expired. Must surface as a clean error.
     #[test]
-    fn claim_rejects_out_of_range_lease_ttl() {
-        // Pre-fix, `req.lease_ttl_sec as i64` wrapped for ttl > i64::MAX,
-        // producing a negative time::Duration → expires_at < now → lease
-        // born already-expired. Must surface as a clean error.
+    fn claim_rejects_u64_max_lease_ttl() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
-        let mut req = claim_req("x", "sess1");
-        req.lease_ttl_sec = u64::MAX;
-        match s.claim(req) {
+        match claim_with_ttl(&mut s, "x", u64::MAX) {
             Err(StoreError::InvalidLeaseTtl(t)) => assert_eq!(t, u64::MAX),
             other => panic!("expected InvalidLeaseTtl, got {other:?}"),
         }
-        // Just past i64::MAX — still rejected.
-        let mut req = claim_req("x", "sess1");
-        req.lease_ttl_sec = (i64::MAX as u64) + 1;
-        assert!(matches!(s.claim(req), Err(StoreError::InvalidLeaseTtl(_))));
-        // i64::MAX seconds fits in Duration but overflows `now + duration` —
-        // surfaces as InvalidLeaseTtl, not a panic.
-        let mut req = claim_req("x", "sess1");
-        req.lease_ttl_sec = i64::MAX as u64;
-        assert!(matches!(s.claim(req), Err(StoreError::InvalidLeaseTtl(_))));
-        // A sane TTL works.
-        let mut req = claim_req("x", "sess1");
-        req.lease_ttl_sec = 3600;
-        assert!(s.claim(req).is_ok());
+    }
+
+    #[test]
+    fn claim_rejects_lease_ttl_just_past_i64_max() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        assert!(matches!(
+            claim_with_ttl(&mut s, "x", (i64::MAX as u64) + 1),
+            Err(StoreError::InvalidLeaseTtl(_))
+        ));
+    }
+
+    /// `i64::MAX` seconds fits in `time::Duration` but overflows
+    /// `now + duration` — surfaces as `InvalidLeaseTtl`, not a panic.
+    #[test]
+    fn claim_rejects_i64_max_lease_ttl() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        assert!(matches!(
+            claim_with_ttl(&mut s, "x", i64::MAX as u64),
+            Err(StoreError::InvalidLeaseTtl(_))
+        ));
+    }
+
+    #[test]
+    fn claim_accepts_sane_lease_ttl() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        assert!(claim_with_ttl(&mut s, "x", 3600).is_ok());
     }
 
     #[test]
