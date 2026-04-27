@@ -365,6 +365,30 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Pin both branches of `canonicalize_via_parent_if_missing` against
+    /// a real tempdir: when the path exists, full `fs::canonicalize`
+    /// applies; when it does NOT, only the parent is canonicalized and
+    /// the leaf is rejoined verbatim. Both branches must yield the same
+    /// canonical-parent prefix so `validate_worktree_dir_override`'s
+    /// `path_within` checks behave consistently regardless of whether
+    /// the override directory has been created yet (the typical
+    /// `git worktree add`-into-new-dir path).
+    #[test]
+    fn canonicalize_via_parent_if_missing_both_branches() {
+        let td = tempdir().unwrap();
+        let parent = fs::canonicalize(td.path()).unwrap();
+
+        let existing = parent.join("here");
+        fs::create_dir(&existing).unwrap();
+        let got_existing = canonicalize_via_parent_if_missing(&existing).unwrap();
+        assert_eq!(got_existing, fs::canonicalize(&existing).unwrap());
+
+        let missing = parent.join("not-yet");
+        assert!(!missing.exists());
+        let got_missing = canonicalize_via_parent_if_missing(&missing).unwrap();
+        assert_eq!(got_missing, parent.join("not-yet"));
+    }
+
     /// Last assertion is the sibling-prefix regression guard: `/a/bad` must
     /// NOT be considered within `/a/b`. `Path::starts_with` is component-aware,
     /// so this guards against a future regression to string-prefix matching.
