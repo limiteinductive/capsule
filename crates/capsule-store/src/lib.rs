@@ -3215,12 +3215,16 @@ mod tests {
         assert!(claim_with_ttl(&mut s, "x", 3600).is_ok());
     }
 
+    /// Lease expires past TTL → next read-path sweep (here: `list_capsules`)
+    /// reverts the capsule to `Planned`, clears `verification`, and closes the
+    /// attempt with outcome=`Expired`. Also pins the `attempt_expired` event
+    /// payload to exactly DESIGN §6's keys (`at`, `prior_lease_expires_at`) —
+    /// the old `lease_expires_at` name and code-only `session_id` must not leak.
     #[test]
     fn lease_expiry_reverts_to_planned_and_clears_verification() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
-        // Attest while the lease is still alive — populates verification_json.
         s.attest(AttestRequest {
             capsule_id: "x".into(),
             session_id: "sess1".into(),
@@ -3231,22 +3235,16 @@ mod tests {
             log_ref: "file:///dev/null".into(),
         })
         .unwrap();
-        // Sleep past TTL so the next read-path sweep expires this attempt.
         std::thread::sleep(std::time::Duration::from_millis(1200));
 
-        // Any read path that runs reclaim sweeps the expiry.
         let listed = s.list_capsules(ListFilter::default()).unwrap();
         let c = listed.iter().find(|c| c.id == "x").unwrap();
         assert_eq!(c.status, Status::Planned);
         assert!(c.active_attempt.is_none());
         assert!(c.verification.is_none());
-        // Attempt itself is closed with outcome=expired.
         assert_eq!(c.attempts.len(), 1);
         assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Expired);
 
-        // DESIGN.md §6 attempt_expired payload: {at, prior_lease_expires_at}.
-        // Pin both spec keys present, the old `lease_expires_at` and code-only
-        // `session_id` extras absent, and no other keys leak in.
         let v = read_event_payload(&s, "x", "attempt_expired");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
