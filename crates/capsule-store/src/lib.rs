@@ -3840,38 +3840,29 @@ mod tests {
         assert_eq!(att.outcome, capsule_core::AttemptOutcome::Landed);
     }
 
+    /// §7.1.2 crash-retry: a second `land()` against a bare that already has
+    /// main + witness at `verified_sha` finds main already at `verified_sha`
+    /// (NoOp on base_ref) and witness already at `verified_sha` (same-OID
+    /// lease accepted as no-op). After the first call lands the capsule,
+    /// the second call sees status=landed and surfaces `WrongStatus` rather
+    /// than re-running the push.
     #[test]
     fn land_idempotent_re_run_is_no_op_on_witness() {
-        // Second land call with the same verified_sha against a bare that already
-        // has main + witness at that sha is the §7.1.2 crash-retry case.
-        // We simulate it by running land() twice; the second one finds main
-        // already at verified_sha (NoOp on base_ref) and witness already
-        // at verified_sha (same-OID lease accepted as no-op).
         let id = "land2";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
         make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
         attest_pass(&mut s, id, &verified_sha);
-        s.land(LandRequest {
+        let land_req = |repo_dir| LandRequest {
             capsule_id: id.into(),
             session_id: "sess1".into(),
             lander: "test-lander".into(),
             remote: bare.to_str().unwrap().into(),
-            repo_dir: work.clone(),
-        })
-        .unwrap();
-
-        // Second land — capsule is now `landed`, so we expect WrongStatus.
-        let err = s
-            .land(LandRequest {
-                capsule_id: id.into(),
-                session_id: "sess1".into(),
-                lander: "test-lander".into(),
-                remote: bare.to_str().unwrap().into(),
-                repo_dir: work,
-            })
-            .unwrap_err();
+            repo_dir,
+        };
+        s.land(land_req(work.clone())).unwrap();
+        let err = s.land(land_req(work)).unwrap_err();
         assert!(matches!(
             err,
             StoreError::WrongStatus {
