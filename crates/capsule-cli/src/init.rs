@@ -373,6 +373,16 @@ mod tests {
         assert_eq!(parse_git_version("nope"), None);
     }
 
+    /// Git for Windows emits extra dotted suffixes like
+    /// `git version 2.43.0.windows.1`; only major/minor matter here.
+    #[test]
+    fn parse_git_version_accepts_windows_suffix() {
+        assert_eq!(
+            parse_git_version("git version 2.43.0.windows.1\n"),
+            Some((2, 43))
+        );
+    }
+
     /// Malformed-version-string corners: prefix matches but the value is
     /// missing or non-numeric. Each must yield `None` (caller treats it as
     /// "git version unknown") rather than a partial `Some((major, 0))` that
