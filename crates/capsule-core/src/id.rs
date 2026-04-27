@@ -35,16 +35,12 @@ pub fn validate(id: &str) -> Result<(), IdError> {
     if bytes[0] == b'.' || bytes[len - 1] == b'.' {
         return Err(IdError::EdgeDot);
     }
-    // Git ref-name rule: no slash-separated component may end with ".lock".
-    // Capsule id is one such component (`refs/heads/capsules/<id>/a<N>`), so
-    // a `.lock` suffix here would surface as an opaque push failure at land
-    // time. Reject up-front. Verified with `git check-ref-format`.
+    // Per-component `.lock` suffix is forbidden by git ref-name rules and
+    // would surface as an opaque push failure at land time. Verified with
+    // `git check-ref-format`; pinned by the `lock_suffix_rejected` test.
     if len >= 5 && &bytes[len - 5..] == b".lock" {
         return Err(IdError::LockSuffix);
     }
-    // Single pass: char whitelist + `..` detection. Tracking `prev_dot` lets
-    // the `..` check piggyback on the byte iteration that already visits
-    // every dot, dropping the prior `id.contains("..")` second scan.
     let mut prev_dot = false;
     for (i, &b) in bytes.iter().enumerate() {
         match b {
