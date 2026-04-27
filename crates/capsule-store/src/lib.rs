@@ -4385,10 +4385,11 @@ mod tests {
         make_capsule(&mut s, id, "feature.txt");
         s.claim(claim_req(id, "sess1")).unwrap();
         attest_pass(&mut s, id, &verified_sha);
-        // Both gates would fire post-attest+freeze: status is Accepted (would
-        // emit WrongStatus) and pending_land is set (emits PendingLandFrozen).
-        // Pin that the freeze gate wins.
-        assert_eq!(s.get_capsule(id).unwrap().status, Status::Accepted);
+        assert_eq!(
+            s.get_capsule(id).unwrap().status,
+            Status::Accepted,
+            "precondition: WrongStatus(Accepted) would otherwise fire"
+        );
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
         simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
 
@@ -4411,14 +4412,13 @@ mod tests {
         s.claim(claim_req_with_ttl(id, "sess1", 1)).unwrap();
         attest_pass(&mut s, id, &verified_sha);
         let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
-        // do_push:false — only `pending_land_json` matters here; reconcile is
-        // not exercised.
         simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
 
         std::thread::sleep(std::time::Duration::from_millis(1200));
 
-        // list_capsules runs reclaim_expired_in_tx as part of its read.
-        let _ = s.list_capsules(ListFilter::default()).unwrap();
+        let _ = s
+            .list_capsules(ListFilter::default())
+            .expect("list_capsules drives reclaim_expired_in_tx");
 
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Accepted, "frozen capsule must not be reclaimed");
