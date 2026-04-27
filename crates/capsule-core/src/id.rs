@@ -100,6 +100,22 @@ mod tests {
         assert_eq!(validate(".a"), Err(IdError::EdgeDot));
     }
 
+    /// `EdgeDot` covers both ends — the impl checks `bytes[0]` AND
+    /// `bytes[len - 1]`; this pins the trailing branch independently.
+    #[test]
+    fn trailing_dot_rejected() {
+        assert_eq!(validate("a."), Err(IdError::EdgeDot));
+    }
+
+    /// 128 is the inclusive upper bound (`len > 128` rejects). Pin both
+    /// sides so flipping `>` to `>=` fails the test instead of silently
+    /// shrinking the accepted-id space by one byte.
+    #[test]
+    fn length_boundary_128_ok_129_rejected() {
+        validate(&"a".repeat(128)).unwrap();
+        assert_eq!(validate(&"a".repeat(129)), Err(IdError::TooLong(129)));
+    }
+
     #[test]
     fn unicode_rejected() {
         assert!(matches!(validate("café"), Err(IdError::InvalidChar(_))));
