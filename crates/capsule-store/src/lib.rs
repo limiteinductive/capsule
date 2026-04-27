@@ -2837,29 +2837,37 @@ mod tests {
         claim_req_with_ttl(id, sess, 300)
     }
 
+    /// Pin the `exit_codes_match` 4-cell truth table directly. The cross-shape
+    /// cells were once absorbed by `_ => false`, then spelled out so a future
+    /// variant on either enum forces compile-time review. Existing attest
+    /// tests touch some cells transitively but only assert event serialization
+    /// — these tests pin the pass/fail policy itself.
+    ///
+    /// Cross-shape real-world example: capsule expects exit 0, run hits a
+    /// sentinel like `"timeout"` — DESIGN §5 says that's a genuine fail.
     #[test]
-    fn exit_codes_match_truth_table() {
-        // Pin the 4-cell truth table directly. Pre-iter-112 the cross-shape
-        // cells were absorbed by `_ => false`; iter 112 spelled them out so a
-        // future variant on either enum forces compile-time review. Existing
-        // attest tests exercise some cells transitively but only assert event
-        // serialization, not the pass/fail policy. Test below pins the policy
-        // outright.
+    fn exit_codes_match_same_shape_equal_payload() {
         use capsule_core::{ExitCode, ExpectExit};
-        // Same-shape, equal payload ⇒ true.
         assert!(exit_codes_match(&ExpectExit::Code(0), &ExitCode::Code(0)));
         assert!(exit_codes_match(
             &ExpectExit::Sentinel("timeout".into()),
             &ExitCode::Sentinel("timeout".into()),
         ));
-        // Same-shape, different payload ⇒ false.
+    }
+
+    #[test]
+    fn exit_codes_match_same_shape_different_payload_fails() {
+        use capsule_core::{ExitCode, ExpectExit};
         assert!(!exit_codes_match(&ExpectExit::Code(0), &ExitCode::Code(1)));
         assert!(!exit_codes_match(
             &ExpectExit::Sentinel("timeout".into()),
             &ExitCode::Sentinel("killed".into()),
         ));
-        // Cross-shape ⇒ false. Real-world: capsule expects exit 0, run hits
-        // a sentinel like "timeout" — DESIGN §5 says that's a genuine fail.
+    }
+
+    #[test]
+    fn exit_codes_match_cross_shape_fails() {
+        use capsule_core::{ExitCode, ExpectExit};
         assert!(!exit_codes_match(
             &ExpectExit::Code(0),
             &ExitCode::Sentinel("timeout".into()),
