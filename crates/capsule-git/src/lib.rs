@@ -494,6 +494,28 @@ mod tests {
         assert_eq!(r, LandOutcome::BaseRefMoved);
     }
 
+    /// Pins FETCH_FIRST in the stderr fallback path; stdout lacks ref lines.
+    #[test]
+    fn stderr_only_fetch_first_classifies_base_ref_moved() {
+        let stdout = "To /tmp/remote.git\nDone\n";
+        let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
+                      ! [rejected] main -> main (fetch first)\n";
+        let r = classify_push(stdout, stderr, false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
+    /// Pins NON_FAST_FORWARD (legacy hyphenated phrasing) in the stderr
+    /// fallback path; without this, dropping the third OR-chain needle
+    /// passes silently.
+    #[test]
+    fn stderr_only_non_fast_forward_classifies_base_ref_moved() {
+        let stdout = "To /tmp/remote.git\nDone\n";
+        let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
+                      ! [rejected] main -> main (non-fast-forward)\n";
+        let r = classify_push(stdout, stderr, false, 1, "main", "capsule-witness/foo/a1").unwrap();
+        assert_eq!(r, LandOutcome::BaseRefMoved);
+    }
+
     /// Fallback stderr classification must keep stdout precedence: witness
     /// stale-info outranks base non-FF even when both messages appear. The
     /// non-FF line is positioned FIRST so a position-based rewrite (last-wins,
