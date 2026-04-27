@@ -3362,6 +3362,27 @@ mod tests {
         }
     }
 
+    /// `available` ignores overlap between Planned capsules. Both are
+    /// listed; claiming one makes the other fail with `ScopeConflict`
+    /// (pinned by `claim_scope_conflict`). Refactoring the filter to
+    /// prune Planned-vs-Planned overlap would silently shift scheduling
+    /// from race-then-conflict to filter-then-pick.
+    #[test]
+    fn list_filter_available_planned_overlap_both_listed() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/api");
+        make_capsule(&mut s, "b", "src/api/sub");
+        let avail = s
+            .list_capsules(ListFilter {
+                available: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut ids: Vec<String> = avail.into_iter().map(|c| c.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
     /// `dep` is planned with no deps → eligible. `child`'s deps are unmet
     /// (its dep `dep` is planned, not landed) → excluded.
     #[test]
