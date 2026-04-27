@@ -2905,6 +2905,13 @@ mod tests {
         claim_req_with_ttl(id, sess, 300)
     }
 
+    fn dep_req(from: &str, to: &str) -> DepRequest {
+        DepRequest {
+            capsule_id: from.into(),
+            depends_on: to.into(),
+        }
+    }
+
     /// Pin the `exit_codes_match` 4-cell truth table directly. The cross-shape
     /// cells were once absorbed by `_ => false`, then spelled out so a future
     /// variant on either enum forces compile-time review. Existing attest
@@ -3783,11 +3790,7 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
         let c = s.get_capsule("a").unwrap();
         assert_eq!(c.depends_on, vec!["b".to_string()]);
     }
@@ -3797,16 +3800,8 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
         let c = s.get_capsule("a").unwrap();
         assert_eq!(c.depends_on, vec!["b".to_string()]);
     }
@@ -3815,12 +3810,7 @@ mod tests {
     fn add_dep_self_loop_rejected() {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
-        let err = s
-            .add_dep(DepRequest {
-                capsule_id: "a".into(),
-                depends_on: "a".into(),
-            })
-            .unwrap_err();
+        let err = s.add_dep(dep_req("a", "a")).unwrap_err();
         assert!(matches!(err, StoreError::DependencyCycle(_, _)));
     }
 
@@ -3852,23 +3842,9 @@ mod tests {
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
         make_capsule(&mut s, "c", "src/c");
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
-        s.add_dep(DepRequest {
-            capsule_id: "b".into(),
-            depends_on: "c".into(),
-        })
-        .unwrap();
-        // a → b → c, now try c → a (would close cycle).
-        let err = s
-            .add_dep(DepRequest {
-                capsule_id: "c".into(),
-                depends_on: "a".into(),
-            })
-            .unwrap_err();
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.add_dep(dep_req("b", "c")).unwrap();
+        let err = s.add_dep(dep_req("c", "a")).unwrap_err();
         assert!(matches!(err, StoreError::DependencyCycle(_, _)));
     }
 
@@ -3876,12 +3852,7 @@ mod tests {
     fn add_dep_target_not_found() {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
-        let err = s
-            .add_dep(DepRequest {
-                capsule_id: "a".into(),
-                depends_on: "ghost".into(),
-            })
-            .unwrap_err();
+        let err = s.add_dep(dep_req("a", "ghost")).unwrap_err();
         assert!(matches!(err, StoreError::DepNotFound(_)));
     }
 
@@ -3890,16 +3861,8 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
-        s.remove_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.remove_dep(dep_req("a", "b")).unwrap();
         let c = s.get_capsule("a").unwrap();
         assert!(c.depends_on.is_empty());
     }
@@ -3911,11 +3874,7 @@ mod tests {
     fn remove_dep_missing_target_noop_no_event() {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
-        s.remove_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "ghost".into(),
-        })
-        .unwrap();
+        s.remove_dep(dep_req("a", "ghost")).unwrap();
         let count: i64 = s
             .conn
             .query_row(
@@ -3939,17 +3898,8 @@ mod tests {
             reason: "r".into(),
         })
         .unwrap();
-        // Both are no-ops on abandoned capsule.
-        s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
-        s.remove_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "b".into(),
-        })
-        .unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.remove_dep(dep_req("a", "b")).unwrap();
         let c = s.get_capsule("a").unwrap();
         assert!(c.depends_on.is_empty());
     }
@@ -3969,10 +3919,7 @@ mod tests {
             reason: "r".into(),
         })
         .unwrap();
-        let res = s.add_dep(DepRequest {
-            capsule_id: "a".into(),
-            depends_on: "ghost".into(),
-        });
+        let res = s.add_dep(dep_req("a", "ghost"));
         assert!(
             res.is_ok(),
             "terminal add_dep should no-op before target validation, got {res:?}"
