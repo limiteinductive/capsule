@@ -2586,6 +2586,20 @@ mod tests {
         let _ = Store::open(&path).unwrap();
     }
 
+    /// `actor` module constants ship verbatim to the `event.actor` column
+    /// (DESIGN §6). Same drift concern as the wire-string enums below: a
+    /// typo (`"sytsem"`, `"recon"`) would silently rewrite the audit-log
+    /// vocabulary downstream consumers grep on. (No closed-set test on
+    /// `event.actor` itself — the column is heterogeneous by design;
+    /// principal IDs like worker `session_id` and `landing.landed_by` are
+    /// also written through `insert_event`'s `actor: &str`.)
+    #[test]
+    fn actor_wire_strings_pinned() {
+        assert_eq!(actor::SYSTEM, "system");
+        assert_eq!(actor::OPERATOR, "operator");
+        assert_eq!(actor::RECONCILER, "reconciler");
+    }
+
     /// Wire-format pin for the enums whose `as_wire_str` strings ship to
     /// external consumers (audit-event payloads, --json CLI output, error
     /// messages). A typo or rename in production call sites would propagate
