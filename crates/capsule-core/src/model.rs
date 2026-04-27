@@ -854,5 +854,34 @@ mod tests {
         assert!(parsed.pending_land.is_none());
         assert!(parsed.landing.is_none());
     }
+
+    /// `Acceptance` is a standalone public JSON shape; minimal hand-authored
+    /// JSON only requires `run` and `expect_exit`. Same split-discipline as
+    /// the Capsule pair: serialize-omit and deserialize-default each pin one
+    /// of the two paired serde attributes (`skip_serializing_if`, `default`)
+    /// independently, so dropping one does not pass the other.
+    #[test]
+    fn acceptance_json_omits_empty_optionals() {
+        let acc = Acceptance {
+            run: "true".into(),
+            expect_exit: ExpectExit::Code(0),
+            cwd: None,
+            timeout_sec: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&acc).unwrap(),
+            serde_json::json!({"run": "true", "expect_exit": 0}),
+        );
+    }
+
+    #[test]
+    fn acceptance_json_defaults_missing_optionals() {
+        let minimal = serde_json::json!({"run": "true", "expect_exit": 0});
+        let parsed: Acceptance = serde_json::from_value(minimal).unwrap();
+        assert_eq!(parsed.run, "true");
+        assert!(matches!(parsed.expect_exit, ExpectExit::Code(0)));
+        assert!(parsed.cwd.is_none());
+        assert!(parsed.timeout_sec.is_none());
+    }
 }
 
