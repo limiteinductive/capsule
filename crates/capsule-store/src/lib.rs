@@ -827,20 +827,16 @@ impl Store {
         let tx = self.conn.transaction()?;
 
         assert_not_pending_land_frozen_in_tx(&tx, capsule_id)?;
-        let before_status: String = tx
-            .query_row(
-                "SELECT status FROM capsule WHERE id = ?1",
-                params![capsule_id],
-                |r| r.get(0),
-            )
-            .or_not_found(capsule_id)?;
-
+        // Same SQL serves the before- and after-sweep reads; one cached
+        // statement amortizes parsing across both.
+        let read_status = |id: &str| -> Result<String> {
+            tx.prepare_cached("SELECT status FROM capsule WHERE id = ?1")?
+                .query_row(params![id], |r| r.get(0))
+                .or_not_found(id)
+        };
+        let before_status = read_status(capsule_id)?;
         reclaim_expired_in_tx(&tx, now)?;
-        let after_status: String = tx.query_row(
-            "SELECT status FROM capsule WHERE id = ?1",
-            params![capsule_id],
-            |r| r.get(0),
-        )?;
+        let after_status = read_status(capsule_id)?;
         tx.commit()?;
         Ok(before_status != after_status)
     }
