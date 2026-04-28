@@ -4500,9 +4500,12 @@ mod tests {
         assert_eq!(v["attempt_id"].as_i64(), Some(1));
         assert_eq!(v["advanced_base_ref"].as_bool(), Some(true));
 
-        // Mirror invariant: payload Value == persisted landing_json Value.
         let landing = s.get_capsule(id).unwrap().landing.expect("landed");
-        assert_eq!(json::to_value(&landing).unwrap(), v);
+        assert_eq!(
+            json::to_value(&landing).unwrap(),
+            v,
+            "event payload must mirror persisted landing_json byte-for-byte"
+        );
     }
 
     /// §7.1.2 crash-retry: a second `land()` against a bare that already has
