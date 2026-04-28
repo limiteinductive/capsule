@@ -4548,6 +4548,25 @@ mod tests {
         assert!(matches!(err, StoreError::CrossSession));
     }
 
+    /// Pins DESIGN §3.3: abandon checks lease ownership, not lease liveness.
+    /// A worker may self-abandon after its heartbeat lease has expired, which
+    /// lets offline recovery clean up its own active attempt.
+    #[test]
+    fn abandon_succeeds_when_lease_expired_same_session() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "self-cleanup".into(),
+        })
+        .unwrap();
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Abandoned);
+    }
+
     #[test]
     fn abandon_already_terminal_rejected() {
         let mut s = tmp_store();
