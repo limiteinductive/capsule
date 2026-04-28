@@ -4032,11 +4032,9 @@ mod tests {
         assert!(matches!(err, StoreError::DepNotFound(_)));
     }
 
-    /// `add_dep` validates target existence before idempotency. If `a→ghost`
-    /// is already in `depends_on` (set at create, since `create_capsule`
-    /// does not validate dep ids), repeating `add_dep(a, ghost)` must still
-    /// surface `DepNotFound` — pins against an "idempotency-first to skip
-    /// the existence query" refactor that would mask stale-edge state.
+    /// Existing deps from `create_capsule` may still point at missing
+    /// capsules. Re-adding such a dep must surface `DepNotFound`, not
+    /// succeed as an idempotent no-op.
     #[test]
     fn add_dep_dep_not_found_outranks_idempotent_noop() {
         let mut s = tmp_store();
