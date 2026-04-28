@@ -5290,6 +5290,72 @@ mod tests {
         assert_eq!(actor, "test-lander");
     }
 
+    /// Pins pending_land_cleared.attempt_id so attempt history can join the
+    /// audit row back to the cleared land attempt.
+    #[test]
+    fn pending_land_cleared_row_links_attempt_id_when_base_ref_moved() {
+        let id = "plc_aid";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let init_sha = git(&work, &["rev-parse", "HEAD~"]);
+        git(&work, &["checkout", "-b", "diverge", &init_sha]);
+        git(&work, &["commit", "--allow-empty", "-m", "diverge"]);
+        let diverge_sha = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(diverge_sha, verified_sha);
+        git(
+            &work,
+            &[
+                "push",
+                "--force",
+                bare.to_str().unwrap(),
+                &format!("{diverge_sha}:refs/heads/main"),
+            ],
+        );
+
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let outcome = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work,
+                skip_deploy_verify_gate: true,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome.outcome, LandOutcome::BaseRefMoved),
+            "guard: outcome must be BaseRefMoved",
+        );
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_cleared'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one pending_land_cleared row");
+        let attempt_id: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_cleared'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "row attempt_id must link to the attempt whose land was cleared",
+        );
+    }
+
     /// Pin land's transient OtherFailure path: unclassified push failures
     /// must clear pending_land and emit the paired operational incident
     /// (kind=land_other_failure) with stderr in detail.
