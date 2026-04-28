@@ -3283,6 +3283,38 @@ mod tests {
         );
     }
 
+    /// Accepted capsules still hold scope: this pins the post-attest,
+    /// pre-land state where §7.0 still forbids overlapping claims.
+    #[test]
+    fn claim_scope_conflict_blocks_when_holder_is_accepted() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/api");
+        s.claim(claim_req("a", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "a".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.get_capsule("a").unwrap().status,
+            Status::Accepted,
+            "guard: holder must be Accepted, not Active"
+        );
+
+        make_capsule(&mut s, "b", "src/api/users.ts");
+        let err = s.claim(claim_req("b", "sess2")).unwrap_err();
+        assert!(
+            matches!(err, StoreError::ScopeConflict(ref claimed, ref conflict)
+                if claimed == "b" && conflict == "a"),
+            "got {err:?}"
+        );
+    }
+
     /// Landed capsules release scope. Pins the terminal-success case
     /// separately from Abandoned so future claims are not blocked forever
     /// by previously landed prefixes.
