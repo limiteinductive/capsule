@@ -4415,6 +4415,49 @@ mod tests {
         assert_eq!(att.outcome, capsule_core::AttemptOutcome::Landed);
     }
 
+    /// DESIGN §6/§7.1.2: `pending_land_committed` must use the exact
+    /// `PendingLand` JSON shape shared with `pending_land_json`.
+    #[test]
+    fn pending_land_committed_event_payload_matches_design_spec() {
+        let id = "pending_payload";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        })
+        .unwrap();
+
+        let v = read_event_payload(&s, id, "pending_land_committed");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "at",
+                "attempt_id",
+                "lander",
+                "prior_base_sha",
+                "verified_sha",
+                "witness_branch",
+            ]
+        );
+        let expected_branch = format!("capsule-witness/{id}/a1");
+        assert_eq!(v["verified_sha"].as_str(), Some(verified_sha.as_str()));
+        assert_eq!(v["lander"].as_str(), Some("test-lander"));
+        assert_eq!(v["attempt_id"].as_u64(), Some(1));
+        assert_eq!(v["witness_branch"].as_str(), Some(expected_branch.as_str()));
+        assert!(v["prior_base_sha"].as_str().is_some());
+    }
+
     /// DESIGN §6: `capsule_landed` payload is exactly `Landing` JSON.
     /// Pin replay-visible keys and equality to the persisted `landing_json`
     /// column — `id`/row metadata do not replace payload fields.
