@@ -4205,6 +4205,29 @@ mod tests {
         assert_eq!(c.depends_on, vec!["b".to_string()]);
     }
 
+    /// Idempotent add_dep must not emit duplicate `dependency_added` events.
+    /// Pins audit-log behavior for retry paths where the deps array is unchanged.
+    #[test]
+    fn add_dep_idempotent_emits_no_event() {
+        let count = |s: &Store| -> i64 {
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM event
+                     WHERE capsule_id = ?1 AND kind = 'dependency_added'",
+                    params!["a"],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(dep_req("a", "b")).unwrap();
+        assert_eq!(count(&s), 1, "first add must emit");
+        s.add_dep(dep_req("a", "b")).unwrap();
+        assert_eq!(count(&s), 1, "duplicate add must not re-emit");
+    }
+
     #[test]
     fn add_dep_self_loop_rejected() {
         let mut s = tmp_store();
