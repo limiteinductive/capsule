@@ -6504,6 +6504,18 @@ mod tests {
         assert_eq!(v["post_action_outcome"], "not_frozen");
         assert!(v["snapshot"].is_null(), "snapshot must be null when nothing was frozen");
 
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'force_unfreeze_invoked'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "operator-jane", "row actor must mirror operator identity");
+        assert_eq!(attempt_id, None, "NotFrozen path has no snapshot to project from");
+
         let count: i64 = s
             .conn
             .query_row(
@@ -6613,10 +6625,11 @@ mod tests {
         assert!(v["snapshot"]["witness_branch"].is_string());
     }
 
-    /// Pins force_unfreeze_invoked.attempt_id on the frozen path so attempt
-    /// history can join the audit row back to the frozen attempt.
+    /// Pins force_unfreeze_invoked row attribution on the frozen path:
+    /// `actor` stores the operator identity verbatim, while `attempt_id`
+    /// projects the frozen snapshot for join queries.
     #[test]
-    fn force_unfreeze_invoked_row_links_attempt_id_when_frozen() {
+    fn force_unfreeze_invoked_row_attributes_to_operator_string_when_frozen() {
         let id = "force_aid";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
         let mut s = tmp_store();
@@ -6645,15 +6658,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "guard: exactly one force_unfreeze_invoked row");
-        let attempt_id: Option<i64> = s
+        let (actor, attempt_id): (String, Option<i64>) = s
             .conn
             .query_row(
-                "SELECT attempt_id FROM event
+                "SELECT actor, attempt_id FROM event
                  WHERE capsule_id = ?1 AND kind = 'force_unfreeze_invoked'",
                 params![id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
+        assert_eq!(
+            actor, "operator-jane",
+            "actor column must carry the operator's identity verbatim, not a generic constant",
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
