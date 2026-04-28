@@ -2904,6 +2904,25 @@ mod tests {
         assert_eq!(v["exit_code"], "timeout");
     }
 
+    /// DESIGN §6: dependency event payloads carry only `{dep_id}`;
+    /// the mutated capsule id lives on the event row.
+    #[test]
+    fn dependency_event_payload_matches_design_spec() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.remove_dep(dep_req("a", "b")).unwrap();
+        for kind in ["dependency_added", "dependency_removed"] {
+            let v = read_event_payload(&s, "a", kind);
+            let obj = v.as_object().expect("payload must be a JSON object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort();
+            assert_eq!(keys, vec!["dep_id"], "{kind}");
+            assert_eq!(v["dep_id"], "b", "{kind}");
+        }
+    }
+
     /// DESIGN §6: `capsule_abandoned` payload carries only `{reason}`.
     /// `session_id` and `attempt_id` live on the event row (`actor` /
     /// `attempt_id`), not in kind-specific payload.
