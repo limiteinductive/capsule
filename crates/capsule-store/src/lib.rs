@@ -5234,6 +5234,41 @@ mod tests {
         assert_eq!(v["by"], actor);
     }
 
+    /// Pins the Cleared/Absent `reconciler_ran` payload end-to-end.
+    /// Absent witness state must omit `sha`; the direct helper pin does
+    /// not prove this shape is preserved through reconciler event emission.
+    #[test]
+    fn reconcile_absent_reconciler_ran_omits_sha() {
+        let id = "rec_absent_run";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        s.reconcile(ReconcileRequest {
+            capsule_id: id.into(),
+            remote: bare.to_str().unwrap().into(),
+        })
+        .unwrap();
+
+        let v = read_event_payload(&s, id, "reconciler_ran");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["decision", "witness_remote_state"]);
+        assert_eq!(v["decision"], "cleared");
+        let state = v["witness_remote_state"]
+            .as_object()
+            .expect("witness_remote_state must be a JSON object");
+        let mut state_keys: Vec<&str> = state.keys().map(String::as_str).collect();
+        state_keys.sort();
+        assert_eq!(state_keys, vec!["state"], "Absent variant must not carry sha");
+        assert_eq!(state["state"], "absent");
+    }
+
     /// Witness exists at some other sha — protection leak / corruption.
     /// The setup writes a `noise.txt` commit and pushes its sha as the
     /// witness ref, simulating divergence between PendingLand's
