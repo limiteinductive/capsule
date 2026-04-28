@@ -2988,6 +2988,48 @@ mod tests {
         assert_eq!(v["reason"], "user request");
     }
 
+    /// Pin abandon's audit coordinates: `actor=session_id` and `attempt_id`
+    /// points at the just-closed attempt. Audit views depend on both for
+    /// principal attribution and attempt-history joins.
+    #[test]
+    fn capsule_abandoned_event_row_attributes_session_and_attempt() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let ack = s.claim(claim_req("x", "sess1")).unwrap();
+        let attempt_id = ack.id as i64;
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "user request".into(),
+        })
+        .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_abandoned'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_abandoned row");
+        let (actor, row_attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_abandoned'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "sess1", "abandon attributes to the session that called it");
+        assert_eq!(
+            row_attempt_id,
+            Some(attempt_id),
+            "abandon event_row.attempt_id must point at the just-closed attempt"
+        );
+    }
+
     /// Build a `NewCapsule` with sensible test defaults: title="t", description="d",
     /// acceptance=`true` (exit 0), base_ref="main", no deps. Caller mutates fields
     /// post-build for non-default scenarios (e.g. setting `depends_on`).
