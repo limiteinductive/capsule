@@ -3174,6 +3174,27 @@ mod tests {
         assert!(ack.lease_expires_at > a1.lease.expires_at);
     }
 
+    /// DESIGN §3.3: `ttl_sec` is set at claim and immutable.
+    /// Heartbeat may extend `expires_at`, but must not rewrite `ttl_sec`.
+    #[test]
+    fn heartbeat_preserves_immutable_ttl_sec() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 300)).unwrap();
+        s.heartbeat("x", "sess1").unwrap();
+        s.heartbeat("x", "sess1").unwrap();
+        let ttl_sec: i64 = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.ttl_sec')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", 1i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ttl_sec, 300);
+    }
+
     #[test]
     fn attest_pass_transitions_to_accepted() {
         let mut s = tmp_store();
