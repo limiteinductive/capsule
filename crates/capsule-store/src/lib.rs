@@ -2904,6 +2904,28 @@ mod tests {
         assert_eq!(v["exit_code"], "timeout");
     }
 
+    /// DESIGN §6: `capsule_abandoned` payload carries only `{reason}`.
+    /// `session_id` and `attempt_id` live on the event row (`actor` /
+    /// `attempt_id`), not in kind-specific payload.
+    #[test]
+    fn capsule_abandoned_event_payload_matches_design_spec() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "user request".into(),
+        })
+        .unwrap();
+        let v = read_event_payload(&s, "x", "capsule_abandoned");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["reason"]);
+        assert_eq!(v["reason"], "user request");
+    }
+
     /// Build a `NewCapsule` with sensible test defaults: title="t", description="d",
     /// acceptance=`true` (exit 0), base_ref="main", no deps. Caller mutates fields
     /// post-build for non-default scenarios (e.g. setting `depends_on`).
