@@ -4283,6 +4283,45 @@ mod tests {
         assert_eq!(ids, vec!["dep"]);
     }
 
+    /// Pins the Accepted-pole of `list --available`: Planned capsules overlapping
+    /// an Accepted holder must be excluded, matching `claim` scope-conflict logic.
+    /// `list_filter_available` covers the Active pole; without this, an Active-only
+    /// `retain_available` refactor could surface unclaimable capsules.
+    #[test]
+    fn list_filter_available_excludes_when_overlap_holder_is_accepted() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "holder", "src/api");
+        make_capsule(&mut s, "overlap", "src/api/users.ts");
+        s.claim(claim_req("holder", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "holder".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.get_capsule("holder").unwrap().status,
+            Status::Accepted,
+            "guard: holder must be Accepted",
+        );
+
+        let avail = s
+            .list_capsules(ListFilter {
+                available: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"overlap"),
+            "Planned capsule overlapping Accepted holder must not be available, got {ids:?}",
+        );
+    }
+
     /// Pin the `WHERE status = ?1` SQL arm of `list_capsules`. The other
     /// `list_filter_*` tests use `..Default::default()` which leaves
     /// `status` as `None` and exercises only the unbound arm. This test
