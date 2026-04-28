@@ -5464,6 +5464,75 @@ mod tests {
         assert!(v["snapshot"]["witness_branch"].is_string());
     }
 
+    /// Force-unfreeze on a witness mismatch abandons and attributes the
+    /// abandon audit rows to the operator, not the autonomous reconciler.
+    #[test]
+    fn force_unfreeze_abandons_when_witness_at_different_sha() {
+        let id = "force_diff";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        std::fs::write(work.join("noise.txt"), "noise\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "noise"]);
+        let other_sha = git(&work, &["rev-parse", "HEAD"]);
+        simulate_land_crash(
+            &s,
+            id,
+            &verified_sha,
+            &prior,
+            &bare,
+            &work,
+            false,
+            Some(&other_sha),
+        );
+
+        let outcome = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+                operator: "operator-jane".into(),
+                reason: "lander dead, witness leaked".into(),
+                lander_confirmed_dead: true,
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Abandoned);
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Abandoned);
+        assert!(c.pending_land.is_none());
+
+        let incident = read_event_payload(&s, id, "operational_incident");
+        assert_eq!(incident["kind"], "witness_oid_mismatch");
+        assert_eq!(
+            incident["detail"]["found_sha"], other_sha,
+            "incident row points at the witness-mismatch event for this capsule"
+        );
+        for (kind, expected) in [
+            ("operational_incident", "operator-jane"),
+            ("reconciler_ran", "operator-jane"),
+            ("force_unfreeze_invoked", "operator-jane"),
+        ] {
+            let actor: String = s
+                .conn
+                .query_row(
+                    "SELECT actor FROM event WHERE capsule_id = ?1 AND kind = ?2",
+                    params![id, kind],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actor, expected, "{kind} actor");
+        }
+
+        let v = read_event_payload(&s, id, "force_unfreeze_invoked");
+        assert_eq!(v["operator"], "operator-jane");
+        assert_eq!(v["post_action_outcome"], "abandoned");
+        assert!(v["snapshot"].is_object(), "snapshot must carry the pending_land");
+    }
+
     /// `format_iso8601` and `parse_iso8601` are a tied pair: every
     /// timestamp column written via `format_iso8601` is read back via
     /// `parse_iso8601`, so they jointly own the DB-row timestamp
