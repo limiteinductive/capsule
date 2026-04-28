@@ -3997,6 +3997,32 @@ mod tests {
         assert_eq!(ids, vec!["p1"]);
     }
 
+    /// Pins oldest-first ordering for operator-visible `list` output.
+    /// Both SQL constants (`SELECT_ALL_ORDERED`, `SELECT_BY_STATUS_ORDERED`)
+    /// can drift independently — assert both arms.
+    #[test]
+    fn list_capsules_orders_by_created_at_asc() {
+        let mut s = tmp_store();
+        // Non-alphabetical insertion order so an `ORDER BY id` refactor
+        // would diverge from this expected sequence.
+        for id in &["z_first", "a_second", "m_third"] {
+            make_capsule(&mut s, id, &format!("src/{id}"));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let listed = s.list_capsules(ListFilter::default()).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["z_first", "a_second", "m_third"], "unbound arm");
+
+        let filtered = s
+            .list_capsules(ListFilter {
+                status: Some(Status::Planned),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = filtered.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["z_first", "a_second", "m_third"], "status-filtered arm");
+    }
+
     #[test]
     fn list_filter_scope_overlaps() {
         let mut s = tmp_store();
