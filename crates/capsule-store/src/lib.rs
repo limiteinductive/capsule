@@ -4488,6 +4488,15 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    /// `git push --force-with-lease=ref:` compares against the local
+    /// origin-tracking ref, not the remote. Tests that stage a conflicting
+    /// witness directly on the bare must refresh the worker's tracking
+    /// refs afterwards — otherwise the lander's lease compares against a
+    /// stale snapshot and the rejection path under test never fires.
+    fn refresh_worker_origin_tracking(work: &std::path::Path) {
+        git(work, &["fetch", "origin"]);
+    }
+
     /// Build a bare repo with `main` at one commit, plus a worker clone with
     /// a second commit pushed under `capsules/<id>/a1` so the bare repo has
     /// the verified_sha object available for the land push.
@@ -4616,9 +4625,7 @@ mod tests {
                 &format!("{other_sha}:refs/heads/capsule-witness/{id}/a1"),
             ],
         );
-        // force-with-lease=ref: compares against the local origin-tracking
-        // ref; populate it after creating the conflicting witness branch.
-        git(&work, &["fetch", "origin"]);
+        refresh_worker_origin_tracking(&work);
 
         let mut s = tmp_store();
         make_capsule(&mut s, id, "feature.txt");
@@ -4662,13 +4669,15 @@ mod tests {
     /// Pins land-time `BaseRefMoved`: a non-FF base push clears
     /// `pending_land`, emits `pending_land_cleared`, and leaves the
     /// capsule `Accepted` with the active attempt still `InFlight`.
+    ///
+    /// Setup forces bare:main to a sha that is not an ancestor of
+    /// `verified_sha`, so the atomic push of `verified_sha → main` is
+    /// rejected non-FF and exercises the `BaseRefMoved` arm.
     #[test]
     fn land_base_ref_moved_clears_pending_and_stays_accepted() {
         let id = "land_baseref";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
 
-        // Force bare:main to a sha that is not an ancestor of verified_sha,
-        // so the atomic push of verified_sha → main is rejected non-FF.
         let init_sha = git(&work, &["rev-parse", "HEAD~"]);
         git(&work, &["checkout", "-b", "diverge", &init_sha]);
         git(&work, &["commit", "--allow-empty", "-m", "diverge"]);
