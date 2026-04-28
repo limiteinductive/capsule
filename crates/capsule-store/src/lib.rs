@@ -5723,6 +5723,51 @@ mod tests {
         assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
+    /// Pins autonomous reconciler_ran attribution: actor is the reconciler
+    /// role and attempt_id links to the recovered attempt.
+    #[test]
+    fn reconcile_reconciler_ran_event_row_attributes_to_reconciler_role() {
+        let id = "rec_run_attr";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, true, None);
+
+        s.reconcile(ReconcileRequest {
+            capsule_id: id.into(),
+            remote: bare.to_str().unwrap().into(),
+        })
+        .unwrap();
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE capsule_id = ?1 AND kind = 'reconciler_ran'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one reconciler_ran row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'reconciler_ran'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "reconciler", "autonomous reconcile attributes to the reconciler role");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must link to the recovered attempt",
+        );
+    }
+
     /// Recovery counterpart to `capsule_landed_event_row_attributes_to_lander`.
     /// Autonomous recovery must attribute the landing event to the reconciler,
     /// not the original lander from the crashed attempt.
