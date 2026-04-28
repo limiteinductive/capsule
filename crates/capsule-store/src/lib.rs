@@ -4092,6 +4092,43 @@ mod tests {
         assert_eq!(payload_str, expires_at_before_reclaim);
     }
 
+    /// Pin attempt_expired audit attribution: reclaim is system-driven, while
+    /// attempt_id still points at the expired attempt for history joins.
+    #[test]
+    fn attempt_expired_event_row_is_system_attributed_with_expired_attempt_id() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let ack = s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        // Listing drives lazy auto-reclaim for expired leases.
+        let _ = s.list_capsules(ListFilter::default()).unwrap();
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event WHERE capsule_id = ?1 AND kind = 'attempt_expired'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one attempt_expired row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'attempt_expired'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "system", "auto-reclaim is system-driven, not the prior session");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must link to the expired attempt",
+        );
+    }
+
     #[test]
     fn reclaim_does_not_touch_unrelated_capsules() {
         let mut s = tmp_store();
