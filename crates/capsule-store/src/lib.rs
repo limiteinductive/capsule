@@ -5258,6 +5258,54 @@ mod tests {
         );
     }
 
+    /// Pin capsule_landed audit-row attribution. Row actor must be the
+    /// lander principal, not session_id, and attempt_id must link to the
+    /// just-closed attempt. Payload tests cover only the JSON shape.
+    #[test]
+    fn capsule_landed_event_row_attributes_to_lander() {
+        let id = "land_attr";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        })
+        .unwrap();
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_landed'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_landed row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_landed'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "test-lander", "actor must be the lander, not the session_id");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must point at the just-closed land attempt"
+        );
+    }
+
     /// §7.1.2 crash-retry: a second `land()` against a bare that already has
     /// main + witness at `verified_sha` finds main already at `verified_sha`
     /// (NoOp on base_ref) and witness already at `verified_sha` (same-OID
