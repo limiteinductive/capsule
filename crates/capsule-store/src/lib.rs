@@ -3174,6 +3174,41 @@ mod tests {
         assert!(ack.lease_expires_at > a1.lease.expires_at);
     }
 
+    /// DESIGN §3.3: heartbeat sets `expires_at = now + ttl_sec`.
+    /// Pins full-TTL renewal, catching constant or fractional extension bugs.
+    #[test]
+    fn heartbeat_extends_lease_by_full_ttl_sec() {
+        const TTL: i64 = 3600;
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", TTL as u64)).unwrap();
+        let before = OffsetDateTime::now_utc();
+        let ack = s.heartbeat("x", "sess1").unwrap();
+        let after = OffsetDateTime::now_utc();
+        let upper = (after - before).whole_seconds() + TTL;
+
+        let ack_ext = (ack.lease_expires_at - before).whole_seconds();
+        assert!(
+            (TTL..=upper).contains(&ack_ext),
+            "ack_ext={ack_ext}s outside [{TTL}, {upper}]"
+        );
+
+        let stored_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", 1i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored_ext = (parse_iso8601(&stored_str) - before).whole_seconds();
+        assert!(
+            (TTL..=upper).contains(&stored_ext),
+            "stored_ext={stored_ext}s outside [{TTL}, {upper}]"
+        );
+    }
+
     /// DESIGN §3.3: `ttl_sec` is set at claim and immutable.
     /// Heartbeat may extend `expires_at`, but must not rewrite `ttl_sec`.
     #[test]
