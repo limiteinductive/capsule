@@ -2916,6 +2916,51 @@ mod tests {
         assert_eq!(v["exit_code"], 0);
     }
 
+    /// Pin attempt_attested audit-row attribution. The payload intentionally
+    /// omits `attestor` and `attempt_id` because they duplicate the event
+    /// row's `actor` and `attempt_id`; those columns are load-bearing.
+    #[test]
+    fn attempt_attested_event_row_attributes_session_and_attempt() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let ack = s.claim(claim_req("x", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'attempt_attested'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one attempt_attested row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'attempt_attested'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "sess1", "attest attributes to the session that called it");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must point at the attempt being attested"
+        );
+    }
+
     #[test]
     fn attempt_attested_event_payload_serializes_sentinel_exit_code() {
         let mut s = tmp_store();
