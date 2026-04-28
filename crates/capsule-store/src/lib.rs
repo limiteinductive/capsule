@@ -4389,6 +4389,31 @@ mod tests {
         );
     }
 
+    /// Pins deploy-verify as the first land gate for existing capsules too.
+    /// An Active+unattested capsule would be `NotLandable` after fetch/extract,
+    /// but missing deploy verification must still surface first.
+    #[test]
+    fn land_deploy_verify_gate_outranks_not_landable() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        assert_eq!(s.get_capsule("x").unwrap().status, Status::Active);
+        let err = s
+            .land(LandRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                lander: "test".into(),
+                remote: "unused".into(),
+                repo_dir: std::env::temp_dir(),
+                skip_deploy_verify_gate: false,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DeployVerifyMissing),
+            "got {err:?}"
+        );
+    }
+
     /// Active but unattested capsules fail pre-tx with `NotLandable`,
     /// preserving the caller hint to attest before landing.
     #[test]
