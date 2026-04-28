@@ -3278,6 +3278,28 @@ mod tests {
         assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
     }
 
+    /// Malformed `verified_sha` is reported before capsule status.
+    /// A Planned capsule with a bad sha must surface `InvalidSha`, not
+    /// `WrongStatus` — pins input validation ahead of the status gate.
+    #[test]
+    fn attest_invalid_sha_outranks_wrong_status() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        assert_eq!(s.get_capsule("x").unwrap().status, Status::Planned);
+        let err = s
+            .attest(AttestRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                verified_sha: "abc".into(),
+                command: "true".into(),
+                exit_code: capsule_core::ExitCode::Code(0),
+                duration_ms: 1,
+                log_ref: "file:///dev/null".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
+    }
+
     /// Symmetric with attest: base_sha flows into `git worktree add ... <sha>`
     /// (capsule-cli isolation) and into LandPush prior-base computation.
     /// Reject at the protocol boundary.
