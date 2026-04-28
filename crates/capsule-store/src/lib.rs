@@ -5153,12 +5153,16 @@ mod tests {
     /// Pins the Landed pole of the terminal no-op branch in `load_deps_for_mutation`.
     /// A refactor that special-cases only `Abandoned` would let Landed capsules
     /// accept dependency mutations, violating DESIGN §7.1.3.
+    ///
+    /// Setup forces `status='landed'` directly via SQL — the no-op branch
+    /// keys on the status column alone, so leaving `landing_json` NULL
+    /// avoids reconstructing a full Landing payload without affecting the
+    /// branch under test.
     #[test]
     fn dep_ops_noop_on_landed_capsules() {
         let mut s = tmp_store();
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
-        // `landing_json` stays NULL — irrelevant to the status-column branch.
         s.conn
             .execute(
                 "UPDATE capsule SET status='landed' WHERE id='a'",
@@ -6117,6 +6121,11 @@ mod tests {
         }
     }
 
+    /// Pins autonomous-reconcile silence on unfrozen capsules: the early
+    /// return short-circuits before the witness-classification branch.
+    /// Force-unfreeze emits `force_unfreeze_invoked` on the same path; the
+    /// autonomous variant must not — a refactor adding a "no-op recorded"
+    /// `reconciler_ran` row here would muddy actor-filtered audit views.
     #[test]
     fn reconcile_noop_when_pending_land_null() {
         let mut s = tmp_store();
@@ -6128,11 +6137,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(outcome, ReconcileOutcome::NotFrozen);
-        // Autonomous reconcile on an unfrozen capsule short-circuits before
-        // entering the witness-classification branch. Force-unfreeze emits
-        // force_unfreeze_invoked on the same path; the autonomous variant
-        // must not — a refactor adding a "no-op recorded" reconciler_ran row
-        // here would muddy actor-filtered audit views.
         let post_create: i64 = s
             .conn
             .query_row(
