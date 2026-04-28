@@ -6623,6 +6623,22 @@ mod tests {
         assert_eq!(v["reason"], "lander pid 12345 unresponsive >30m");
         assert_eq!(v["post_action_outcome"], "landed");
         assert!(v["snapshot"]["witness_branch"].is_string());
+
+        for (kind, expected) in [
+            ("capsule_landed", "operator-jane"),
+            ("reconciler_ran", "operator-jane"),
+            ("force_unfreeze_invoked", "operator-jane"),
+        ] {
+            let actor: String = s
+                .conn
+                .query_row(
+                    "SELECT actor FROM event WHERE capsule_id = ?1 AND kind = ?2",
+                    params![id, kind],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actor, expected, "{kind} actor");
+        }
     }
 
     /// Pins force_unfreeze_invoked row attribution on the frozen path:
