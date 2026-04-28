@@ -4282,6 +4282,31 @@ mod tests {
         assert_eq!(obj.get("title"), Some(&json::Value::String("t2".into())));
     }
 
+    /// DESIGN §6: amends are human config changes and must remain
+    /// operator-attributed for operator-action audit views.
+    #[test]
+    fn amend_event_attributes_actor_to_operator() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("t2".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (actor, count): (String, i64) = s
+            .conn
+            .query_row(
+                "SELECT actor, COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_amended'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_amended row");
+        assert_eq!(actor, "operator", "capsule_amended must stay operator-attributed");
+    }
+
     #[test]
     fn amend_on_active_rejected() {
         let mut s = tmp_store();
