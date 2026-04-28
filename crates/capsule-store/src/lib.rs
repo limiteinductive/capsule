@@ -4659,6 +4659,98 @@ mod tests {
         );
     }
 
+    /// Pins land-time `BaseRefMoved`: a non-FF base push clears
+    /// `pending_land`, emits `pending_land_cleared`, and leaves the
+    /// capsule `Accepted` with the active attempt still `InFlight`.
+    #[test]
+    fn land_base_ref_moved_clears_pending_and_stays_accepted() {
+        let id = "land_baseref";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+
+        // Force bare:main to a sha that is not an ancestor of verified_sha,
+        // so the atomic push of verified_sha → main is rejected non-FF.
+        let init_sha = git(&work, &["rev-parse", "HEAD~"]);
+        git(&work, &["checkout", "-b", "diverge", &init_sha]);
+        git(&work, &["commit", "--allow-empty", "-m", "diverge"]);
+        let diverge_sha = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(diverge_sha, verified_sha);
+        git(
+            &work,
+            &[
+                "push",
+                "--force",
+                bare.to_str().unwrap(),
+                &format!("{diverge_sha}:refs/heads/main"),
+            ],
+        );
+
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+
+        let ack = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work,
+                skip_deploy_verify_gate: true,
+            })
+            .unwrap();
+        assert!(
+            matches!(ack.outcome, LandOutcome::BaseRefMoved),
+            "expected BaseRefMoved, got {:?}",
+            ack.outcome
+        );
+
+        let bare_main = git(&bare, &["rev-parse", "main"]);
+        assert_eq!(bare_main, diverge_sha, "remote base ref untouched");
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Accepted);
+        assert!(c.pending_land.is_none());
+        assert!(c.landing.is_none());
+        let att = c.attempts.iter().find(|a| a.id == 1).unwrap();
+        assert_eq!(att.outcome, capsule_core::AttemptOutcome::InFlight);
+
+        let cleared: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_cleared'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, 1, "exactly one pending_land_cleared event");
+        let landed: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_landed'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 0, "BaseRefMoved must not emit capsule_landed");
+
+        let (payload, actor): (String, String) = s
+            .conn
+            .query_row(
+                "SELECT payload_json, actor FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_cleared'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let v: json::Value = json::from_str(&payload).unwrap();
+        assert_eq!(v["reason"], "base_ref_moved");
+        assert_eq!(v["by"], "test-lander");
+        assert_eq!(actor, "test-lander");
+    }
+
     /// DESIGN §6/§7.1.2: `pending_land_committed` must use the exact
     /// `PendingLand` JSON shape shared with `pending_land_json`.
     #[test]
