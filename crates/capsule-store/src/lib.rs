@@ -5654,6 +5654,67 @@ mod tests {
         assert!(v["snapshot"].is_object(), "snapshot must carry the pending_land");
     }
 
+    /// Force-unfreeze on witness absence clears `pending_land` without
+    /// completing the capsule or attempt. All emitted audit rows are
+    /// attributed to the operator, not `reconciler`.
+    #[test]
+    fn force_unfreeze_clears_when_witness_absent() {
+        let id = "force_absent";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+
+        let outcome = s
+            .force_unfreeze(ForceUnfreezeRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+                operator: "operator-jane".into(),
+                reason: "lander dead, no witness pushed".into(),
+                lander_confirmed_dead: true,
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Cleared);
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Accepted, "Cleared keeps status=Accepted");
+        assert!(c.pending_land.is_none(), "pending_land cleared");
+        assert_eq!(c.attempts.len(), 1, "guard: attempts[0] must be the land attempt");
+        assert_eq!(
+            c.attempts[0].outcome,
+            capsule_core::AttemptOutcome::InFlight,
+            "Cleared keeps the attempt in-flight (operator can re-land)"
+        );
+
+        for (kind, expected) in [
+            ("pending_land_cleared", "operator-jane"),
+            ("reconciler_ran", "operator-jane"),
+            ("force_unfreeze_invoked", "operator-jane"),
+        ] {
+            let actor: String = s
+                .conn
+                .query_row(
+                    "SELECT actor FROM event WHERE capsule_id = ?1 AND kind = ?2",
+                    params![id, kind],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actor, expected, "{kind} actor");
+        }
+
+        let cleared = read_event_payload(&s, id, "pending_land_cleared");
+        assert_eq!(cleared["reason"], "witness_absent");
+        assert_eq!(cleared["by"], "operator-jane");
+
+        let v = read_event_payload(&s, id, "force_unfreeze_invoked");
+        assert_eq!(v["operator"], "operator-jane");
+        assert_eq!(v["post_action_outcome"], "cleared");
+        assert!(v["snapshot"].is_object(), "snapshot must carry the pending_land");
+    }
+
     /// `format_iso8601` and `parse_iso8601` are a tied pair: every
     /// timestamp column written via `format_iso8601` is read back via
     /// `parse_iso8601`, so they jointly own the DB-row timestamp
