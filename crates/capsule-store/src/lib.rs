@@ -3810,8 +3810,6 @@ mod tests {
         assert!(matches!(err, StoreError::DuplicateId(_)));
     }
 
-    // ---- abandon / reclaim / dep tests ----
-
     #[test]
     fn abandon_releases_mutex_and_marks_terminal() {
         let mut s = tmp_store();
@@ -4270,8 +4268,6 @@ mod tests {
         assert!(c.depends_on.is_empty());
     }
 
-    // ---- land() integration tests against a real local bare repo. ----
-
     fn git(cwd: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(args)
@@ -4527,8 +4523,6 @@ mod tests {
             "got {err:?}"
         );
     }
-
-    // ---- reconciler / force-unfreeze tests ----
 
     /// Drive the §7.1.2 land-crash decision tree from a test by writing
     /// `PendingLand` straight into `capsule.pending_land_json` (skipping
