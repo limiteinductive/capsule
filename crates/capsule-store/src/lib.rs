@@ -2904,6 +2904,29 @@ mod tests {
         assert_eq!(v["exit_code"], "timeout");
     }
 
+    /// DESIGN §6: `capsule_created` payload is only the audit-relevant tail:
+    /// `{acceptance, scope_prefixes, base_ref, depends_on}`. `id` lives on
+    /// the event row; `title`/`description` are intentionally omitted.
+    #[test]
+    fn capsule_created_event_payload_matches_design_spec() {
+        let mut s = tmp_store();
+        let mut nc = new_capsule_args("x", "src/api");
+        nc.depends_on = vec!["dep1".into()];
+        s.create_capsule(nc).unwrap();
+        let v = read_event_payload(&s, "x", "capsule_created");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["acceptance", "base_ref", "depends_on", "scope_prefixes"]
+        );
+        assert_eq!(v["base_ref"], "main");
+        assert_eq!(v["depends_on"], json::json!(["dep1"]));
+        assert_eq!(v["scope_prefixes"], json::json!(["src/api"]));
+        assert_eq!(v["acceptance"]["run"], "true");
+    }
+
     /// DESIGN §6: dependency event payloads carry only `{dep_id}`;
     /// the mutated capsule id lives on the event row.
     #[test]
