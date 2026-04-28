@@ -3730,6 +3730,22 @@ mod tests {
         assert_eq!(ids, vec!["api"]);
     }
 
+    /// Pins `scope_overlaps` to component-wise prefix matching (DESIGN §7.0).
+    /// `src/apifoo` must not overlap a capsule scoped to `src/api`; a raw
+    /// string-prefix implementation would incorrectly match it.
+    #[test]
+    fn list_filter_scope_overlaps_is_component_wise() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "api", "src/api");
+        let res = s
+            .list_capsules(ListFilter {
+                scope_overlaps: Some(CanonicalPath::new("src/apifoo").unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(res.is_empty(), "got {:?}", res.iter().map(|c| &c.id).collect::<Vec<_>>());
+    }
+
     #[test]
     fn create_rejects_invalid_id() {
         let mut s = tmp_store();
