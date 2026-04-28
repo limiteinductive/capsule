@@ -4075,11 +4075,13 @@ mod tests {
     /// Pins oldest-first ordering for operator-visible `list` output.
     /// Both SQL constants (`SELECT_ALL_ORDERED`, `SELECT_BY_STATUS_ORDERED`)
     /// can drift independently — assert both arms.
+    ///
+    /// Setup uses non-alphabetical insertion order (`z_first`, `a_second`,
+    /// `m_third`) so an `ORDER BY id` refactor would diverge from the
+    /// expected sequence and fail visibly.
     #[test]
     fn list_capsules_orders_by_created_at_asc() {
         let mut s = tmp_store();
-        // Non-alphabetical insertion order so an `ORDER BY id` refactor
-        // would diverge from this expected sequence.
         for id in &["z_first", "a_second", "m_third"] {
             make_capsule(&mut s, id, &format!("src/{id}"));
             std::thread::sleep(std::time::Duration::from_millis(1));
