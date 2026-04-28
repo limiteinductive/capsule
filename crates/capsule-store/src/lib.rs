@@ -3433,6 +3433,42 @@ mod tests {
         assert!(ack.lease_expires_at > a1.lease.expires_at);
     }
 
+    /// Heartbeat must succeed in Accepted: agents keep the lease alive
+    /// through the post-attest, pre-land window.
+    #[test]
+    fn heartbeat_succeeds_when_status_is_accepted() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let claimed = s.claim(claim_req("x", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.get_capsule("x").unwrap().status,
+            Status::Accepted,
+            "guard: holder must be Accepted",
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ack = s.heartbeat("x", "sess1").unwrap();
+        assert!(
+            ack.lease_expires_at > claimed.lease.expires_at,
+            "heartbeat must extend the lease in Accepted state too",
+        );
+        assert_eq!(
+            s.get_capsule("x").unwrap().status,
+            Status::Accepted,
+            "heartbeat must not change status",
+        );
+    }
+
     /// DESIGN §3.3: heartbeat sets `expires_at = now + ttl_sec`.
     /// Pins full-TTL renewal, catching constant or fractional extension bugs.
     #[test]
