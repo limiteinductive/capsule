@@ -4600,6 +4600,65 @@ mod tests {
         assert_eq!(att.outcome, capsule_core::AttemptOutcome::Landed);
     }
 
+    /// Pins land-time witness mismatch handling: abandon the capsule and emit
+    /// `{witness_branch, verified_sha}` without `found_sha`.
+    #[test]
+    fn land_witness_oid_mismatch_abandons_and_emits_incident() {
+        let id = "land_mismatch";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let other_sha = git(&bare, &["rev-parse", "main"]);
+        assert_ne!(other_sha, verified_sha);
+        git(
+            &work,
+            &[
+                "push",
+                bare.to_str().unwrap(),
+                &format!("{other_sha}:refs/heads/capsule-witness/{id}/a1"),
+            ],
+        );
+        // force-with-lease=ref: compares against the local origin-tracking
+        // ref; populate it after creating the conflicting witness branch.
+        git(&work, &["fetch", "origin"]);
+
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+
+        let ack = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work,
+                skip_deploy_verify_gate: true,
+            })
+            .unwrap();
+        assert!(
+            matches!(ack.outcome, LandOutcome::WitnessOidMismatch),
+            "expected WitnessOidMismatch, got {:?}",
+            ack.outcome
+        );
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Abandoned);
+        assert!(c.pending_land.is_none());
+        let att = c.attempts.iter().find(|a| a.id == 1).unwrap();
+        assert_eq!(att.outcome, capsule_core::AttemptOutcome::Abandoned);
+
+        let v = read_event_payload(&s, id, "operational_incident");
+        assert_eq!(v["kind"], "witness_oid_mismatch");
+        let detail = v.get("detail").expect("missing detail wrapper");
+        assert!(detail.is_object(), "detail must be a JSON object");
+        assert_eq!(detail["witness_branch"], format!("capsule-witness/{id}/a1"));
+        assert_eq!(detail["verified_sha"], verified_sha);
+        assert!(
+            detail.get("found_sha").is_none(),
+            "land-time payload has no found_sha"
+        );
+    }
+
     /// DESIGN §6/§7.1.2: `pending_land_committed` must use the exact
     /// `PendingLand` JSON shape shared with `pending_land_json`.
     #[test]
