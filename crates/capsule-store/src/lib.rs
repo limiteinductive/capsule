@@ -3018,6 +3018,26 @@ mod tests {
         assert!(matches!(err, StoreError::ScopeConflict(_, _)));
     }
 
+    /// Abandoned capsules do not lock their scope. `find_scope_conflict` must
+    /// only consider lease-holding capsules, otherwise abandoning would leave
+    /// the old `scope_json` blocking future claims forever.
+    #[test]
+    fn claim_scope_conflict_ignores_abandoned() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/api");
+        s.claim(claim_req("a", "sess1")).unwrap();
+        s.abandon(AbandonRequest {
+            capsule_id: "a".into(),
+            session_id: "sess1".into(),
+            reason: "r".into(),
+        })
+        .unwrap();
+        assert_eq!(s.get_capsule("a").unwrap().status, Status::Abandoned);
+        make_capsule(&mut s, "b", "src/api");
+        s.claim(claim_req("b", "sess2")).unwrap();
+        assert_eq!(s.get_capsule("b").unwrap().status, Status::Active);
+    }
+
     /// Pins error precedence: unmet deps are reported before scope conflicts,
     /// even when the capsule also overlaps an in-flight sibling.
     #[test]
