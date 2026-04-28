@@ -3253,6 +3253,28 @@ mod tests {
         assert!(c.verification.is_some());
     }
 
+    /// Attestation stores the verified SHA on the active attempt, not only on the capsule.
+    #[test]
+    fn attest_records_tip_sha_on_active_attempt() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let pre = s.get_capsule("x").unwrap();
+        assert!(pre.attempts[0].tip_sha.is_none(), "claim leaves tip_sha NULL");
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let post = s.get_capsule("x").unwrap();
+        assert_eq!(post.attempts[0].tip_sha.as_deref(), Some(FAKE_SHA));
+    }
+
     #[test]
     fn attest_fail_stays_active() {
         let mut s = tmp_store();
