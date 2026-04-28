@@ -3283,6 +3283,33 @@ mod tests {
         );
     }
 
+    /// Landed capsules release scope. Pins the terminal-success case
+    /// separately from Abandoned so future claims are not blocked forever
+    /// by previously landed prefixes.
+    #[test]
+    fn claim_scope_conflict_ignores_landed() {
+        let id = "landed_a";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "src/api");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        })
+        .unwrap();
+        assert_eq!(s.get_capsule(id).unwrap().status, Status::Landed);
+
+        make_capsule(&mut s, "next", "src/api");
+        s.claim(claim_req("next", "sess2")).unwrap();
+        assert_eq!(s.get_capsule("next").unwrap().status, Status::Active);
+    }
+
     /// Abandoned capsules do not lock their scope. `find_scope_conflict` must
     /// only consider lease-holding capsules, otherwise abandoning would leave
     /// the old `scope_json` blocking future claims forever.
