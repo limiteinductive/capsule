@@ -2842,6 +2842,41 @@ mod tests {
         assert!(v.get("lease_expires_at").is_none(), "old key must not return");
     }
 
+    /// Pin attempt_claimed audit-row attribution. The event row must be
+    /// attributed to the claiming session and linked to the newly allocated
+    /// attempt; the payload-shape test does not protect those columns.
+    #[test]
+    fn attempt_claimed_event_row_attributes_session_and_attempt() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let ack = s.claim(claim_req("x", "sess1")).unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'attempt_claimed'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one attempt_claimed row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'attempt_claimed'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "sess1", "claim attributes to the calling session");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must point at the just-allocated attempt"
+        );
+    }
+
     /// `attempt_attested` event payload (DESIGN §6): `{verified_sha, exit_code,
     /// command, log_ref, duration_ms}`. The full `Verification` struct also
     /// carries `at/attestor/attempt_id`, but those duplicate the event row's
