@@ -5054,6 +5054,70 @@ mod tests {
         assert_eq!(actor, "test-lander");
     }
 
+    /// Pin land's transient OtherFailure path: unclassified push failures
+    /// must clear pending_land and emit the paired operational incident
+    /// (kind=land_other_failure) with stderr in detail.
+    #[cfg(unix)]
+    #[test]
+    fn land_other_failure_clears_pending_and_emits_paired_incident() {
+        let id = "land_other";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'capsule-test: policy rejected push' >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+
+        let err = s
+            .land(LandRequest {
+                capsule_id: id.into(),
+                session_id: "sess1".into(),
+                lander: "test-lander".into(),
+                remote: bare.to_str().unwrap().into(),
+                repo_dir: work,
+                skip_deploy_verify_gate: true,
+            })
+            .unwrap_err();
+        let stderr = match err {
+            StoreError::LandOtherFailure(s) => s,
+            other => panic!("expected LandOtherFailure, got {other:?}"),
+        };
+        assert!(
+            stderr.contains("policy rejected push"),
+            "stderr must carry hook message, got: {stderr}"
+        );
+
+        let c = s.get_capsule(id).unwrap();
+        assert_eq!(c.status, Status::Accepted);
+        assert!(c.pending_land.is_none());
+        let att = c.attempts.iter().find(|a| a.id == 1).unwrap();
+        assert_eq!(att.outcome, capsule_core::AttemptOutcome::InFlight);
+
+        let cleared = read_event_payload(&s, id, "pending_land_cleared");
+        assert_eq!(cleared["reason"], "other_failure");
+        assert_eq!(cleared["by"], "test-lander");
+
+        let incident = read_event_payload(&s, id, "operational_incident");
+        assert_eq!(incident["kind"], "land_other_failure");
+        let detail = incident.get("detail").expect("missing detail wrapper");
+        assert!(
+            detail["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("policy rejected push"),
+            "incident detail.stderr must carry hook message, got: {detail}"
+        );
+    }
+
     /// DESIGN §6/§7.1.2: `pending_land_committed` must use the exact
     /// `PendingLand` JSON shape shared with `pending_land_json`.
     #[test]
