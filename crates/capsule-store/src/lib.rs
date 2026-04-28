@@ -6508,6 +6508,25 @@ mod tests {
             v.get("found_sha").is_none(),
             "old flat key must not regress to top level"
         );
+
+        for kind in ["operational_incident", "reconciler_ran"] {
+            let actors: Vec<String> = s
+                .conn
+                .prepare(
+                    "SELECT actor FROM event
+                     WHERE capsule_id = ?1 AND kind = ?2 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map(params![id, kind], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                actors,
+                vec!["reconciler".to_string()],
+                "{kind} on autonomous-reconciler path must emit exactly one row attributed to actor::RECONCILER"
+            );
+        }
     }
 
     /// Operator invokes force-unfreeze on a capsule with no pending_land.
