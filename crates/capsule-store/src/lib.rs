@@ -4552,6 +4552,40 @@ mod tests {
         assert_eq!(c.status, Status::Planned);
     }
 
+    /// Pins the Accepted side of expired-lease reclaim: post-attest capsules
+    /// with no pending land must return to Planned and drop verification.
+    /// Otherwise `status = 'active'` would miss stale Accepted lease holders.
+    #[test]
+    fn reclaim_reclaims_expired_accepted_lease_and_clears_verification() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.get_capsule("x").unwrap().status,
+            Status::Accepted,
+            "guard: holder must be Accepted before lease expiry",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let reclaimed = s.reclaim("x").unwrap();
+        assert!(reclaimed, "expired Accepted lease must reclaim");
+        let c = s.get_capsule("x").unwrap();
+        assert_eq!(c.status, Status::Planned);
+        assert!(
+            c.verification.is_none(),
+            "reclaim must clear verification on Accepted-pole reclaim",
+        );
+    }
+
     /// Explicit reclaim rejects frozen capsules, unlike auto-reclaim paths
     /// that silently skip frozen rows.
     #[test]
