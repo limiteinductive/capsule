@@ -5354,6 +5354,63 @@ mod tests {
         );
     }
 
+    /// LandOtherFailure is emitted from a separate catch-all path, so pin its
+    /// row attribution independently from WitnessOidMismatch.
+    #[cfg(unix)]
+    #[test]
+    fn land_other_failure_incident_row_attributes_to_lander() {
+        let id = "land_otherfail_attr";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'capsule-test: policy rejected push' >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let _ = s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        });
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'operational_incident'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one operational_incident row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'operational_incident'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "test-lander", "OtherFailure incident attributes to the lander");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must link to the failing attempt",
+        );
+    }
+
     /// DESIGN §6/§7.1.2: `pending_land_committed` must use the exact
     /// `PendingLand` JSON shape shared with `pending_land_json`.
     #[test]
