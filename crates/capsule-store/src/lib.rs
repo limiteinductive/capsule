@@ -4300,6 +4300,25 @@ mod tests {
         assert_eq!(c.status, Status::Planned);
     }
 
+    /// Explicit reclaim rejects frozen capsules, unlike auto-reclaim paths
+    /// that silently skip frozen rows.
+    #[test]
+    fn reclaim_frozen_capsule_returns_pending_land_frozen() {
+        let id = "rclfrz";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, false, None);
+        let err = s.reclaim(id).unwrap_err();
+        assert!(
+            matches!(err, StoreError::PendingLandFrozen(ref cid) if cid == id),
+            "got {err:?}"
+        );
+    }
+
     /// Expired attempts remain audit history, so reclaim must not reuse
     /// their id. Reuse would collide with git refs derived from
     /// `(capsule_id, attempt_id)`.
