@@ -3407,6 +3407,39 @@ mod tests {
         assert!(matches!(v.exit_code, capsule_core::ExitCode::Code(0)));
     }
 
+    /// Retry attest must overwrite both `capsule.verification` and
+    /// `attempt.tip_sha` from the same `verified_sha`. Pins against a
+    /// refactor making `tip_sha` sticky after the first attest.
+    #[test]
+    fn attest_retry_overwrites_attempt_tip_sha() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let req = |sha: &str, code: i32| AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: sha.into(),
+            command: "cmd".into(),
+            exit_code: capsule_core::ExitCode::Code(code),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        };
+        let other_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        s.attest(req(FAKE_SHA, 1)).unwrap();
+        s.attest(req(other_sha, 0)).unwrap();
+        let post = s.get_capsule("x").unwrap();
+        assert_eq!(
+            post.attempts[0].tip_sha.as_deref(),
+            Some(other_sha),
+            "retry must overwrite tip_sha so attempt row tracks capsule.verification"
+        );
+        assert_eq!(
+            post.verification.unwrap().verified_sha,
+            post.attempts[0].tip_sha.clone().unwrap(),
+            "tip_sha and verification.verified_sha must agree after retry",
+        );
+    }
+
     #[test]
     fn attest_after_accepted_rejected() {
         let mut s = tmp_store();
