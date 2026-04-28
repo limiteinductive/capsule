@@ -2942,6 +2942,30 @@ mod tests {
         }
     }
 
+    /// Dependency mutations are unauthenticated, so audit rows must stay
+    /// `actor=system` with no attempt. Pin this separately from payload shape.
+    #[test]
+    fn dependency_event_row_attribution_is_system_no_attempt() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.remove_dep(dep_req("a", "b")).unwrap();
+        for kind in ["dependency_added", "dependency_removed"] {
+            let (actor, attempt_id): (String, Option<i64>) = s
+                .conn
+                .query_row(
+                    "SELECT actor, attempt_id FROM event
+                     WHERE capsule_id = ?1 AND kind = ?2",
+                    params!["a", kind],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(actor, "system", "{kind}");
+            assert!(attempt_id.is_none(), "{kind} attempt_id must be NULL");
+        }
+    }
+
     /// DESIGN §6: `capsule_abandoned` payload carries only `{reason}`.
     /// `session_id` and `attempt_id` live on the event row (`actor` /
     /// `attempt_id`), not in kind-specific payload.
