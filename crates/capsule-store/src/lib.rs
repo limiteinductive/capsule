@@ -3610,6 +3610,40 @@ mod tests {
         );
     }
 
+    /// Pins `assert_live_lease_for_session`'s `LeaseExpired` payload.
+    /// Heartbeat has a separate emit site, so it cannot cover attest drift.
+    #[test]
+    fn attest_same_session_lease_expired_carries_prior_expires_at() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        let stored_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", 1i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let err = s
+            .attest(AttestRequest {
+                capsule_id: "x".into(),
+                session_id: "sess1".into(),
+                verified_sha: FAKE_SHA.into(),
+                command: "true".into(),
+                exit_code: capsule_core::ExitCode::Code(0),
+                duration_ms: 1,
+                log_ref: "file:///dev/null".into(),
+            })
+            .unwrap_err();
+        let StoreError::LeaseExpired(at_str) = err else {
+            panic!("expected LeaseExpired, got {err:?}");
+        };
+        assert_eq!(at_str, stored_str, "payload must pass through json_extract bytes");
+    }
+
     /// Parallel pin to `cross_session_outranks_expired_lease` for the
     /// `assert_live_lease_for_session` helper. `attest` does not run
     /// reclaim before lease load, so status stays `active` and the
