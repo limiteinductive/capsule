@@ -4465,6 +4465,29 @@ mod tests {
         assert!(matches!(err, StoreError::DependencyCycle(_, _)));
     }
 
+    /// Pins `DependencyCycle(adder, target)`. Both fields are `CapsuleId`,
+    /// so a swap would still match the variant while reversing the rejected
+    /// edge in the operator-facing message.
+    #[test]
+    fn add_dep_cycle_error_arg_order_and_message() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        make_capsule(&mut s, "c", "src/c");
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.add_dep(dep_req("b", "c")).unwrap();
+        let err = s.add_dep(dep_req("c", "a")).unwrap_err();
+        let StoreError::DependencyCycle(adder, target) = &err else {
+            panic!("expected DependencyCycle, got {err:?}");
+        };
+        assert_eq!(adder, "c", "first arg is the capsule that tried to add the dep");
+        assert_eq!(target, "a", "second arg is the dep target");
+        assert_eq!(
+            err.to_string(),
+            "dependency cycle: adding c -> a would create a cycle"
+        );
+    }
+
     #[test]
     fn add_dep_target_not_found() {
         let mut s = tmp_store();
