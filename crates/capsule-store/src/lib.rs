@@ -3518,6 +3518,32 @@ mod tests {
         );
     }
 
+    /// Same-session heartbeat after expiry returns `LeaseExpired` with the
+    /// lease's prior `expires_at`; heartbeat does not reclaim before renewal.
+    #[test]
+    fn heartbeat_same_session_lease_expired_carries_prior_expires_at() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let claimed = s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
+        let prior_expires = claimed.lease.expires_at;
+        let stored_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", 1i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let err = s.heartbeat("x", "sess1").unwrap_err();
+        let StoreError::LeaseExpired(at_str) = err else {
+            panic!("expected LeaseExpired, got {err:?}");
+        };
+        assert_eq!(parse_iso8601(&at_str), prior_expires);
+        assert_eq!(at_str, stored_str, "payload must pass through json_extract bytes");
+    }
+
     /// Pin precedence: a wrong-session caller whose lease has ALSO expired
     /// must see CrossSession, not LeaseExpired. They don't own the lease,
     /// period — the expiry is irrelevant context, and leaking it would let
