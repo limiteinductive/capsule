@@ -3312,6 +3312,24 @@ mod tests {
         );
     }
 
+    /// When multiple claim inputs are invalid, `base_sha` is reported first.
+    /// Pins validation order against refactors that group or reorder
+    /// input checks.
+    #[test]
+    fn claim_invalid_sha_outranks_invalid_lease_ttl() {
+        let mut s = tmp_store();
+        let err = s
+            .claim(ClaimRequest {
+                capsule_id: "ghost".into(),
+                owner: "o".into(),
+                session_id: "sess1".into(),
+                lease_ttl_sec: u64::MAX,
+                base_sha: "bogus".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidSha(_)), "got {err:?}");
+    }
+
     #[test]
     fn heartbeat_cross_session_rejected() {
         let mut s = tmp_store();
