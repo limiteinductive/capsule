@@ -5041,6 +5041,53 @@ mod tests {
         assert!(v["prior_base_sha"].as_str().is_some());
     }
 
+    /// Pin pending_land_committed audit-row attribution: actor is the
+    /// lander principal, not the claiming session, and attempt_id is the
+    /// active attempt. The payload pin only covers JSON fields.
+    #[test]
+    fn pending_land_committed_event_row_attributes_to_lander() {
+        let id = "pending_attr";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        })
+        .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_committed'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one pending_land_committed row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'pending_land_committed'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "test-lander", "actor must be the lander, not the session_id");
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must point at the active land attempt"
+        );
+    }
+
     /// DESIGN §6: `capsule_landed` payload is exactly `Landing` JSON.
     /// Pin replay-visible keys and equality to the persisted `landing_json`
     /// column — `id`/row metadata do not replace payload fields.
