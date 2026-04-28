@@ -626,13 +626,7 @@ impl Store {
     pub fn land(&mut self, req: LandRequest) -> Result<LandAck> {
         use capsule_git::{land_push, ls_remote_branch, LandOutcome as GitOutcome};
 
-        // ---- Step 0: deploy-verify gate (DESIGN.md §8.2). ----
-        // Refuse to land in production until the ACL suite is recorded as
-        // passing for this deployment. Bypass requires explicit caller
-        // assertion (CLI's --skip-deploy-verify-gate is audit-logged).
-        if !req.skip_deploy_verify_gate && !self.check_deploy_verify_pass()? {
-            return Err(StoreError::DeployVerifyMissing);
-        }
+        self.enforce_deploy_verify_gate(req.skip_deploy_verify_gate)?;
 
         // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
         let cap = self.get_capsule(&req.capsule_id)?;
@@ -951,6 +945,17 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// §8.2 step 0: refuse to land in production until the ACL suite
+    /// is recorded as passing for this deployment. Bypass requires the
+    /// caller to set `skip` explicitly — the CLI surfaces this behind
+    /// `--skip-deploy-verify-gate`, which is itself audit-logged.
+    fn enforce_deploy_verify_gate(&self, skip: bool) -> Result<()> {
+        if !skip && !self.check_deploy_verify_pass()? {
+            return Err(StoreError::DeployVerifyMissing);
+        }
+        Ok(())
     }
 
     /// Operator escape hatch (DESIGN.md §7.1.2). Same decision tree as
