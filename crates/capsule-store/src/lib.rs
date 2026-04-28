@@ -3469,6 +3469,59 @@ mod tests {
         );
     }
 
+    /// Pins DESIGN §7.2: a frozen capsule (`pending_land_json` set) still
+    /// accepts heartbeats. Lander crash recovery does not require the worker
+    /// to stop heartbeating during the attest-to-land window.
+    #[test]
+    fn heartbeat_succeeds_when_capsule_is_frozen() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let claimed = s.claim(claim_req("x", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        let pending = PendingLand {
+            at: OffsetDateTime::now_utc(),
+            attempt_id: 1,
+            verified_sha: FAKE_SHA.into(),
+            prior_base_sha: FAKE_SHA.into(),
+            witness_branch: "capsule-witness/x/a1".into(),
+            lander: "test-lander".into(),
+        };
+        let pending_json = json::to_string(&pending).unwrap();
+        let now_str = format_iso8601(OffsetDateTime::now_utc()).unwrap();
+        s.conn
+            .execute(
+                "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
+                params![pending_json, now_str, "x"],
+            )
+            .unwrap();
+        assert!(
+            s.get_capsule("x").unwrap().pending_land.is_some(),
+            "guard: capsule must be frozen",
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.heartbeat("x", "sess1").unwrap();
+        let after = s.get_capsule("x").unwrap();
+        let persisted = &after.attempts.iter().find(|a| a.id == 1).unwrap().lease;
+        assert!(
+            persisted.expires_at > claimed.lease.expires_at,
+            "persisted lease.expires_at must advance even on frozen capsule",
+        );
+        assert!(
+            after.pending_land.is_some(),
+            "heartbeat must not unfreeze the capsule",
+        );
+    }
+
     /// DESIGN §3.3: heartbeat sets `expires_at = now + ttl_sec`.
     /// Pins full-TTL renewal, catching constant or fractional extension bugs.
     #[test]
