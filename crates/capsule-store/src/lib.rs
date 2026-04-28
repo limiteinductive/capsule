@@ -4415,6 +4415,53 @@ mod tests {
         assert_eq!(att.outcome, capsule_core::AttemptOutcome::Landed);
     }
 
+    /// DESIGN §6: `capsule_landed` payload is exactly `Landing` JSON.
+    /// Pin replay-visible keys and equality to the persisted `landing_json`
+    /// column — `id`/row metadata do not replace payload fields.
+    #[test]
+    fn capsule_landed_event_payload_matches_design_spec() {
+        let id = "land_payload";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        s.land(LandRequest {
+            capsule_id: id.into(),
+            session_id: "sess1".into(),
+            lander: "test-lander".into(),
+            remote: bare.to_str().unwrap().into(),
+            repo_dir: work,
+            skip_deploy_verify_gate: true,
+        })
+        .unwrap();
+
+        let v = read_event_payload(&s, id, "capsule_landed");
+        let obj = v.as_object().expect("payload must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "advanced_base_ref",
+                "at",
+                "attempt_id",
+                "landed_by",
+                "landed_sha",
+                "prior_base_sha",
+                "witness_branch",
+            ]
+        );
+        assert_eq!(v["landed_sha"].as_str(), Some(verified_sha.as_str()));
+        assert_eq!(v["landed_by"].as_str(), Some("test-lander"));
+        assert_eq!(v["attempt_id"].as_i64(), Some(1));
+        assert_eq!(v["advanced_base_ref"].as_bool(), Some(true));
+
+        // Mirror invariant: payload Value == persisted landing_json Value.
+        let landing = s.get_capsule(id).unwrap().landing.expect("landed");
+        assert_eq!(json::to_value(&landing).unwrap(), v);
+    }
+
     /// §7.1.2 crash-retry: a second `land()` against a bare that already has
     /// main + witness at `verified_sha` finds main already at `verified_sha`
     /// (NoOp on base_ref) and witness already at `verified_sha` (same-OID
