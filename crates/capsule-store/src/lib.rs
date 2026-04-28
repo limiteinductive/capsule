@@ -6316,6 +6316,54 @@ mod tests {
         assert!(v["snapshot"]["witness_branch"].is_string());
     }
 
+    /// Pins force_unfreeze_invoked.attempt_id on the frozen path so attempt
+    /// history can join the audit row back to the frozen attempt.
+    #[test]
+    fn force_unfreeze_invoked_row_links_attempt_id_when_frozen() {
+        let id = "force_aid";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, true, None);
+
+        s.force_unfreeze(ForceUnfreezeRequest {
+            capsule_id: id.into(),
+            remote: bare.to_str().unwrap().into(),
+            operator: "operator-jane".into(),
+            reason: "lander dead".into(),
+            lander_confirmed_dead: true,
+        })
+        .unwrap();
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'force_unfreeze_invoked'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one force_unfreeze_invoked row");
+        let attempt_id: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'force_unfreeze_invoked'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "frozen path must project snapshot.attempt_id onto the row column",
+        );
+    }
+
     /// Force-unfreeze on a witness mismatch abandons and attributes the
     /// abandon audit rows to the operator, not the autonomous reconciler.
     #[test]
