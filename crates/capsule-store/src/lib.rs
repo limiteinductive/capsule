@@ -6413,6 +6413,25 @@ mod tests {
         assert_eq!(keys, vec!["by", "reason"]);
         assert_eq!(v["reason"], "witness_absent");
         assert_eq!(v["by"], actor);
+
+        for kind in ["pending_land_cleared", "reconciler_ran"] {
+            let actors: Vec<String> = s
+                .conn
+                .prepare(
+                    "SELECT actor FROM event
+                     WHERE capsule_id = ?1 AND kind = ?2 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map(params![id, kind], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                actors,
+                vec!["reconciler".to_string()],
+                "{kind} on autonomous-reconciler path must emit exactly one row attributed to actor::RECONCILER"
+            );
+        }
     }
 
     /// Pins the Cleared/Absent `reconciler_ran` payload end-to-end.
