@@ -4837,10 +4837,10 @@ mod tests {
         assert_eq!(obj.get("title"), Some(&json::Value::String("t2".into())));
     }
 
-    /// DESIGN §6: amends are human config changes and must remain
-    /// operator-attributed for operator-action audit views.
+    /// Amend only applies to Planned capsules, so capsule_amended must stay
+    /// operator-attributed (DESIGN §6) and must not link to an attempt row.
     #[test]
-    fn amend_event_attributes_actor_to_operator() {
+    fn amend_event_row_attribution_is_operator_no_attempt() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         s.amend(AmendRequest {
@@ -4849,17 +4849,27 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let (actor, count): (String, i64) = s
+        let count: i64 = s
             .conn
             .query_row(
-                "SELECT actor, COUNT(*) FROM event
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_amended'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_amended row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
                  WHERE capsule_id = ?1 AND kind = 'capsule_amended'",
                 params!["x"],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(count, 1, "guard: exactly one capsule_amended row");
         assert_eq!(actor, "operator", "capsule_amended must stay operator-attributed");
+        assert_eq!(attempt_id, None, "amend has no active attempt to link to");
     }
 
     #[test]
