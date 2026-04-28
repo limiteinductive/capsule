@@ -681,10 +681,8 @@ impl Store {
                 witness_branch,
                 lander: req.lander,
             };
-            // SQL bytes (used in step 4's CAS) and event payload share one
-            // serialization so both paths see identical bytes by construction.
-            let pending_value = json::to_value(&pending)?;
-            pending_json = pending_value.to_string();
+            let (pending_value, pending_str) = serialize_pending_for_cas_and_audit(&pending)?;
+            pending_json = pending_str;
 
             tx.prepare_cached(
                 "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
@@ -1876,6 +1874,20 @@ fn pending_land_snapshot_unchanged(
     )?
     .query_row(params![capsule_id, snapshot_json], |r| r.get(0))
     .or_not_found(capsule_id)
+}
+
+/// Serialize `PendingLand` once and hand back both the typed `Value`
+/// (for the `pending_land_committed` event payload) and its `String`
+/// form (the `pending_land_json` column bytes). Step-4's CAS via
+/// `pending_land_snapshot_unchanged` byte-compares the column against
+/// the snapshot the lander captured here, so a single serialization
+/// guarantees the audit row and the CAS subject are byte-identical by
+/// construction — diverging serializations would let the CAS pass
+/// while the audit row references a different snapshot.
+fn serialize_pending_for_cas_and_audit(p: &PendingLand) -> Result<(json::Value, String)> {
+    let v = json::to_value(p)?;
+    let s = v.to_string();
+    Ok((v, s))
 }
 
 /// SQL-side existence check for the §7.2 reclaim/abandon freeze flag,
@@ -4018,6 +4030,24 @@ mod tests {
         make_capsule(&mut s, "a", "src/a");
         let err = s.add_dep(dep_req("a", "ghost")).unwrap_err();
         assert!(matches!(err, StoreError::DepNotFound(_)));
+    }
+
+    /// `add_dep` validates target existence before idempotency. If `a→ghost`
+    /// is already in `depends_on` (set at create, since `create_capsule`
+    /// does not validate dep ids), repeating `add_dep(a, ghost)` must still
+    /// surface `DepNotFound` — pins against an "idempotency-first to skip
+    /// the existence query" refactor that would mask stale-edge state.
+    #[test]
+    fn add_dep_dep_not_found_outranks_idempotent_noop() {
+        let mut s = tmp_store();
+        let mut a = new_capsule_args("a", "src/a");
+        a.depends_on = vec!["ghost".into()];
+        s.create_capsule(a).unwrap();
+        let err = s.add_dep(dep_req("a", "ghost")).unwrap_err();
+        assert!(
+            matches!(err, StoreError::DepNotFound(ref id) if id == "ghost"),
+            "got {err:?}"
+        );
     }
 
     #[test]
