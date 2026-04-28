@@ -4283,6 +4283,46 @@ mod tests {
         assert_eq!(ids, vec!["dep"]);
     }
 
+    /// Pins `retain_available`: an Accepted dep is not satisfied.
+    /// Only Landed deps unblock dependents; Accepted can still abandon at land time
+    /// via witness mismatch or force-unfreeze.
+    #[test]
+    fn list_filter_available_excludes_dependent_when_dep_is_accepted() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "dep", "src/dep");
+        let mut child = new_capsule_args("child", "src/child");
+        child.depends_on = vec!["dep".into()];
+        s.create_capsule(child).unwrap();
+        s.claim(claim_req("dep", "sess1")).unwrap();
+        s.attest(AttestRequest {
+            capsule_id: "dep".into(),
+            session_id: "sess1".into(),
+            verified_sha: FAKE_SHA.into(),
+            command: "true".into(),
+            exit_code: capsule_core::ExitCode::Code(0),
+            duration_ms: 1,
+            log_ref: "file:///dev/null".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.get_capsule("dep").unwrap().status,
+            Status::Accepted,
+            "guard: dep must be Accepted, not Landed",
+        );
+
+        let avail = s
+            .list_capsules(ListFilter {
+                available: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = avail.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"child"),
+            "Planned dependent must stay unavailable while dep is Accepted, got {ids:?}",
+        );
+    }
+
     /// Pins the Accepted-pole of `list --available`: Planned capsules overlapping
     /// an Accepted holder must be excluded, matching `claim` scope-conflict logic.
     /// `list_filter_available` covers the Active pole; without this, an Active-only
