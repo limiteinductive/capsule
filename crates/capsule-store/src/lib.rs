@@ -4048,6 +4048,40 @@ mod tests {
         s.claim(claim_req("y", "sess2")).unwrap();
     }
 
+    /// Terminal attempts must record `closed_at`, not just `outcome`.
+    /// This pins `close_attempt`; otherwise duration projections stay NULL.
+    #[test]
+    fn abandon_records_attempt_closed_at() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.claim(claim_req("x", "sess1")).unwrap();
+        let pre = s.get_capsule("x").unwrap();
+        assert!(
+            pre.attempts[0].closed_at.is_none(),
+            "in-flight attempt must have no closed_at"
+        );
+        let before = OffsetDateTime::now_utc();
+        s.abandon(AbandonRequest {
+            capsule_id: "x".into(),
+            session_id: "sess1".into(),
+            reason: "test".into(),
+        })
+        .unwrap();
+        let post = s.get_capsule("x").unwrap();
+        assert_eq!(
+            post.attempts[0].outcome,
+            capsule_core::AttemptOutcome::Abandoned,
+            "guard: pin must inspect a terminal attempt"
+        );
+        let closed = post.attempts[0]
+            .closed_at
+            .expect("abandoned attempt must record closed_at");
+        assert!(
+            closed >= before,
+            "closed_at {closed} earlier than abandon start {before}"
+        );
+    }
+
     #[test]
     fn abandon_cross_session_rejected() {
         let mut s = tmp_store();
