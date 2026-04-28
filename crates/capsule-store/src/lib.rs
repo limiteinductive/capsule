@@ -3940,6 +3940,34 @@ mod tests {
         assert_eq!(kind, "capsule_amended");
     }
 
+    /// `capsule_amended` payload is a diff, not a snapshot: only fields
+    /// explicitly changed by the request may appear in the event payload.
+    #[test]
+    fn amend_event_payload_records_only_changed_fields() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("t2".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let payload_json: String = s
+            .conn
+            .query_row(
+                "SELECT payload_json FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_amended'
+                 ORDER BY rowid DESC LIMIT 1",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: json::Value = json::from_str(&payload_json).unwrap();
+        let obj = v.as_object().expect("payload object");
+        assert_eq!(obj.len(), 1, "extra keys in diff payload: {obj:?}");
+        assert_eq!(obj.get("title"), Some(&json::Value::String("t2".into())));
+    }
+
     #[test]
     fn amend_on_active_rejected() {
         let mut s = tmp_store();
