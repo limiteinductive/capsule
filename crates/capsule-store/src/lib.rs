@@ -6128,6 +6128,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(outcome, ReconcileOutcome::NotFrozen);
+        // Autonomous reconcile on an unfrozen capsule short-circuits before
+        // entering the witness-classification branch. Force-unfreeze emits
+        // force_unfreeze_invoked on the same path; the autonomous variant
+        // must not — a refactor adding a "no-op recorded" reconciler_ran row
+        // here would muddy actor-filtered audit views.
+        let post_create: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = 'x' AND kind != 'capsule_created'",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_create, 0, "autonomous reconcile on unfrozen must emit no events");
     }
 
     /// Crash window: §7.1.2 step 3 (push) succeeded, step 4 (DB commit)
