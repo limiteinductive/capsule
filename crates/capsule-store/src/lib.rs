@@ -3233,6 +3233,40 @@ mod tests {
         );
     }
 
+    /// `last_heartbeat` is the operator-visible liveness signal.
+    /// Heartbeat must advance it, not only `lease_json.expires_at`.
+    #[test]
+    fn heartbeat_advances_attempt_last_heartbeat() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let a1 = s.claim(claim_req("x", "sess1")).unwrap();
+        let aid = a1.id as i64;
+        let claim_lh: String = s
+            .conn
+            .query_row(
+                "SELECT last_heartbeat FROM attempt
+                 WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", aid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.heartbeat("x", "sess1").unwrap();
+        let after_lh: String = s
+            .conn
+            .query_row(
+                "SELECT last_heartbeat FROM attempt
+                 WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", aid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            parse_iso8601(&after_lh) > parse_iso8601(&claim_lh),
+            "heartbeat must advance last_heartbeat: claim={claim_lh} after={after_lh}"
+        );
+    }
+
     /// DESIGN §3.3: `ttl_sec` is set at claim and immutable.
     /// Heartbeat may extend `expires_at`, but must not rewrite `ttl_sec`.
     #[test]
