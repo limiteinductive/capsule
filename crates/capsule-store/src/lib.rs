@@ -628,7 +628,6 @@ impl Store {
 
         self.enforce_deploy_verify_gate(req.skip_deploy_verify_gate)?;
 
-        // ---- Step 1: read remote base_ref tip (outside any DB tx). ----
         let cap = self.get_capsule(&req.capsule_id)?;
         let Some(LandableSnapshot {
             base_ref,
@@ -640,7 +639,6 @@ impl Store {
         };
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
-        // ---- Step 2: write PendingLand under preconditions. ----
         let attempt_id: i64;
         let pending_json: String;
         let pending = {
@@ -695,7 +693,6 @@ impl Store {
             pending
         };
 
-        // ---- Step 3: atomic multi-ref push. No DB. ----
         let push_outcome = land_push(
             &req.repo_dir,
             &req.remote,
@@ -704,7 +701,6 @@ impl Store {
             &pending.verified_sha,
         )?;
 
-        // ---- Step 4: synchronous reconcile from outcome. ----
         let (now, now_str) = now_pair()?;
         let tx = self.conn.transaction()?;
 
