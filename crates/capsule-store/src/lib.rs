@@ -5549,6 +5549,58 @@ mod tests {
         assert_eq!(v["witness_remote_state"]["sha"], verified_sha);
     }
 
+    /// Recovery counterpart to `capsule_landed_event_row_attributes_to_lander`.
+    /// Autonomous recovery must attribute the landing event to the reconciler,
+    /// not the original lander from the crashed attempt.
+    #[test]
+    fn reconcile_recovered_capsule_landed_event_row_attributes_to_reconciler() {
+        let id = "rec_attr";
+        let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
+        let mut s = tmp_store();
+        make_capsule(&mut s, id, "feature.txt");
+        let ack = s.claim(claim_req(id, "sess1")).unwrap();
+        attest_pass(&mut s, id, &verified_sha);
+        let prior = capsule_git::ls_remote_branch(bare.to_str().unwrap(), "main").unwrap();
+        simulate_land_crash(&s, id, &verified_sha, &prior, &bare, &work, true, None);
+
+        let outcome = s
+            .reconcile(ReconcileRequest {
+                capsule_id: id.into(),
+                remote: bare.to_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Landed);
+
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_landed'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_landed row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_landed'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            actor, "reconciler",
+            "recovery-path landings attribute to reconciler, not the original lander"
+        );
+        assert_eq!(
+            attempt_id,
+            Some(ack.id as i64),
+            "attempt_id must point at the attempt the reconciler closed"
+        );
+    }
+
     /// Frozen capsules reject `abandon` before session ownership is checked.
     /// Preserves the §7.2 pending-land invariant for both wrong-session and
     /// legitimate-session callers; recovery / `force_unfreeze` must resolve.
