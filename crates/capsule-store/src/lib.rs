@@ -5150,6 +5150,38 @@ mod tests {
         assert!(c.depends_on.is_empty());
     }
 
+    /// Pins the Landed pole of the terminal no-op branch in `load_deps_for_mutation`.
+    /// A refactor that special-cases only `Abandoned` would let Landed capsules
+    /// accept dependency mutations, violating DESIGN §7.1.3.
+    #[test]
+    fn dep_ops_noop_on_landed_capsules() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/a");
+        make_capsule(&mut s, "b", "src/b");
+        // `landing_json` stays NULL — irrelevant to the status-column branch.
+        s.conn
+            .execute(
+                "UPDATE capsule SET status='landed' WHERE id='a'",
+                params![],
+            )
+            .unwrap();
+        s.add_dep(dep_req("a", "b")).unwrap();
+        s.remove_dep(dep_req("a", "b")).unwrap();
+        let c = s.get_capsule("a").unwrap();
+        assert_eq!(c.status, Status::Landed, "guard: capsule still Landed");
+        assert!(c.depends_on.is_empty(), "Landed must accept the call but emit no edge");
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = 'a' AND kind IN ('dependency_added','dependency_removed')",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "terminal-no-op must not emit dep events");
+    }
+
     /// Terminal capsules short-circuit before dep-target validation. An
     /// `add_dep` from an abandoned capsule to a missing target is Ok, not
     /// DepNotFound — the terminal check in `load_deps_for_mutation` runs
