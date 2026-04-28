@@ -3003,6 +3003,39 @@ mod tests {
         assert_eq!(v["acceptance"]["run"], "true");
     }
 
+    /// Pin capsule_created audit attribution. Creation is system-owned and
+    /// predates attempts, unlike capsule_amended (operator) and principal
+    /// events (session/lander with attempt_id).
+    #[test]
+    fn capsule_created_event_row_is_system_attributed_with_null_attempt_id() {
+        let mut s = tmp_store();
+        s.create_capsule(new_capsule_args("x", "src/api")).unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_created'",
+                params!["x"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "guard: exactly one capsule_created row");
+        let (actor, attempt_id): (String, Option<i64>) = s
+            .conn
+            .query_row(
+                "SELECT actor, attempt_id FROM event
+                 WHERE capsule_id = ?1 AND kind = 'capsule_created'",
+                params!["x"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor, "system", "creation is system-driven, not operator");
+        assert_eq!(
+            attempt_id, None,
+            "creation predates any attempt; attempt_id must be NULL"
+        );
+    }
+
     /// DESIGN §6: dependency event payloads carry only `{dep_id}`;
     /// the mutated capsule id lives on the event row.
     #[test]
