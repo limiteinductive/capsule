@@ -4094,13 +4094,16 @@ mod tests {
 
     /// Pin attempt_expired audit attribution: reclaim is system-driven, while
     /// attempt_id still points at the expired attempt for history joins.
+    ///
+    /// Setup claims with a 1-sec TTL, sleeps past expiry, then triggers the
+    /// lazy auto-reclaim by calling `list_capsules` (read paths run
+    /// `reclaim_expired_in_tx` on access).
     #[test]
     fn attempt_expired_event_row_is_system_attributed_with_expired_attempt_id() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let ack = s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1200));
-        // Listing drives lazy auto-reclaim for expired leases.
         let _ = s.list_capsules(ListFilter::default()).unwrap();
 
         let count: i64 = s
