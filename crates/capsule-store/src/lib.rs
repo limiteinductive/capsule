@@ -3107,6 +3107,27 @@ mod tests {
         assert!(matches!(err, StoreError::ScopeConflict(_, _)));
     }
 
+    /// Pins `ScopeConflict(failing_claim, existing_in_flight)`.
+    /// Both fields are `CapsuleId`, so swapping them still matches the variant
+    /// but makes the Display message point operators at the wrong capsule.
+    #[test]
+    fn claim_scope_conflict_error_arg_order_and_message() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "a", "src/api");
+        make_capsule(&mut s, "b", "src/api/users.ts");
+        s.claim(claim_req("a", "sess1")).unwrap();
+        let err = s.claim(claim_req("b", "sess2")).unwrap_err();
+        let StoreError::ScopeConflict(claimed, conflict) = &err else {
+            panic!("expected ScopeConflict, got {err:?}");
+        };
+        assert_eq!(claimed, "b", "first arg is the failing claim's capsule");
+        assert_eq!(conflict, "a", "second arg is the existing in-flight capsule");
+        assert_eq!(
+            err.to_string(),
+            "capsule b scope overlaps in-flight capsule a"
+        );
+    }
+
     /// Abandoned capsules do not lock their scope. `find_scope_conflict` must
     /// only consider lease-holding capsules, otherwise abandoning would leave
     /// the old `scope_json` blocking future claims forever.
