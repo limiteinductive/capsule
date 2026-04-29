@@ -3675,6 +3675,26 @@ mod tests {
             .unwrap();
         assert!(!ack.accepted);
         assert_eq!(ack.new_status, Status::Active);
+        // Failed attestations must still persist verification + emit the
+        // AttemptAttested event — a refactor that "skipped persistence on
+        // fail to keep the row clean" would erase the only audit trail of
+        // the failed run before the worker retries.
+        let c = s.get_capsule("x").unwrap();
+        let v = c.verification.expect("failed attest must persist verification");
+        assert_eq!(v.verified_sha, FAKE_SHA);
+        assert!(matches!(v.exit_code, capsule_core::ExitCode::Code(1)));
+        assert_eq!(c.attempts.len(), 1, "guard: single attempt before indexing");
+        assert_eq!(c.attempts[0].tip_sha.as_deref(), Some(FAKE_SHA));
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE capsule_id = 'x' AND kind = 'attempt_attested'",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "failed attest must still emit attempt_attested for audit");
     }
 
     /// Failed attestations are retryable while the attempt remains Active.
