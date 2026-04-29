@@ -729,7 +729,7 @@ impl Store {
                     Some(attempt_id),
                     &pending.lander,
                     OperationalIncidentKind::WitnessOidMismatch,
-                    json::json!({
+                    &json::json!({
                         "witness_branch": pending.witness_branch,
                         "verified_sha": pending.verified_sha,
                     }),
@@ -1036,7 +1036,7 @@ impl Store {
                     Some(attempt_id_i64),
                     actor,
                     OperationalIncidentKind::WitnessOidMismatch,
-                    json::json!({
+                    &json::json!({
                         "witness_branch": pending.witness_branch,
                         "expected_sha": pending.verified_sha,
                         "found_sha": found_sha,
@@ -1518,7 +1518,7 @@ fn emit_operational_incident(
     attempt_id: Option<i64>,
     actor: &str,
     kind: OperationalIncidentKind,
-    detail: json::Value,
+    detail: &json::Value,
 ) -> Result<()> {
     let payload = json::json!({
         "kind": kind.as_wire_str(),
@@ -2549,7 +2549,7 @@ fn record_transient_land_failure(
         Some(attempt_id),
         by,
         OperationalIncidentKind::LandOtherFailure,
-        json::json!({ "stderr": stderr }),
+        &json::json!({ "stderr": stderr }),
     )
 }
 
