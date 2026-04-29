@@ -57,10 +57,18 @@ pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
     if !out.status.success() {
         return Err(GitError::Failed {
             code: out.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: stderr_to_string(out.stderr),
         });
     }
     parse_ls_remote_stdout(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Convert a `Vec<u8>` (typically `Output::stderr`) to `String` without an
+/// allocation in the common valid-UTF-8 case. `String::from_utf8` reuses the
+/// `Vec<u8>` buffer in place; the lossy fallback only fires for malformed
+/// bytes (essentially never for git's user-facing stderr).
+fn stderr_to_string(v: Vec<u8>) -> String {
+    String::from_utf8(v).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 /// Pure parser/validator for `git ls-remote --heads` stdout. Empty stdout →
