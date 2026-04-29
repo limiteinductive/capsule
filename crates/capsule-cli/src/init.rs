@@ -155,21 +155,18 @@ fn maybe_update_gitignore(
         .with_context(|| format!("canonicalizing {}", store_dir.display()))?;
     let abs_worktree = fs::canonicalize(worktree)
         .with_context(|| format!("canonicalizing worktree {}", worktree.display()))?;
-    let rel = match abs_store_dir.strip_prefix(&abs_worktree) {
-        Ok(r) => r.to_path_buf(),
-        Err(_) => {
-            return Ok((
-                None,
-                Some(format!(
-                    "store dir {} is outside the worktree {}",
-                    abs_store_dir.display(),
-                    abs_worktree.display()
-                )),
-            ));
-        }
+    let Ok(rel) = abs_store_dir.strip_prefix(&abs_worktree) else {
+        return Ok((
+            None,
+            Some(format!(
+                "store dir {} is outside the worktree {}",
+                abs_store_dir.display(),
+                abs_worktree.display()
+            )),
+        ));
     };
 
-    let Some(line) = format_gitignore_dir_pattern(&rel) else {
+    let Some(line) = format_gitignore_dir_pattern(rel) else {
         return Ok((
             None,
             Some("store dir equals worktree root — refusing to ignore the repo".to_string()),
