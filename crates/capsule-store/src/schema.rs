@@ -90,10 +90,7 @@ const V2_DEPLOY_VERIFY_GATE: &str = r"
     ";
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
-    // Bootstrap `schema_version` so the version-read below has a table to
-    // hit. Outside an explicit transaction, SQLite runs the single DDL
-    // statement in an implicit transaction — no BEGIN/COMMIT wrapper needed.
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")?;
+    bootstrap_version_table(conn)?;
 
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -113,6 +110,15 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
     }
 
     Ok(())
+}
+
+/// Create `schema_version` if absent so the version-read in `ensure` has a
+/// table to hit before any migration runs. `V1_INITIAL` also declares this
+/// table (`CREATE TABLE IF NOT EXISTS`); the duplication is intentional —
+/// V1 is skipped on already-stamped DBs, so without this bootstrap the
+/// version-read would fail on first open of a v1+ store.
+fn bootstrap_version_table(conn: &Connection) -> SqlResult<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
 }
 
 #[cfg(test)]
