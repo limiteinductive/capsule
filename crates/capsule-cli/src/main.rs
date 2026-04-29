@@ -218,6 +218,11 @@ struct LandArgs {
     /// `verified_sha` in its object database. Defaults to cwd.
     #[arg(long = "repo-dir")]
     repo_dir: Option<PathBuf>,
+    /// Bypass the DESIGN §8.2 deploy-verify gate. For tests, development,
+    /// and break-glass use only — production should run `capsule deploy
+    /// verify` first to record a pass.
+    #[arg(long = "skip-deploy-verify-gate")]
+    skip_deploy_verify_gate: bool,
 }
 
 #[derive(clap::Args)]
@@ -539,6 +544,7 @@ fn main() -> Result<()> {
                 lander: args.lander,
                 remote: args.remote,
                 repo_dir,
+                skip_deploy_verify_gate: args.skip_deploy_verify_gate,
             })?;
             if cli.json {
                 print_json(&ack)?;
