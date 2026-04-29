@@ -195,9 +195,6 @@ fn classify_push(
             base = Some(line);
         }
     }
-    let witness = witness.as_ref();
-    let base = base.as_ref();
-
     if success {
         let (base_created, base_changed) = ref_change(base);
         let (witness_created, witness_changed) = ref_change(witness);
@@ -218,13 +215,13 @@ fn classify_push(
     }
 }
 
-fn witness_protection_leak(witness: Option<&RefLine<'_>>) -> bool {
+fn witness_protection_leak(witness: Option<RefLine<'_>>) -> bool {
     rejected_with(witness, git_reject::STALE_INFO)
 }
 
 /// Inlined (not three `rejected_with` calls) so `flag == '!'` is checked
 /// once across the three equivalent rejection reasons git emits for non-FF.
-fn base_non_fast_forward(base: Option<&RefLine<'_>>) -> bool {
+fn base_non_fast_forward(base: Option<RefLine<'_>>) -> bool {
     base.is_some_and(|l| {
         l.flag == '!'
             && [
@@ -260,7 +257,7 @@ fn classify_failure_from_stderr(stderr: &str, code: i32) -> Result<LandOutcome> 
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct RefLine<'a> {
     flag: char,
     dst: &'a str,
@@ -283,7 +280,7 @@ fn parse_ref_line(line: &str) -> Option<RefLine<'_>> {
 }
 
 /// (created, changed). `*` = new ref, `' '` = FF, `'+'` = forced update.
-fn ref_change(line: Option<&RefLine<'_>>) -> (bool, bool) {
+fn ref_change(line: Option<RefLine<'_>>) -> (bool, bool) {
     match line.map(|l| l.flag) {
         Some('*') => (true, true),
         Some(' ' | '+') => (false, true),
@@ -291,7 +288,7 @@ fn ref_change(line: Option<&RefLine<'_>>) -> (bool, bool) {
     }
 }
 
-fn rejected_with(line: Option<&RefLine<'_>>, needle: &str) -> bool {
+fn rejected_with(line: Option<RefLine<'_>>, needle: &str) -> bool {
     line.is_some_and(|l| l.flag == '!' && l.summary.contains(needle))
 }
 
