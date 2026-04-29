@@ -917,7 +917,8 @@ impl Store {
     /// reconcile only ls-remotes, so any cwd is fine — but we accept it
     /// uniformly for symmetry with `land`.
     pub fn reconcile(&mut self, req: ReconcileRequest) -> Result<ReconcileOutcome> {
-        self.reconcile_inner(req, /* operator: */ None)
+        let operator = None;
+        self.reconcile_inner(req, operator)
     }
 
     /// Record that the deploy-verify ACL suite (DESIGN §8.2) passed for
