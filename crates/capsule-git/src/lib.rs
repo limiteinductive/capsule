@@ -330,7 +330,7 @@ mod tests {
         let stdout = "not-a-sha\trefs/heads/main\n";
         match parse_ls_remote_stdout(stdout) {
             Err(GitError::Parse(msg)) => assert!(msg.contains("not-a-sha"), "msg: {msg}"),
-            other @ (Ok(_) | Err(GitError::Io(_)) | Err(GitError::Failed { .. })) => {
+            other @ (Ok(_) | Err(GitError::Io(_) | GitError::Failed { .. })) => {
                 panic!("expected Parse error, got {other:?}")
             }
         }
