@@ -1767,14 +1767,31 @@ fn load_land_preconditions(
     .or_not_found(capsule_id)
 }
 
+/// Single source of truth for the lease-validation precedence: CrossSession
+/// outranks LeaseExpired. Pinned by `cross_session_outranks_expired_lease`
+/// (heartbeat path) and `attest_cross_session_outranks_expired_lease`
+/// (assert path). Takes `expires_at_str` by value because the LeaseExpired
+/// arm consumes it as the error payload — moving the string in saves a
+/// clone on the (load-bearing) error path; the live path discards it.
+fn check_lease_owner_and_expiry(
+    owner: &str,
+    session_id: &str,
+    expires_at_str: String,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if owner != session_id {
+        return Err(StoreError::CrossSession);
+    }
+    if now > parse_iso8601(&expires_at_str) {
+        return Err(StoreError::LeaseExpired(expires_at_str));
+    }
+    Ok(())
+}
+
 /// Live-lease assertion for callers that don't consume the lease body
 /// (`attest`, `land` step 2). Projects only `session_id` + `expires_at` via
 /// `json_extract`, so the full lease blob stays inside SQLite — no String
-/// alloc for the blob, no `serde_json::from_str::<Lease>` parse. Precedence
-/// (CrossSession before LeaseExpired) matches `Store::heartbeat`'s open-coded
-/// projection; both pinned by `cross_session_outranks_expired_lease`
-/// (heartbeat) and `attest_cross_session_outranks_expired_lease` (this
-/// helper).
+/// alloc for the blob, no `serde_json::from_str::<Lease>` parse.
 fn assert_live_lease_for_session(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1791,27 +1808,19 @@ fn assert_live_lease_for_session(
         .query_row(params![capsule_id, attempt_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
-    if owner != session_id {
-        return Err(StoreError::CrossSession);
-    }
-    let expires_at = parse_iso8601(&expires_at_str);
-    if now > expires_at {
-        return Err(StoreError::LeaseExpired(expires_at_str));
-    }
-    Ok(())
+    check_lease_owner_and_expiry(&owner, session_id, expires_at_str, now)
 }
 
 /// Sister to `assert_live_lease_for_session` for `heartbeat`'s renewal path:
-/// runs the same CrossSession-before-LeaseExpired precedence (pinned by
-/// `cross_session_outranks_expired_lease`) but also projects `ttl_sec` for
-/// the `checked_lease_expiry` recompute the predicate-only helper doesn't
-/// need. Returns the ttl as `u64` after asserting non-negativity — `claim`
-/// gates `ttl_sec` through `checked_lease_expiry` (which validates
-/// `i64::try_from`), so a stored ttl is always in `[0, i64::MAX]`; the
-/// `expect` is defense-in-depth against a corrupted row, not a real
-/// runtime branch. Like the sister, the lease blob stays inside SQLite —
-/// `Store::heartbeat` patches `expires_at` in place via `json_set`, so no
-/// `serde_json::from_str::<Lease>` parse + re-serialize per heartbeat.
+/// also projects `ttl_sec` for the `checked_lease_expiry` recompute the
+/// predicate-only helper doesn't need. Returns the ttl as `u64` after
+/// asserting non-negativity — `claim` gates `ttl_sec` through
+/// `checked_lease_expiry` (which validates `i64::try_from`), so a stored
+/// ttl is always in `[0, i64::MAX]`; the `expect` is defense-in-depth
+/// against a corrupted row, not a real runtime branch. Like the sister,
+/// the lease blob stays inside SQLite — `Store::heartbeat` patches
+/// `expires_at` in place via `json_set`, so no `serde_json::from_str::<Lease>`
+/// parse + re-serialize per heartbeat.
 fn project_live_lease_for_renewal(
     tx: &rusqlite::Transaction<'_>,
     capsule_id: &str,
@@ -1829,13 +1838,7 @@ fn project_live_lease_for_renewal(
         .query_row(params![capsule_id, attempt_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
-    if owner != session_id {
-        return Err(StoreError::CrossSession);
-    }
-    let expires_at = parse_iso8601(&expires_at_str);
-    if now > expires_at {
-        return Err(StoreError::LeaseExpired(expires_at_str));
-    }
+    check_lease_owner_and_expiry(&owner, session_id, expires_at_str, now)?;
     Ok(u64::try_from(ttl_sec).expect("claim stores ttl_sec as a non-negative i64"))
 }
 
