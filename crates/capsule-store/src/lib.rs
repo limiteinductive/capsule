@@ -909,8 +909,7 @@ impl Store {
     /// reconcile only ls-remotes, so any cwd is fine — but we accept it
     /// uniformly for symmetry with `land`.
     pub fn reconcile(&mut self, req: ReconcileRequest) -> Result<ReconcileOutcome> {
-        let operator = None;
-        self.reconcile_inner(req, operator)
+        self.reconcile_inner(req, None)
     }
 
     /// Record that the deploy-verify ACL suite (DESIGN §8.2) passed for
@@ -962,14 +961,14 @@ impl Store {
                 capsule_id: req.capsule_id,
                 remote: req.remote,
             },
-            Some((req.operator, req.reason)),
+            Some((&req.operator, &req.reason)),
         )
     }
 
     fn reconcile_inner(
         &mut self,
         req: ReconcileRequest,
-        operator: Option<(String, String)>,
+        operator: Option<(&str, &str)>,
     ) -> Result<ReconcileOutcome> {
         use capsule_git::ls_remote_branch;
 
@@ -977,7 +976,7 @@ impl Store {
 
         let pending_json = load_pending_land_json(&self.conn, &req.capsule_id)?;
         let Some(snapshot_json) = pending_json else {
-            if let Some((op, reason)) = operator.as_ref() {
+            if let Some((op, reason)) = operator {
                 return self.audit_force_unfreeze_on_unfrozen(&now_str, &req.capsule_id, op, reason);
             }
             return Ok(ReconcileOutcome::NotFrozen);
@@ -987,9 +986,7 @@ impl Store {
         let witness_sha = ls_remote_branch(&req.remote, &pending.witness_branch)?;
         let witness_state = WitnessState::classify(witness_sha, &pending.verified_sha);
 
-        let actor: &str = operator
-            .as_ref()
-            .map_or(actor::RECONCILER, |(op, _)| op.as_str());
+        let actor: &str = operator.map_or(actor::RECONCILER, |(op, _)| op);
         let attempt_id_i64 = pending.attempt_id as i64;
         let witness_state_json = witness_remote_state_json(&witness_state);
 
@@ -1004,7 +1001,7 @@ impl Store {
                 ReconcileOutcome::CasLost,
                 &witness_state_json,
             )?;
-            if let Some((op, reason)) = operator.as_ref() {
+            if let Some((op, reason)) = operator {
                 emit_force_unfreeze_invoked(
                     &tx,
                     &now_str,
@@ -1066,7 +1063,7 @@ impl Store {
             outcome,
             &witness_state_json,
         )?;
-        if let Some((op, reason)) = operator.as_ref() {
+        if let Some((op, reason)) = operator {
             emit_force_unfreeze_invoked(
                 &tx,
                 &now_str,
