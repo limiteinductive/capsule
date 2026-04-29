@@ -378,20 +378,14 @@ impl Store {
 
         reclaim_expired_in_tx(&tx, now)?;
 
-        let (status_str, _active_attempt, frozen, depends_on_json, scope_json): (
-            String,
-            Option<i64>,
-            bool,
-            String,
-            String,
-        ) = tx
+        let (status_str, frozen, depends_on_json, scope_json): (String, bool, String, String) = tx
             .prepare_cached(
-                "SELECT status, active_attempt, pending_land_json IS NOT NULL,
+                "SELECT status, pending_land_json IS NOT NULL,
                         depends_on_json, scope_json
                  FROM capsule WHERE id = ?1",
             )?
             .query_row(params![req.capsule_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .or_not_found(&req.capsule_id)?;
 
