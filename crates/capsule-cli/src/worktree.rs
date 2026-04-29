@@ -61,9 +61,8 @@ pub fn setup(
     let setup_lock_path = locks_dir.join(format!("worktree-setup-{capsule_id}.lock"));
     let setup_lock = acquire_setup_lock(&setup_lock_path)?;
 
-    let default_path = canonical_capsule_dir.join(format!("worktrees/{capsule_id}-a{attempt_num}"));
     let worktree_path = match worktree_dir_override {
-        None => default_path,
+        None => canonical_capsule_dir.join(format!("worktrees/{capsule_id}-a{attempt_num}")),
         Some(p) => validate_worktree_dir_override(p, &main_worktree_root, &canonical_capsule_dir)?,
     };
 
