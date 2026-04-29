@@ -3,6 +3,7 @@
 //! Shells out to the `git` CLI for portability — `--force-with-lease` and
 //! atomic multi-ref push semantics are best preserved by the canonical client.
 
+use std::borrow::Cow;
 use std::process::Command;
 
 use thiserror::Error;
@@ -148,12 +149,12 @@ pub fn land_push(
         .output()?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr_to_string(out.stderr);
     let code = out.status.code().unwrap_or(-1);
 
     classify_push(
         &stdout,
-        &stderr,
+        Cow::Owned(stderr),
         out.status.success(),
         code,
         base_ref,
@@ -176,14 +177,15 @@ pub fn land_push(
 /// destinations; this function strips that prefix and compares bare names so
 /// `base_ref` / `witness_branch` callers don't pay two `format!` allocs per
 /// call.
-fn classify_push(
+fn classify_push<'a>(
     stdout: &str,
-    stderr: &str,
+    stderr: impl Into<Cow<'a, str>>,
     success: bool,
     code: i32,
     base_ref: &str,
     witness_branch: &str,
 ) -> Result<LandOutcome> {
+    let stderr = stderr.into();
     let mut witness: Option<RefLine<'_>> = None;
     let mut base: Option<RefLine<'_>> = None;
     for line in stdout.lines().filter_map(parse_ref_line) {
@@ -238,7 +240,11 @@ fn base_non_fast_forward(base: Option<RefLine<'_>>) -> bool {
 /// Stderr-only fallback when porcelain stdout did not carry per-ref reasons
 /// (older git, unrecognized output). Same precedence as the stdout path:
 /// witness leak outranks base non-FF.
-fn classify_failure_from_stderr(stderr: &str, code: i32) -> Result<LandOutcome> {
+///
+/// Takes `Cow<str>` so the `OtherFailure` / `Failed` arms can move the
+/// already-owned `String` from `land_push` (zero-alloc), while pure-`&str`
+/// callers (tests) still pay no extra cost on the borrow path.
+fn classify_failure_from_stderr(stderr: Cow<'_, str>, code: i32) -> Result<LandOutcome> {
     if stderr.contains(git_reject::STALE_INFO) {
         Ok(LandOutcome::WitnessOidMismatch)
     } else if [
@@ -252,12 +258,12 @@ fn classify_failure_from_stderr(stderr: &str, code: i32) -> Result<LandOutcome> 
         Ok(LandOutcome::BaseRefMoved)
     } else if code != 0 {
         Ok(LandOutcome::OtherFailure {
-            stderr: stderr.to_string(),
+            stderr: stderr.into_owned(),
         })
     } else {
         Err(GitError::Failed {
             code,
-            stderr: stderr.to_string(),
+            stderr: stderr.into_owned(),
         })
     }
 }
@@ -528,7 +534,7 @@ mod tests {
         let stderr = "error: failed to push some refs to '/tmp/remote.git'\n\
                       hint: Updates were rejected because the remote contains work that ...\n\
                       ! [rejected] witness -> witness (stale info)\n";
-        let r = classify_failure_from_stderr(stderr, 1).unwrap();
+        let r = classify_failure_from_stderr(Cow::Borrowed(stderr), 1).unwrap();
         assert_eq!(r, LandOutcome::WitnessOidMismatch);
     }
 
