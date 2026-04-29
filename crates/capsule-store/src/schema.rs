@@ -334,7 +334,7 @@ mod tests {
         let sql = "CREATE TABLE x (\n  c TEXT NOT NULL CHECK (c IN ('a','b', 'c' )),\n  d INT)";
         let got = extract_check_in_list(sql, "c");
         let want: std::collections::HashSet<String> =
-            ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            ["a", "b", "c"].into_iter().map(String::from).collect();
         assert_eq!(got, want);
     }
 
