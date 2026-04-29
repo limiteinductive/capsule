@@ -571,10 +571,8 @@ fn main() -> Result<()> {
             let reclaimed = store.reclaim(&args.capsule_id)?;
             if cli.json {
                 println!("{}", serde_json::json!({"reclaimed": reclaimed}));
-            } else if reclaimed {
-                println!("reclaimed");
             } else {
-                println!("no-op");
+                println!("{}", if reclaimed { "reclaimed" } else { "no-op" });
             }
         }
         Cmd::AddDep(args) => {
