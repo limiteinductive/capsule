@@ -80,9 +80,9 @@ fn detect_worktree() -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8(out.stdout).ok()?;
-    let trimmed = s.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    let mut s = String::from_utf8(out.stdout).ok()?;
+    s.truncate(s.trim_end().len());
+    (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
 /// Returns a warning string if git is missing or < 2.13.
