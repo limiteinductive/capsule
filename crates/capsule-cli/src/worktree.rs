@@ -177,7 +177,7 @@ fn validate_worktree_dir_override(
 }
 
 fn path_within(child: &Path, parent: &Path) -> bool {
-    child == parent || child.starts_with(parent)
+    child.starts_with(parent)
 }
 
 /// Canonicalize `p` if it exists; otherwise canonicalize its parent and rejoin
