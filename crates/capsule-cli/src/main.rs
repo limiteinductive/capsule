@@ -825,27 +825,19 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     let lease_lost = hb.shutdown();
     drop(isolate_state);
 
-    match status {
-        Ok(s) => {
-            let code = s.code().unwrap_or_else(|| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    s.signal().map_or(1, |sig| 128 + sig)
-                }
-                #[cfg(not(unix))]
-                {
-                    1
-                }
-            });
-            if lease_lost && code == 0 {
-                Ok(1)
-            } else {
-                Ok(code)
-            }
+    let s = status.map_err(|e| anyhow::anyhow!("spawning {first}: {e}"))?;
+    let code = s.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            s.signal().map_or(1, |sig| 128 + sig)
         }
-        Err(e) => Err(anyhow::anyhow!("spawning {first}: {e}")),
-    }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+    Ok(if lease_lost && code == 0 { 1 } else { code })
 }
 
 /// `Display` adapter for the comma-joined scope-list rendering used inside
