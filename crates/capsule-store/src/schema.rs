@@ -25,15 +25,15 @@ const V1_INITIAL: &str = r"
         title           TEXT NOT NULL,
         description     TEXT NOT NULL,
         acceptance_json TEXT NOT NULL,
-        scope_json      TEXT NOT NULL,    -- JSON array of canonical paths
+        scope_json      TEXT NOT NULL,
         base_ref        TEXT NOT NULL,
-        depends_on_json TEXT NOT NULL,    -- JSON array of capsule_id
+        depends_on_json TEXT NOT NULL,
         status          TEXT NOT NULL CHECK (status IN
                           ('planned','active','accepted','landed','abandoned')),
         active_attempt  INTEGER,
-        verification_json TEXT,           -- nullable; locked once status=accepted
-        pending_land_json TEXT,           -- nullable; reclaim-frozen while non-null (§7.2)
-        landing_json    TEXT,             -- nullable; terminal
+        verification_json TEXT,           -- locked once status=accepted
+        pending_land_json TEXT,           -- reclaim-frozen while non-null (§7.2)
+        landing_json    TEXT,             -- terminal
         created_at      TEXT NOT NULL,
         updated_at      TEXT NOT NULL
     );
