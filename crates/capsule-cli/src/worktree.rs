@@ -245,8 +245,9 @@ fn acquire_runtime_lock(path: &Path, worktree_path: &Path) -> Result<File> {
 }
 
 fn git_show_toplevel() -> Result<PathBuf> {
-    let out = run_git_capture(&["rev-parse", "--show-toplevel"])?;
-    Ok(PathBuf::from(out.trim()))
+    let mut out = run_git_capture(&["rev-parse", "--show-toplevel"])?;
+    out.truncate(out.trim_end().len());
+    Ok(PathBuf::from(out))
 }
 
 fn git_is_bare() -> Result<bool> {
