@@ -11,7 +11,10 @@ use capsule_store::{
 use clap::{Parser, Subcommand};
 use time::format_description::well_known::Rfc3339;
 
+mod config;
+mod deploy_verify;
 mod init;
+mod serialize_lint;
 mod worktree;
 
 #[derive(Parser)]
@@ -37,8 +40,10 @@ struct Cli {
 enum Cmd {
     /// Initialize a capsule store at `<dir>/state.db`.
     Init(InitArgs),
-    /// Run the deployment ACL test suite. [unimplemented]
-    DeployVerify,
+    /// Run the deployment ACL test suite (DESIGN §8.2). Hermetic mode spins
+    /// up a tempdir bare repo with the reference pre-receive hook; remote
+    /// mode runs against a real forge with three pre-provisioned principals.
+    DeployVerify(DeployVerifyArgs),
     /// Create a new capsule.
     Create(CreateArgs),
     /// Amend a planned capsule (pre-claim). Use before `claim` to fix a
@@ -201,6 +206,34 @@ struct AttestArgs {
     /// Write-once or content-addressed URI for the verification log.
     #[arg(long = "log-ref")]
     log_ref: String,
+    /// Repo to read `git diff --name-only <base_sha>..<verified_sha>` from for
+    /// the PROPOSAL §3.2 serialize-paths lint. Defaults to cwd.
+    #[arg(long = "repo-dir")]
+    repo_dir: Option<PathBuf>,
+    /// Bypass the PROPOSAL §3.2 serialize-paths lint. Audit-logged on stderr.
+    #[arg(long = "skip-serialize-lint")]
+    skip_serialize_lint: bool,
+}
+
+#[derive(clap::Args)]
+struct DeployVerifyArgs {
+    /// Run hermetically against a tempdir bare repo + reference pre-receive
+    /// hook. Mutually exclusive with --remote.
+    #[arg(long, conflicts_with = "remote")]
+    hermetic: bool,
+    /// Remote URL for real-forge mode. Requires --lander-url, --worker-url,
+    /// --outsider-url to specify per-identity push URLs.
+    #[arg(long, requires_all = ["lander_url", "worker_url", "outsider_url"])]
+    remote: Option<String>,
+    #[arg(long = "lander-url")]
+    lander_url: Option<String>,
+    #[arg(long = "worker-url")]
+    worker_url: Option<String>,
+    #[arg(long = "outsider-url")]
+    outsider_url: Option<String>,
+    /// Base ref to land against (default "main").
+    #[arg(long = "base-ref", default_value = "main")]
+    base_ref: String,
 }
 
 #[derive(clap::Args)]
@@ -507,6 +540,14 @@ fn main() -> Result<()> {
         }
         Cmd::Attest(args) => {
             let mut store = open_store(&dir)?;
+            run_serialize_lint(
+                &dir,
+                &store,
+                &args.capsule_id,
+                &args.verified_sha,
+                args.repo_dir.as_deref(),
+                args.skip_serialize_lint,
+            )?;
             let ack = store.attest(AttestRequest {
                 capsule_id: args.capsule_id,
                 session_id: args.session,
@@ -620,8 +661,31 @@ fn main() -> Result<()> {
                 println!("force-unfreeze\toutcome={wire}");
             }
         }
-        Cmd::DeployVerify => {
-            anyhow::bail!("not yet implemented")
+        Cmd::DeployVerify(args) => {
+            let mode = if args.hermetic {
+                deploy_verify::Mode::Hermetic
+            } else if let Some(remote) = args.remote.as_deref() {
+                deploy_verify::Mode::Remote {
+                    remote: remote.into(),
+                    lander_url: args.lander_url.clone().unwrap(),
+                    worker_url: args.worker_url.clone().unwrap(),
+                    outsider_url: args.outsider_url.clone().unwrap(),
+                }
+            } else {
+                anyhow::bail!("must specify --hermetic or --remote <url>");
+            };
+            let report = deploy_verify::run(deploy_verify::Opts {
+                mode,
+                base_ref: args.base_ref,
+                json: cli.json,
+            })?;
+            if report.all_passed {
+                let mut store = open_store(&dir)?;
+                store
+                    .record_deploy_verify_pass(&report.mode_label, &report.base_ref)
+                    .context("recording deploy verify pass")?;
+            }
+            std::process::exit(if report.all_passed { 0 } else { 1 });
         }
     }
     Ok(())
@@ -837,6 +901,61 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
         }
     });
     Ok(if lease_lost && code == 0 { 1 } else { code })
+}
+
+/// PROPOSAL §3.2: pre-attest gate that rejects when a touched lockfile is not
+/// covered by the capsule's declared scope. Lives CLI-side because DESIGN
+/// §7.1.0 keeps `Store::attest` git-free; the lint shells out to
+/// `git diff --name-only`. Findings exit 2 unless the user passes
+/// `--skip-serialize-lint`.
+fn run_serialize_lint(
+    dir: &Path,
+    store: &Store,
+    capsule_id: &str,
+    verified_sha: &str,
+    repo_dir_arg: Option<&Path>,
+    skip: bool,
+) -> Result<()> {
+    let cfg = config::load(dir)?;
+    let required = config::canonicalize_required(&cfg)?;
+    if required.is_empty() {
+        return Ok(());
+    }
+    let capsule = store.get_capsule(capsule_id)?;
+    let scope_prefixes = capsule.scope_prefixes.clone();
+    let base_sha = capsule
+        .into_active_attempt()
+        .ok_or_else(|| anyhow::anyhow!("no active attempt for {capsule_id}"))?
+        .base_sha;
+    let repo_dir = match repo_dir_arg {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("resolving --repo-dir / cwd")?,
+    };
+    let findings = serialize_lint::check_attest_diff(
+        &repo_dir,
+        &base_sha,
+        verified_sha,
+        &scope_prefixes,
+        &required,
+    )?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    for f in &findings {
+        eprintln!(
+            "serialize_path_uncovered: {} (matched required {})",
+            f.path, f.matched_required
+        );
+    }
+    if skip {
+        eprintln!("warning: --skip-serialize-lint set; PROPOSAL §3.2 lockfile lint bypassed");
+        return Ok(());
+    }
+    eprintln!(
+        "hint: amend the capsule with the listed paths in --scope, or pass \
+         --skip-serialize-lint to bypass."
+    );
+    std::process::exit(2);
 }
 
 /// `Display` adapter for the comma-joined scope-list rendering used inside
