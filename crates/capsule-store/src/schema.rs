@@ -235,6 +235,34 @@ mod tests {
         );
     }
 
+    /// `deploy_verify_pass` is single-row by construction: the gate is a
+    /// tri-state (never-run / passed / bypassed-by-flag), not a history.
+    /// `Store::record_deploy_verify_pass` hardcodes `VALUES (1, ...)` and
+    /// `check_deploy_verify_pass` reads `WHERE id = 1`, so the table's
+    /// `CHECK (id = 1)` is the runtime guard catching any caller that
+    /// drifts (e.g. a refactor switching to AUTOINCREMENT). A direct
+    /// `INSERT (id=2)` must fail at the SQLite layer.
+    #[test]
+    fn deploy_verify_pass_check_rejects_non_unit_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure(&conn).unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO deploy_verify_pass(id, at, mode, base_ref) \
+                 VALUES (2, '2026-01-01T00:00:00Z', 'hermetic', 'main')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK constraint failure, got {err}",
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deploy_verify_pass", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected row must not have partially landed");
+    }
+
     #[test]
     fn extract_check_in_list_parses_quoted_literals() {
         // Pin the parser shape used by the two CHECK-set tests against
