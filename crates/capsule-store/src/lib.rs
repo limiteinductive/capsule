@@ -1653,12 +1653,11 @@ fn find_scope_conflict(
 /// Monotonically increasing per capsule; gaps are allowed (an aborted claim
 /// leaves a row that future claims do not reuse).
 fn next_attempt_id(tx: &rusqlite::Transaction<'_>, capsule_id: &str) -> Result<i64> {
-    let next = tx
+    Ok(tx
         .prepare_cached(
             "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM attempt WHERE capsule_id = ?1",
         )?
-        .query_row(params![capsule_id], |r| r.get(0))?;
-    Ok(next)
+        .query_row(params![capsule_id], |r| r.get(0))?)
 }
 
 /// `list --available` filter: keep only `Planned` capsules whose deps are all
