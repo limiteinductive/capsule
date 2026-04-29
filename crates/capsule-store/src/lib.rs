@@ -1953,14 +1953,14 @@ fn creates_cycle(
 /// cleanest form.
 fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result<bool> {
     use std::collections::{HashSet, VecDeque};
+    if from == target {
+        return Ok(true);
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut q: VecDeque<String> = VecDeque::new();
     seen.insert(from.to_string());
     q.push_back(from.to_string());
     while let Some(node) = q.pop_front() {
-        if node == target {
-            return Ok(true);
-        }
         let mut stmt = tx.prepare_cached(
             "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
              WHERE c.id = ?1",
@@ -1970,6 +1970,9 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         for d in deps {
+            if d == target {
+                return Ok(true);
+            }
             if seen.insert(d.clone()) {
                 q.push_back(d);
             }
