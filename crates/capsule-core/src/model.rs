@@ -278,6 +278,23 @@ impl PendingLand {
             advanced_base_ref,
         }
     }
+
+    /// Variant of `into_landing` for the canonical lander finalizing its own
+    /// land — `landed_by` is taken directly from `self.lander`, so the caller
+    /// avoids a `String` clone. Used by `Store::land`'s success path; the
+    /// reconciler/operator paths still go through `into_landing` to record a
+    /// different actor.
+    pub fn into_self_landing(self, at: OffsetDateTime, advanced_base_ref: bool) -> Landing {
+        Landing {
+            at,
+            landed_sha: self.verified_sha,
+            prior_base_sha: self.prior_base_sha,
+            landed_by: self.lander,
+            attempt_id: self.attempt_id,
+            witness_branch: self.witness_branch,
+            advanced_base_ref,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

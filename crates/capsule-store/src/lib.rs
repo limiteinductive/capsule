@@ -704,8 +704,7 @@ impl Store {
         let outcome = match push_outcome {
             GitOutcome::Advanced { .. } | GitOutcome::NoOp => {
                 let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
-                let lander = pending.lander.clone();
-                let landing = pending.into_landing(now, advanced_base_ref, lander);
+                let landing = pending.into_self_landing(now, advanced_base_ref);
                 finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
                 LandOutcome::Landed { landing }
             }
