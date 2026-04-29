@@ -889,10 +889,10 @@ fn print_status(c: &Capsule) {
     if !c.depends_on.is_empty() {
         println!("  depends_on: {}", c.depends_on.join(", "));
     }
-    for (i, a) in c.attempts.iter().enumerate() {
+    for a in &c.attempts {
         println!(
             "  attempt {}: {}\tsession={}\tbranch={}\tlease_expires={}",
-            i + 1,
+            a.id,
             a.outcome.as_wire_str(),
             a.lease.session_id,
             a.branch,
