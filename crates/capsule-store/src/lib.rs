@@ -1568,13 +1568,7 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
            AND c.pending_land_json IS NULL",
     ))?;
     let candidates: Vec<(String, i64, String)> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
@@ -1632,9 +1626,9 @@ fn find_unmet_deps(
          WHERE c.id IS NULL
          ORDER BY j.key",
     )?;
-    let unmet = stmt
-        .query_map(params![depends_on_json], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unmet: Vec<String> = stmt
+        .query_map(params![depends_on_json], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(unmet)
 }
 
@@ -1687,8 +1681,8 @@ fn retain_available(
 ) -> Result<Vec<Capsule>> {
     let landed_ids: std::collections::HashSet<String> = tx
         .prepare_cached("SELECT id FROM capsule WHERE status = 'landed'")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     let in_flight_scopes: Vec<(String, Vec<CanonicalPath>)> = tx
         .prepare_cached(concat!(
             "SELECT id, scope_json FROM capsule WHERE status IN (",
@@ -1700,7 +1694,7 @@ fn retain_available(
             let (id, j) = row?;
             Ok((id, json::from_str(&j)?))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<_>>()?;
 
     Ok(capsules
         .into_iter()
@@ -1983,9 +1977,9 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
             "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
              WHERE c.id = ?1",
         )?;
-        let deps = stmt
-            .query_map(params![node], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
+        let deps: Vec<String> = stmt
+            .query_map(params![node], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         for d in deps {
             if seen.insert(d.clone()) {
