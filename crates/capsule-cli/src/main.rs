@@ -425,25 +425,21 @@ fn main() -> Result<()> {
         }
         Cmd::Amend(args) => {
             let mut store = open_store(&dir)?;
-            let acceptance = if let Some(run) = args.acceptance_cmd {
-                Some(Acceptance {
-                    run,
-                    expect_exit: ExpectExit::Code(args.acceptance_expect_exit.unwrap_or(0)),
-                    cwd: args.acceptance_cwd,
-                    timeout_sec: args.acceptance_timeout_sec,
-                })
-            } else {
-                if args.acceptance_expect_exit.is_some()
-                    || args.acceptance_cwd.is_some()
-                    || args.acceptance_timeout_sec.is_some()
-                {
-                    anyhow::bail!(
-                        "--acceptance-expect-exit/--acceptance-cwd/--acceptance-timeout-sec \
-                         require --acceptance-cmd"
-                    );
-                }
-                None
-            };
+            let has_acceptance_options = args.acceptance_expect_exit.is_some()
+                || args.acceptance_cwd.is_some()
+                || args.acceptance_timeout_sec.is_some();
+            if args.acceptance_cmd.is_none() && has_acceptance_options {
+                anyhow::bail!(
+                    "--acceptance-expect-exit/--acceptance-cwd/--acceptance-timeout-sec \
+                     require --acceptance-cmd"
+                );
+            }
+            let acceptance = args.acceptance_cmd.map(|run| Acceptance {
+                run,
+                expect_exit: ExpectExit::Code(args.acceptance_expect_exit.unwrap_or(0)),
+                cwd: args.acceptance_cwd,
+                timeout_sec: args.acceptance_timeout_sec,
+            });
             let scope_prefixes = if args.scope.is_empty() {
                 None
             } else {
