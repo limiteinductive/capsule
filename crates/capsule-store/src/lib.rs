@@ -852,7 +852,6 @@ impl Store {
         }
         deps.push(req.depends_on);
         let new_json = json::to_string(&deps)?;
-        let dep_id = deps.last().expect("just pushed");
 
         persist_dep_change(
             &tx,
@@ -860,7 +859,7 @@ impl Store {
             &req.capsule_id,
             &new_json,
             EventKind::DependencyAdded,
-            dep_id,
+            deps.last().expect("just pushed"),
         )?;
         tx.commit()?;
         Ok(())
