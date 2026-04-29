@@ -1561,6 +1561,14 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
+    let mut revert_stmt = tx.prepare_cached(
+        "UPDATE capsule
+            SET status='planned',
+                active_attempt=NULL,
+                verification_json=NULL,
+                updated_at=?1
+          WHERE id=?2",
+    )?;
     for (capsule_id, attempt_id, expires_at_str) in candidates {
         let expires_at = parse_iso8601(&expires_at_str);
         if now <= expires_at {
@@ -1574,15 +1582,7 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
             capsule_core::AttemptOutcome::Expired,
             &now_str,
         )?;
-        tx.prepare_cached(
-            "UPDATE capsule
-                SET status='planned',
-                    active_attempt=NULL,
-                    verification_json=NULL,
-                    updated_at=?1
-              WHERE id=?2",
-        )?
-        .execute(params![now_str, capsule_id])?;
+        revert_stmt.execute(params![now_str, capsule_id])?;
         let payload = json::json!({
             "at": now_str,
             "prior_lease_expires_at": expires_at_str,
@@ -1960,15 +1960,14 @@ fn reachable(tx: &rusqlite::Transaction<'_>, from: &str, target: &str) -> Result
     let mut q: VecDeque<String> = VecDeque::new();
     seen.insert(from.to_string());
     q.push_back(from.to_string());
+    let mut deps_stmt = tx.prepare_cached(
+        "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
+         WHERE c.id = ?1",
+    )?;
     while let Some(node) = q.pop_front() {
-        let mut stmt = tx.prepare_cached(
-            "SELECT j.value FROM capsule c, json_each(c.depends_on_json) j
-             WHERE c.id = ?1",
-        )?;
-        let deps: Vec<String> = stmt
+        let deps: Vec<String> = deps_stmt
             .query_map(params![node], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
         for d in deps {
             if d == target {
                 return Ok(true);
