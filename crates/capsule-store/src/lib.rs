@@ -989,8 +989,7 @@ impl Store {
 
         let actor: &str = operator
             .as_ref()
-            .map(|(op, _)| op.as_str())
-            .unwrap_or(actor::RECONCILER);
+            .map_or(actor::RECONCILER, |(op, _)| op.as_str());
         let attempt_id_i64 = pending.attempt_id as i64;
         let witness_state_json = witness_remote_state_json(&witness_state);
 
