@@ -90,9 +90,10 @@ const V2_DEPLOY_VERIFY_GATE: &str = r"
     ";
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch(
-        "BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY); COMMIT;",
-    )?;
+    // Bootstrap `schema_version` so the version-read below has a table to
+    // hit. Outside an explicit transaction, SQLite runs the single DDL
+    // statement in an implicit transaction — no BEGIN/COMMIT wrapper needed.
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")?;
 
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
