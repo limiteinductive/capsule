@@ -2901,7 +2901,7 @@ mod tests {
         let v = read_event_payload(&s, "x", "attempt_attested");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec!["command", "duration_ms", "exit_code", "log_ref", "verified_sha"]
@@ -2988,7 +2988,7 @@ mod tests {
         let v = read_event_payload(&s, "x", "capsule_created");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec!["acceptance", "base_ref", "depends_on", "scope_prefixes"]
@@ -3045,7 +3045,7 @@ mod tests {
             let v = read_event_payload(&s, "a", kind);
             let obj = v.as_object().expect("payload must be a JSON object");
             let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-            keys.sort();
+            keys.sort_unstable();
             assert_eq!(keys, vec!["dep_id"], "{kind}");
             assert_eq!(v["dep_id"], "b", "{kind}");
         }
@@ -3092,7 +3092,7 @@ mod tests {
         let v = read_event_payload(&s, "x", "capsule_abandoned");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["reason"]);
         assert_eq!(v["reason"], "user request");
     }
@@ -4161,7 +4161,7 @@ mod tests {
         let v = read_event_payload(&s, "x", "attempt_expired");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["at", "prior_lease_expires_at"]);
     }
 
@@ -5886,7 +5886,7 @@ mod tests {
         let v = read_event_payload(&s, id, "pending_land_committed");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec![
@@ -5977,7 +5977,7 @@ mod tests {
         let v = read_event_payload(&s, id, "capsule_landed");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec![
@@ -6354,7 +6354,7 @@ mod tests {
         let v = read_event_payload(&s, id, "reconciler_ran");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["decision", "witness_remote_state"]);
         assert_eq!(v["decision"], "landed");
         assert_eq!(v["witness_remote_state"]["state"], "at_verified_sha");
@@ -6599,7 +6599,7 @@ mod tests {
         let v: json::Value = json::from_str(&payload).unwrap();
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["by", "reason"]);
         assert_eq!(v["reason"], "witness_absent");
         assert_eq!(v["by"], actor);
@@ -6647,14 +6647,14 @@ mod tests {
         let v = read_event_payload(&s, id, "reconciler_ran");
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["decision", "witness_remote_state"]);
         assert_eq!(v["decision"], "cleared");
         let state = v["witness_remote_state"]
             .as_object()
             .expect("witness_remote_state must be a JSON object");
         let mut state_keys: Vec<&str> = state.keys().map(String::as_str).collect();
-        state_keys.sort();
+        state_keys.sort_unstable();
         assert_eq!(state_keys, vec!["state"], "Absent variant must not carry sha");
         assert_eq!(state["state"], "absent");
     }
@@ -6870,7 +6870,7 @@ mod tests {
         let v: json::Value = json::from_str(&payload).unwrap();
         let obj = v.as_object().expect("payload must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec!["operator", "post_action_outcome", "reason", "snapshot"]
