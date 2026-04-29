@@ -310,10 +310,8 @@ impl Store {
             return self.get_capsule(&capsule_id);
         }
 
-        let updated_at_idx = update.vals.len() + 1;
-        let where_idx = updated_at_idx + 1;
-        update.sets.push(format!("updated_at = ?{updated_at_idx}"));
-        update.vals.push(now_str.clone().into());
+        update.bind_set_only("updated_at", now_str.clone().into());
+        let where_idx = update.next_placeholder();
         update.vals.push(capsule_id.clone().into());
         let sql = format!(
             "UPDATE capsule SET {} WHERE id = ?{where_idx}",
@@ -2106,13 +2104,13 @@ impl AmendUpdate {
         self.vals.len() + 1
     }
 
-    fn bind_sql_only(&mut self, col: &str, val: rusqlite::types::Value) {
+    fn bind_set_only(&mut self, col: &str, val: rusqlite::types::Value) {
         self.sets.push(format!("{col} = ?{}", self.next_placeholder()));
         self.vals.push(val);
     }
 
     fn set_string(&mut self, col: &str, diff_key: &str, value: String) {
-        self.bind_sql_only(col, value.clone().into());
+        self.bind_set_only(col, value.clone().into());
         self.diff.insert(diff_key.into(), json::Value::String(value));
     }
 
@@ -2128,7 +2126,7 @@ impl AmendUpdate {
         value: &T,
     ) -> Result<()> {
         let v = json::to_value(value)?;
-        self.bind_sql_only(col, v.to_string().into());
+        self.bind_set_only(col, v.to_string().into());
         self.diff.insert(diff_key.into(), v);
         Ok(())
     }
