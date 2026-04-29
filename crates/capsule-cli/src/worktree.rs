@@ -245,20 +245,17 @@ fn acquire_runtime_lock(path: &Path, worktree_path: &Path) -> Result<File> {
 }
 
 fn git_show_toplevel() -> Result<PathBuf> {
-    let out = run_git_capture(&["rev-parse", "--show-toplevel"])
-        .context("git rev-parse --show-toplevel")?;
+    let out = run_git_capture(&["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(out.trim()))
 }
 
 fn git_is_bare() -> Result<bool> {
-    let out = run_git_capture(&["rev-parse", "--is-bare-repository"])
-        .context("git rev-parse --is-bare-repository")?;
+    let out = run_git_capture(&["rev-parse", "--is-bare-repository"])?;
     Ok(out.trim() == "true")
 }
 
 fn git_rev_parse(rev: &str) -> Result<String> {
-    let mut out = run_git_capture(&["rev-parse", "--verify", rev])
-        .with_context(|| format!("git rev-parse {rev}"))?;
+    let mut out = run_git_capture(&["rev-parse", "--verify", rev])?;
     out.truncate(out.trim_end().len());
     Ok(out)
 }
@@ -346,7 +343,7 @@ fn run_git_capture(args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .args(args)
         .output()
-        .context("spawn git")?;
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -354,7 +351,8 @@ fn run_git_capture(args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8(out.stdout)?)
+    String::from_utf8(out.stdout)
+        .with_context(|| format!("git {} stdout is not valid utf-8", args.join(" ")))
 }
 
 #[cfg(test)]
