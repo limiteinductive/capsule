@@ -2031,16 +2031,21 @@ struct LandableSnapshot {
 
 impl LandableSnapshot {
     /// Consumes the capsule so land step 1 can move out the three needed
-    /// String fields instead of cloning them.
-    fn extract(mut cap: capsule_core::Capsule) -> Option<Self> {
+    /// String fields instead of cloning them. Partial-moves the three
+    /// fields directly out of `cap`, sidestepping the mutable
+    /// `take()` + `position()` + `swap_remove()` path the prior shape used.
+    fn extract(cap: capsule_core::Capsule) -> Option<Self> {
         let aid = cap.active_attempt?;
-        let v = cap.verification.take()?;
-        let pos = cap.attempts.iter().position(|a| a.id == aid)?;
-        let att = cap.attempts.swap_remove(pos);
+        let verified_sha = cap.verification?.verified_sha;
+        let witness_branch = cap
+            .attempts
+            .into_iter()
+            .find(|a| a.id == aid)?
+            .witness_branch;
         Some(Self {
             base_ref: cap.base_ref,
-            witness_branch: att.witness_branch,
-            verified_sha: v.verified_sha,
+            witness_branch,
+            verified_sha,
         })
     }
 }
