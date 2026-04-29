@@ -631,9 +631,7 @@ impl Store {
         };
         let prior_base_sha = ls_remote_branch(&req.remote, &base_ref)?;
 
-        let attempt_id: i64;
-        let pending_json: String;
-        let pending = {
+        let (attempt_id, pending_json, pending) = {
             let (now, now_str) = now_pair()?;
             let tx = self.conn.transaction()?;
 
@@ -648,7 +646,6 @@ impl Store {
                 return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Land, status));
             }
             let aid = active_attempt.expect("accepted ⇒ active_attempt set");
-            attempt_id = aid;
             let in_tx_verified_sha =
                 in_tx_verified_sha.expect("accepted ⇒ verification set with verified_sha");
             if in_tx_verified_sha != verified_sha {
@@ -665,8 +662,7 @@ impl Store {
                 witness_branch,
                 lander: req.lander,
             };
-            let (pending_value, pending_str) = serialize_value_and_text(&pending)?;
-            pending_json = pending_str;
+            let (pending_value, pending_json) = serialize_value_and_text(&pending)?;
 
             tx.prepare_cached(
                 "UPDATE capsule SET pending_land_json=?1, updated_at=?2 WHERE id=?3",
@@ -682,7 +678,7 @@ impl Store {
                 &pending_value,
             )?;
             tx.commit()?;
-            pending
+            (aid, pending_json, pending)
         };
 
         let push_outcome = land_push(
