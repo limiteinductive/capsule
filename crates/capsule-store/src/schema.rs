@@ -8,13 +8,14 @@ use rusqlite::{Connection, Result as SqlResult};
 /// follows.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
-const MIGRATIONS: &[&str] = &[
-    // v1: initial schema. Capsule is the aggregate root; attempts and events
-    // are normalized; attestations and landing live inline on the capsule
-    // (only one of each per capsule lifetime — verification is locked at
-    // accepted, landing is terminal). PendingLand is inline JSON for the
-    // crash-recovery transactional invariant in DESIGN.md §7.1.2.
-    r"
+const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_DEPLOY_VERIFY_GATE];
+
+/// v1: initial schema. Capsule is the aggregate root; attempts and events
+/// are normalized; attestations and landing live inline on the capsule
+/// (only one of each per capsule lifetime — verification is locked at
+/// accepted, landing is terminal). PendingLand is inline JSON for the
+/// crash-recovery transactional invariant in DESIGN.md §7.1.2.
+const V1_INITIAL: &str = r"
     CREATE TABLE IF NOT EXISTS schema_version (
         version INTEGER PRIMARY KEY
     );
@@ -71,22 +72,22 @@ const MIGRATIONS: &[&str] = &[
     );
 
     CREATE INDEX IF NOT EXISTS idx_event_capsule ON event(capsule_id, rowid);
-    ",
-    // v2: deploy-verify gate (DESIGN.md §8.2). `deploy_verify_pass` records
-    // the most recent successful run of the ACL test suite for this store.
-    // `Store::land` requires a non-null row before committing PendingLand,
-    // unless `LandRequest::skip_deploy_verify_gate` is set. Single-row table
-    // (PRIMARY KEY = 1) — the gate is a tri-state (never-run / passed /
-    // bypassed-by-flag), not a history.
-    r"
+    ";
+
+/// v2: deploy-verify gate (DESIGN.md §8.2). `deploy_verify_pass` records
+/// the most recent successful run of the ACL test suite for this store.
+/// `Store::land` requires a non-null row before committing PendingLand,
+/// unless `LandRequest::skip_deploy_verify_gate` is set. Single-row table
+/// (PRIMARY KEY = 1) — the gate is a tri-state (never-run / passed /
+/// bypassed-by-flag), not a history.
+const V2_DEPLOY_VERIFY_GATE: &str = r"
     CREATE TABLE IF NOT EXISTS deploy_verify_pass (
         id        INTEGER PRIMARY KEY CHECK (id = 1),
         at        TEXT NOT NULL,
         mode      TEXT NOT NULL,
         base_ref  TEXT NOT NULL
     );
-    ",
-];
+    ";
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(
@@ -159,6 +160,12 @@ mod tests {
     /// enough for the v1 schema's hand-written CHECK clauses; extending to
     /// a CHECK with parens or escaped quotes inside literals would require
     /// a real parser.
+    ///
+    /// Each token must be a single-quoted literal; absent quotes panic
+    /// instead of silently round-tripping through `trim_matches`, so a typo
+    /// dropping the quotes in the CHECK list fails loudly. Without this
+    /// guard, a malformed CHECK could produce values that compare equal to
+    /// the enum wire strings and pass the set-equality tests.
     fn extract_check_in_list(sql: &str, column: &str) -> std::collections::HashSet<String> {
         let needle = format!("CHECK ({column} IN");
         let after = sql
@@ -171,11 +178,6 @@ mod tests {
             .split(',')
             .map(|tok| {
                 let t = tok.trim();
-                // Each token must be a single-quoted literal; refuse to
-                // silently strip absent quotes so a bare identifier in the
-                // CHECK list (e.g. a typo dropping the quotes) fails loudly
-                // instead of round-tripping through the same trim_matches
-                // as the legitimate quoted form.
                 assert!(
                     t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2,
                     "expected single-quoted SQL literal in CHECK IN list, got {t:?}",
@@ -263,12 +265,12 @@ mod tests {
         assert_eq!(count, 0, "rejected row must not have partially landed");
     }
 
+    /// Pin the parser shape used by the two CHECK-set tests against
+    /// realistic whitespace variations (`'a','b', 'c' ` — leading-space,
+    /// no-space, trailing-space) so a future schema reformat doesn't
+    /// silently break extraction.
     #[test]
     fn extract_check_in_list_parses_quoted_literals() {
-        // Pin the parser shape used by the two CHECK-set tests against
-        // realistic whitespace variations (`'a','b', 'c' ` — leading-space,
-        // no-space, trailing-space) so a future schema reformat doesn't
-        // silently break extraction.
         let sql = "CREATE TABLE x (\n  c TEXT NOT NULL CHECK (c IN ('a','b', 'c' )),\n  d INT)";
         let got = extract_check_in_list(sql, "c");
         let want: std::collections::HashSet<String> =
@@ -276,15 +278,15 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// Pin the contract: an IN-list element without enclosing quotes
+    /// (e.g. a typo where someone wrote `bare` instead of `'bare'`)
+    /// panics rather than silently round-tripping through the
+    /// trim/strip path. Without this guard, a malformed CHECK could
+    /// produce values that compare equal to the enum wire strings
+    /// and pass the set-equality tests.
     #[test]
     #[should_panic(expected = "expected single-quoted SQL literal")]
     fn extract_check_in_list_rejects_unquoted_token() {
-        // Pin the contract: an IN-list element without enclosing quotes
-        // (e.g. a typo where someone wrote `bare` instead of `'bare'`)
-        // panics rather than silently round-tripping through the
-        // trim/strip path. Without this guard, a malformed CHECK could
-        // produce values that compare equal to the enum wire strings
-        // and pass the set-equality tests.
         let sql = "CHECK (c IN ('a', bare, 'c'))";
         let _ = extract_check_in_list(sql, "c");
     }
