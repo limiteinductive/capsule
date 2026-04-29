@@ -233,9 +233,13 @@ fn base_non_fast_forward(base: Option<RefLine<'_>>) -> bool {
 fn classify_failure_from_stderr(stderr: &str, code: i32) -> Result<LandOutcome> {
     if stderr.contains(git_reject::STALE_INFO) {
         Ok(LandOutcome::WitnessOidMismatch)
-    } else if stderr.contains(git_reject::NON_FAST_FORWARD)
-        || stderr.contains(git_reject::FETCH_FIRST)
-        || stderr.contains(git_reject::UPDATES_REJECTED)
+    } else if [
+        git_reject::NON_FAST_FORWARD,
+        git_reject::FETCH_FIRST,
+        git_reject::UPDATES_REJECTED,
+    ]
+    .iter()
+    .any(|n| stderr.contains(n))
     {
         Ok(LandOutcome::BaseRefMoved)
     } else if code != 0 {
@@ -341,7 +345,8 @@ mod tests {
     const STALE_INFO_STDERR: &str = "error: failed to push some refs to '/tmp/remote.git'\n";
     const FETCH_FIRST_STDOUT: &str =
         "To /tmp/remote.git\n!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n";
-    const FETCH_FIRST_STDERR: &str = "error: failed to push some refs to '/tmp/remote.git'\nhint: Updates were rejected ...\n";
+    const FETCH_FIRST_STDERR: &str =
+        "error: failed to push some refs to '/tmp/remote.git'\nhint: Updates were rejected ...\n";
     const ADVANCED_STDOUT: &str =
         "To /tmp/remote.git\n \trefs/heads/x:refs/heads/main\t<sha>..<sha>\n*\trefs/heads/x:refs/heads/capsule-witness/foo/a1\t[new branch]\nDone\n";
     const NOOP_STDOUT: &str = "To /tmp/remote.git\n=\trefs/heads/x:refs/heads/main\t[up to date]\n=\trefs/heads/x:refs/heads/capsule-witness/foo/a1\t[up to date]\nDone\n";
