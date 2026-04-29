@@ -634,6 +634,7 @@ fn main() -> Result<()> {
 }
 
 struct SessionAttempt {
+    /// Raw lease TTL; heartbeat cadence is floored in `spawn_heartbeat_thread`.
     ttl: u64,
     branch: String,
     base_sha: String,
@@ -668,7 +669,7 @@ fn load_session_attempt(
         );
     }
     Ok(SessionAttempt {
-        ttl: attempt.lease.ttl_sec.max(3),
+        ttl: attempt.lease.ttl_sec,
         branch: attempt.branch,
         base_sha: attempt.base_sha,
         num: attempt.id,
