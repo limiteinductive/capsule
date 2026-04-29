@@ -6056,6 +6056,24 @@ mod tests {
         );
     }
 
+    /// `DeployVerifyMissing`'s Display message is the operator's only hint
+    /// at the remediation step (`capsule deploy verify --hermetic` /
+    /// `--remote <url>`). Pin the literal so a refactor that shortened
+    /// the message to a generic "deploy verify gate: missing pass"
+    /// (matching the variant pattern but losing the actionable hint)
+    /// fails the test.
+    #[test]
+    fn deploy_verify_missing_display_message() {
+        let err = StoreError::DeployVerifyMissing;
+        assert_eq!(
+            err.to_string(),
+            "deploy verify gate: no recorded pass — run \
+             `capsule deploy verify --hermetic` (or `--remote <url>`) \
+             before landing, or pass --skip-deploy-verify-gate \
+             (DESIGN.md §8.2)"
+        );
+    }
+
     /// `record_deploy_verify_pass` is single-row by construction (PK CHECK
     /// id=1, INSERT OR REPLACE) — re-running `capsule deploy verify` from
     /// the operator overwrites the prior pass rather than accumulating
