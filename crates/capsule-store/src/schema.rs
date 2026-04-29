@@ -72,6 +72,20 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX IF NOT EXISTS idx_event_capsule ON event(capsule_id, rowid);
     ",
+    // v2: deploy-verify gate (DESIGN.md §8.2). `deploy_verify_pass` records
+    // the most recent successful run of the ACL test suite for this store.
+    // `Store::land` requires a non-null row before committing PendingLand,
+    // unless `LandRequest::skip_deploy_verify_gate` is set. Single-row table
+    // (PRIMARY KEY = 1) — the gate is a tri-state (never-run / passed /
+    // bypassed-by-flag), not a history.
+    r"
+    CREATE TABLE IF NOT EXISTS deploy_verify_pass (
+        id        INTEGER PRIMARY KEY CHECK (id = 1),
+        at        TEXT NOT NULL,
+        mode      TEXT NOT NULL,
+        base_ref  TEXT NOT NULL
+    );
+    ",
 ];
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
