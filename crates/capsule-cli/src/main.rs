@@ -440,11 +440,9 @@ fn main() -> Result<()> {
                 cwd: args.acceptance_cwd,
                 timeout_sec: args.acceptance_timeout_sec,
             });
-            let scope_prefixes = if args.scope.is_empty() {
-                None
-            } else {
-                Some(canonicalize_scope_args(&args.scope)?)
-            };
+            let scope_prefixes = (!args.scope.is_empty())
+                .then(|| canonicalize_scope_args(&args.scope))
+                .transpose()?;
             let capsule = store.amend(AmendRequest {
                 capsule_id: args.capsule_id,
                 title: args.title,
