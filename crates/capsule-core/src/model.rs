@@ -35,13 +35,13 @@ impl Status {
     /// reading from the DB or schema-validated input may treat that as
     /// corruption (the SQL CHECK constraint enforces the membership) and
     /// panic, while less-trusted callers can surface a clean error.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "planned" => Self::Planned,
-            "active" => Self::Active,
-            "accepted" => Self::Accepted,
-            "landed" => Self::Landed,
-            "abandoned" => Self::Abandoned,
+    pub const fn from_wire(s: &str) -> Option<Self> {
+        Some(match s.as_bytes() {
+            b"planned" => Self::Planned,
+            b"active" => Self::Active,
+            b"accepted" => Self::Accepted,
+            b"landed" => Self::Landed,
+            b"abandoned" => Self::Abandoned,
             _ => return None,
         })
     }
@@ -114,13 +114,13 @@ impl AttemptOutcome {
         }
     }
 
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "in_flight" => Self::InFlight,
-            "released" => Self::Released,
-            "expired" => Self::Expired,
-            "abandoned" => Self::Abandoned,
-            "landed" => Self::Landed,
+    pub const fn from_wire(s: &str) -> Option<Self> {
+        Some(match s.as_bytes() {
+            b"in_flight" => Self::InFlight,
+            b"released" => Self::Released,
+            b"expired" => Self::Expired,
+            b"abandoned" => Self::Abandoned,
+            b"landed" => Self::Landed,
             _ => return None,
         })
     }
