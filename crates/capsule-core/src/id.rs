@@ -23,7 +23,7 @@ pub enum IdError {
     LockSuffix,
 }
 
-pub fn validate(id: &str) -> Result<(), IdError> {
+pub const fn validate(id: &str) -> Result<(), IdError> {
     let bytes = id.as_bytes();
     let len = bytes.len();
     if len == 0 {
@@ -35,12 +35,21 @@ pub fn validate(id: &str) -> Result<(), IdError> {
     if bytes[0] == b'.' || bytes[len - 1] == b'.' {
         return Err(IdError::EdgeDot);
     }
-    if id.ends_with(".lock") {
-        return Err(IdError::LockSuffix);
+    if len >= 5 {
+        let t = len - 5;
+        if bytes[t] == b'.'
+            && bytes[t + 1] == b'l'
+            && bytes[t + 2] == b'o'
+            && bytes[t + 3] == b'c'
+            && bytes[t + 4] == b'k'
+        {
+            return Err(IdError::LockSuffix);
+        }
     }
     let mut prev_dot = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => prev_dot = false,
             b'.' => {
                 if prev_dot {
@@ -50,6 +59,7 @@ pub fn validate(id: &str) -> Result<(), IdError> {
             }
             _ => return Err(IdError::InvalidChar(i)),
         }
+        i += 1;
     }
     Ok(())
 }
