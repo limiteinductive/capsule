@@ -3,7 +3,7 @@
 //! Shells out to the `git` CLI for portability — `--force-with-lease` and
 //! atomic multi-ref push semantics are best preserved by the canonical client.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use thiserror::Error;
 
@@ -53,8 +53,6 @@ mod git_reject {
 pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
     let out = Command::new("git")
         .args(["ls-remote", "--heads", remote, branch])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
         .output()?;
     if !out.status.success() {
         return Err(GitError::Failed {
@@ -139,8 +137,6 @@ pub fn land_push(
             &base_refspec,
             &witness_refspec,
         ])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
         .output()?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
