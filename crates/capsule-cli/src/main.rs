@@ -601,10 +601,11 @@ fn main() -> Result<()> {
                 capsule_id: args.capsule_id,
                 remote: args.remote,
             })?;
+            let wire = outcome.as_wire_str();
             if cli.json {
-                print_json(&outcome.as_wire_str())?;
+                print_json(&wire)?;
             } else {
-                println!("reconcile\toutcome={}", outcome.as_wire_str());
+                println!("reconcile\toutcome={wire}");
             }
         }
         Cmd::ForceUnfreeze(args) => {
@@ -616,10 +617,11 @@ fn main() -> Result<()> {
                 reason: args.reason,
                 lander_confirmed_dead: args.lander_confirmed_dead,
             })?;
+            let wire = outcome.as_wire_str();
             if cli.json {
-                print_json(&outcome.as_wire_str())?;
+                print_json(&wire)?;
             } else {
-                println!("force-unfreeze\toutcome={}", outcome.as_wire_str());
+                println!("force-unfreeze\toutcome={wire}");
             }
         }
         Cmd::DeployVerify => {
