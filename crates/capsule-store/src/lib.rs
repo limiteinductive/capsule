@@ -6056,6 +6056,40 @@ mod tests {
         );
     }
 
+    /// `record_deploy_verify_pass` is single-row by construction (PK CHECK
+    /// id=1, INSERT OR REPLACE) — re-running `capsule deploy verify` from
+    /// the operator overwrites the prior pass rather than accumulating
+    /// rows. A refactor that dropped `OR REPLACE` (plain INSERT) would
+    /// leave the first pass passing but the second call would fail with a
+    /// PK conflict, breaking the routine "re-verify" workflow.
+    #[test]
+    fn record_deploy_verify_pass_is_idempotent_and_overwrites() {
+        let mut s = tmp_store();
+        s.record_deploy_verify_pass("hermetic", "main").unwrap();
+        s.record_deploy_verify_pass("remote:origin", "release")
+            .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM deploy_verify_pass",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "INSERT OR REPLACE must keep a single row");
+        let (mode, base_ref): (String, String) = s
+            .conn
+            .query_row(
+                "SELECT mode, base_ref FROM deploy_verify_pass WHERE id = 1",
+                params![],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "remote:origin", "second call's mode must overwrite");
+        assert_eq!(base_ref, "release", "second call's base_ref must overwrite");
+        assert!(s.check_deploy_verify_pass().unwrap());
+    }
+
     /// Active but unattested capsules fail pre-tx with `NotLandable`,
     /// preserving the caller hint to attest before landing.
     #[test]
