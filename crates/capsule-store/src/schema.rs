@@ -139,6 +139,36 @@ mod tests {
         assert_eq!(count, SCHEMA_VERSION);
     }
 
+    /// Hand-stamp a fresh in-memory DB at v1: runs `V1_INITIAL` directly
+    /// (bypassing `ensure`) and records `version=1`. Used to seed the
+    /// partial-upgrade path test.
+    fn stamp_at_v1(conn: &Connection) {
+        conn.execute_batch(V1_INITIAL).unwrap();
+        conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])
+            .unwrap();
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    fn recorded_versions(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_version ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     /// Pin the partial-upgrade path: a DB stamped at v1 must skip V1_INITIAL
     /// (its `INSERT INTO schema_version VALUES (1)` would PK-conflict if
     /// re-run) and apply V2 only. Without this, an off-by-one in the skip
@@ -149,46 +179,19 @@ mod tests {
     #[test]
     fn ensure_skips_already_applied_migrations() {
         let conn = Connection::open_in_memory().unwrap();
-        // Hand-stamp the DB at v1 by running V1_INITIAL directly (without
-        // going through `ensure`) and recording version=1.
-        conn.execute_batch(V1_INITIAL).unwrap();
-        conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])
-            .unwrap();
-        // `deploy_verify_pass` (V2) must not exist yet.
-        let v2_pre: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema \
-                 WHERE type='table' AND name='deploy_verify_pass'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(v2_pre, 0, "precondition: V2 not yet applied");
+        stamp_at_v1(&conn);
+        assert!(
+            !table_exists(&conn, "deploy_verify_pass"),
+            "precondition: V2 not yet applied",
+        );
 
         ensure(&conn).unwrap();
 
-        // V2 applied: table exists.
-        let v2_post: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema \
-                 WHERE type='table' AND name='deploy_verify_pass'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(v2_post, 1, "V2 must apply on top of v1-stamped DB");
-
-        // schema_version has exactly {1, 2}; if V1 had re-run, the INSERT
-        // would have PK-conflicted before reaching this assertion.
-        let mut stmt = conn
-            .prepare("SELECT version FROM schema_version ORDER BY version")
-            .unwrap();
-        let versions: Vec<i64> = stmt
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(versions, vec![1, 2]);
+        assert!(
+            table_exists(&conn, "deploy_verify_pass"),
+            "V2 must apply on top of v1-stamped DB",
+        );
+        assert_eq!(recorded_versions(&conn), vec![1, 2]);
     }
 
     /// Read the live CREATE TABLE SQL for `table_name` from `sqlite_schema`.
