@@ -71,15 +71,12 @@ pub fn ls_remote_branch(remote: &str, branch: &str) -> Result<String> {
 /// (e.g. a corrupt remote response) cannot flow into Store::land's
 /// `pre_push_base_sha` and silently corrupt the §7.1.2 dance.
 fn parse_ls_remote_stdout(stdout: &str) -> Result<String> {
-    match stdout.split_whitespace().next() {
-        None => Ok(ZERO_OID.to_string()),
-        Some(sha) => {
-            capsule_core::sha::validate(sha).map_err(|e| {
-                GitError::Parse(format!("ls-remote returned non-sha token {sha:?}: {e}"))
-            })?;
-            Ok(sha.to_string())
-        }
-    }
+    let Some(sha) = stdout.split_whitespace().next() else {
+        return Ok(ZERO_OID.to_string());
+    };
+    capsule_core::sha::validate(sha)
+        .map_err(|e| GitError::Parse(format!("ls-remote returned non-sha token {sha:?}: {e}")))?;
+    Ok(sha.to_string())
 }
 
 /// Outcome of an atomic multi-ref land push (DESIGN.md §7.1.2 step 3).
