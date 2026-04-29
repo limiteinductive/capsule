@@ -824,7 +824,7 @@ fn run_work(dir: &Path, args: WorkArgs) -> Result<i32> {
     let lease_lost = hb.shutdown();
     drop(isolate_state);
 
-    let s = status.map_err(|e| anyhow::anyhow!("spawning {first}: {e}"))?;
+    let s = status.with_context(|| format!("spawning {first}"))?;
     let code = s.code().unwrap_or_else(|| {
         #[cfg(unix)]
         {
