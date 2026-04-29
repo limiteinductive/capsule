@@ -934,13 +934,16 @@ impl Store {
     }
 
     /// True iff `record_deploy_verify_pass` has been called on this store.
+    /// `EXISTS` short-circuits on first match (mirrors `capsule_exists`'s
+    /// shape) and `prepare_cached` keeps the parse off the per-`land`
+    /// hot path.
     pub fn check_deploy_verify_pass(&self) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM deploy_verify_pass WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(count > 0)
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM deploy_verify_pass WHERE id = 1)",
+            )?
+            .query_row([], |r| r.get(0))?)
     }
 
     /// §8.2 step 0: refuse to land in production until the ACL suite
@@ -3657,6 +3660,10 @@ mod tests {
         assert_eq!(post.attempts[0].tip_sha.as_deref(), Some(FAKE_SHA));
     }
 
+    /// Failed attestations must still persist verification + emit the
+    /// AttemptAttested event — a refactor that "skipped persistence on
+    /// fail to keep the row clean" would erase the only audit trail of
+    /// the failed run before the worker retries.
     #[test]
     fn attest_fail_stays_active() {
         let mut s = tmp_store();
@@ -3675,10 +3682,6 @@ mod tests {
             .unwrap();
         assert!(!ack.accepted);
         assert_eq!(ack.new_status, Status::Active);
-        // Failed attestations must still persist verification + emit the
-        // AttemptAttested event — a refactor that "skipped persistence on
-        // fail to keep the row clean" would erase the only audit trail of
-        // the failed run before the worker retries.
         let c = s.get_capsule("x").unwrap();
         let v = c.verification.expect("failed attest must persist verification");
         assert_eq!(v.verified_sha, FAKE_SHA);
