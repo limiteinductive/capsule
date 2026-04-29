@@ -909,7 +909,7 @@ impl Store {
     /// reconcile only ls-remotes, so any cwd is fine — but we accept it
     /// uniformly for symmetry with `land`.
     pub fn reconcile(&mut self, req: ReconcileRequest) -> Result<ReconcileOutcome> {
-        self.reconcile_inner(req, None)
+        self.reconcile_inner(&req.capsule_id, &req.remote, None)
     }
 
     /// Record that the deploy-verify ACL suite (DESIGN §8.2) passed for
@@ -957,33 +957,32 @@ impl Store {
             return Err(StoreError::ForceUnfreezeNotConfirmed);
         }
         self.reconcile_inner(
-            ReconcileRequest {
-                capsule_id: req.capsule_id,
-                remote: req.remote,
-            },
+            &req.capsule_id,
+            &req.remote,
             Some((&req.operator, &req.reason)),
         )
     }
 
     fn reconcile_inner(
         &mut self,
-        req: ReconcileRequest,
+        capsule_id: &str,
+        remote: &str,
         operator: Option<(&str, &str)>,
     ) -> Result<ReconcileOutcome> {
         use capsule_git::ls_remote_branch;
 
         let (now, now_str) = now_pair()?;
 
-        let pending_json = load_pending_land_json(&self.conn, &req.capsule_id)?;
+        let pending_json = load_pending_land_json(&self.conn, capsule_id)?;
         let Some(snapshot_json) = pending_json else {
             if let Some((op, reason)) = operator {
-                return self.audit_force_unfreeze_on_unfrozen(&now_str, &req.capsule_id, op, reason);
+                return self.audit_force_unfreeze_on_unfrozen(&now_str, capsule_id, op, reason);
             }
             return Ok(ReconcileOutcome::NotFrozen);
         };
         let pending: PendingLand = json::from_str(&snapshot_json)?;
 
-        let witness_sha = ls_remote_branch(&req.remote, &pending.witness_branch)?;
+        let witness_sha = ls_remote_branch(remote, &pending.witness_branch)?;
         let witness_state = WitnessState::classify(witness_sha, &pending.verified_sha);
 
         let actor: &str = operator.map_or(actor::RECONCILER, |(op, _)| op);
@@ -991,11 +990,11 @@ impl Store {
         let witness_state_json = witness_remote_state_json(&witness_state);
 
         let tx = self.conn.transaction()?;
-        if !pending_land_snapshot_unchanged(&tx, &req.capsule_id, &snapshot_json)? {
+        if !pending_land_snapshot_unchanged(&tx, capsule_id, &snapshot_json)? {
             emit_reconciler_ran(
                 &tx,
                 &now_str,
-                &req.capsule_id,
+                capsule_id,
                 Some(attempt_id_i64),
                 actor,
                 ReconcileOutcome::CasLost,
@@ -1005,7 +1004,7 @@ impl Store {
                 emit_force_unfreeze_invoked(
                     &tx,
                     &now_str,
-                    &req.capsule_id,
+                    capsule_id,
                     op,
                     reason,
                     Some(&pending),
@@ -1021,15 +1020,15 @@ impl Store {
                 let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
                 let landing =
                     pending.clone().into_landing(now, advanced_base_ref, actor.to_string());
-                finalize_landed(&tx, &req.capsule_id, &landing, &now_str)?;
+                finalize_landed(&tx, capsule_id, &landing, &now_str)?;
                 ReconcileOutcome::Landed
             }
             WitnessState::Different(found_sha) => {
-                abandon_on_witness_mismatch(&tx, &req.capsule_id, attempt_id_i64, &now_str)?;
+                abandon_on_witness_mismatch(&tx, capsule_id, attempt_id_i64, &now_str)?;
                 emit_operational_incident(
                     &tx,
                     &now_str,
-                    &req.capsule_id,
+                    capsule_id,
                     Some(attempt_id_i64),
                     actor,
                     OperationalIncidentKind::WitnessOidMismatch,
@@ -1045,7 +1044,7 @@ impl Store {
                 clear_pending_land(
                     &tx,
                     &now_str,
-                    &req.capsule_id,
+                    capsule_id,
                     Some(attempt_id_i64),
                     actor,
                     PendingLandClearedReason::WitnessAbsent,
@@ -1057,7 +1056,7 @@ impl Store {
         emit_reconciler_ran(
             &tx,
             &now_str,
-            &req.capsule_id,
+            capsule_id,
             Some(attempt_id_i64),
             actor,
             outcome,
@@ -1067,7 +1066,7 @@ impl Store {
             emit_force_unfreeze_invoked(
                 &tx,
                 &now_str,
-                &req.capsule_id,
+                capsule_id,
                 op,
                 reason,
                 Some(&pending),
