@@ -263,20 +263,13 @@ impl PendingLand {
     /// that finalized the landing — usually `self.lander`, but the reconciler
     /// (or an operator on `force_unfreeze`) records itself instead.
     pub fn into_landing(
-        self,
+        mut self,
         at: OffsetDateTime,
         advanced_base_ref: bool,
         landed_by: String,
     ) -> Landing {
-        Landing {
-            at,
-            landed_sha: self.verified_sha,
-            prior_base_sha: self.prior_base_sha,
-            landed_by,
-            attempt_id: self.attempt_id,
-            witness_branch: self.witness_branch,
-            advanced_base_ref,
-        }
+        self.lander = landed_by;
+        self.into_self_landing(at, advanced_base_ref)
     }
 
     /// Variant of `into_landing` for the canonical lander finalizing its own
