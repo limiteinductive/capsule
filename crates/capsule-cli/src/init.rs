@@ -124,15 +124,13 @@ fn parse_git_version(s: &str) -> Option<(u32, u32)> {
 /// Returns `None` for the empty path (worktree root), where ignoring the
 /// pattern would shadow the entire repo.
 fn format_gitignore_dir_pattern(rel: &Path) -> Option<String> {
+    let mut comps = rel.components();
+    let first = comps.next()?;
     let mut out = String::new();
-    for c in rel.components() {
-        if !out.is_empty() {
-            out.push('/');
-        }
+    out.push_str(&first.as_os_str().to_string_lossy());
+    for c in comps {
+        out.push('/');
         out.push_str(&c.as_os_str().to_string_lossy());
-    }
-    if out.is_empty() {
-        return None;
     }
     out.push('/');
     Some(out)
