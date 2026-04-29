@@ -290,7 +290,7 @@ fn parse_status_arg(s: &str) -> std::result::Result<Status, String> {
 
 /// Canonicalize a CLI path arg, formatting errors uniformly across flags.
 fn parse_canonical_path(flag: &str, s: &str) -> Result<CanonicalPath> {
-    CanonicalPath::new(s).map_err(|e| anyhow::anyhow!("invalid --{flag} {s:?}: {e}"))
+    CanonicalPath::new(s).with_context(|| format!("invalid --{flag} {s:?}"))
 }
 
 /// Canonicalize repeated `--scope` args (used by `create` and `amend`).
