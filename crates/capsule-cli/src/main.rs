@@ -651,13 +651,14 @@ fn load_session_attempt(
     let store = open_store(dir)?;
     let capsule = store.get_capsule(capsule_id)?;
     let active_attempt_id = capsule.active_attempt;
-    let attempt = capsule.into_active_attempt().ok_or_else(|| {
-        if let Some(aid) = active_attempt_id {
-            anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
-        } else {
-            anyhow::anyhow!("capsule has no active attempt; run `capsule claim`")
-        }
-    })?;
+    let attempt = capsule
+        .into_active_attempt()
+        .ok_or_else(|| match active_attempt_id {
+            Some(aid) => {
+                anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
+            }
+            None => anyhow::anyhow!("capsule has no active attempt; run `capsule claim`"),
+        })?;
     if attempt.lease.session_id != session {
         anyhow::bail!(
             "session mismatch: active attempt session is {}",
