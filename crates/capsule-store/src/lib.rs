@@ -665,7 +665,7 @@ impl Store {
                 witness_branch,
                 lander: req.lander,
             };
-            let (pending_value, pending_str) = serialize_pending_for_cas_and_audit(&pending)?;
+            let (pending_value, pending_str) = serialize_value_and_text(&pending)?;
             pending_json = pending_str;
 
             tx.prepare_cached(
@@ -1876,16 +1876,16 @@ fn pending_land_snapshot_unchanged(
     .or_not_found(capsule_id)
 }
 
-/// Serialize `PendingLand` once and hand back both the typed `Value`
-/// (for the `pending_land_committed` event payload) and its `String`
-/// form (the `pending_land_json` column bytes). Step-4's CAS via
-/// `pending_land_snapshot_unchanged` byte-compares the column against
-/// the snapshot the lander captured here, so a single serialization
-/// guarantees the audit row and the CAS subject are byte-identical by
-/// construction — diverging serializations would let the CAS pass
-/// while the audit row references a different snapshot.
-fn serialize_pending_for_cas_and_audit(p: &PendingLand) -> Result<(json::Value, String)> {
-    let v = json::to_value(p)?;
+/// Serialize a value once into both its typed `json::Value` (for an
+/// audit-event payload) and its `String` form (for the matching SQL
+/// column bytes). Single source of truth for the paired serialization
+/// used at two sites: `Store::land` step 2 for `PendingLand`, where
+/// step 4's CAS byte-compares the column against the snapshot the
+/// lander captured (a serialization drift would let CAS pass while
+/// the audit row referenced a different snapshot), and
+/// `finalize_landed` for `Landing`.
+fn serialize_value_and_text<T: serde::Serialize>(value: &T) -> Result<(json::Value, String)> {
+    let v = json::to_value(value)?;
     let s = v.to_string();
     Ok((v, s))
 }
@@ -2119,8 +2119,8 @@ impl AmendUpdate {
         diff_key: &str,
         value: &T,
     ) -> Result<()> {
-        let v = json::to_value(value)?;
-        self.bind_set_only(col, v.to_string().into());
+        let (v, s) = serialize_value_and_text(value)?;
+        self.bind_set_only(col, s.into());
         self.diff.insert(diff_key.into(), v);
         Ok(())
     }
@@ -2390,8 +2390,7 @@ fn finalize_landed(
     landing: &Landing,
     now_str: &str,
 ) -> Result<()> {
-    let landing_value = json::to_value(landing)?;
-    let landing_json = landing_value.to_string();
+    let (landing_value, landing_json) = serialize_value_and_text(landing)?;
     let attempt_id = landing.attempt_id as i64;
     tx.prepare_cached(
         "UPDATE capsule
@@ -6007,7 +6006,7 @@ mod tests {
         assert_eq!(
             json::to_value(&landing).unwrap(),
             v,
-            "event payload must mirror persisted landing_json byte-for-byte"
+            "event payload must mirror the persisted landing shape"
         );
     }
 
