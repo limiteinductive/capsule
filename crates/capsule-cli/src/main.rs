@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
-    self, AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest,
+    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest,
     ForceUnfreezeRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
     Store,
 };
