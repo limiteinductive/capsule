@@ -94,8 +94,6 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
         "BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY); COMMIT;",
     )?;
 
-    // `schema_version` was just created above, and `COALESCE` covers
-    // the empty-table case. Any failure here is a real rusqlite error.
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
