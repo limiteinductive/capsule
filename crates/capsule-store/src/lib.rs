@@ -4722,6 +4722,109 @@ mod tests {
         );
     }
 
+    /// Pin the lease-expiry boundary at `now == expires_at`: must be treated
+    /// as **live**, not expired. A regression flipping the `<=` guard in
+    /// `reclaim_expired_in_tx` to `<` would reclaim at the exact tick of
+    /// expiry; the two sister live-lease checks
+    /// (`assert_live_lease_for_session`, `project_live_lease_for_renewal`)
+    /// use `now > expires_at` and rely on the same boundary, so pinning
+    /// here also guards their cross-helper consistency. Calls
+    /// `reclaim_expired_in_tx` directly with a controlled `now` rather than
+    /// `thread::sleep`-ing past a small TTL — exact, fast, and immune to
+    /// CI clock jitter.
+    #[test]
+    fn reclaim_treats_now_equal_expires_at_as_live() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
+        let expires_at = a.lease.expires_at;
+
+        {
+            let tx = s.conn.transaction().unwrap();
+            reclaim_expired_in_tx(&tx, expires_at).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            s.get_capsule("x").unwrap().status,
+            Status::Active,
+            "now == expires_at must be treated as live",
+        );
+
+        {
+            let tx = s.conn.transaction().unwrap();
+            reclaim_expired_in_tx(&tx, expires_at + time::Duration::nanoseconds(1)).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            s.get_capsule("x").unwrap().status,
+            Status::Planned,
+            "now > expires_at by any amount must reclaim",
+        );
+    }
+
+    /// Sister to `reclaim_treats_now_equal_expires_at_as_live` for the
+    /// predicate-only helper used by `attest` and `land` step 2: the guard
+    /// is `if now > expires_at` (Err), so `now == expires_at` must succeed.
+    /// Pinning per-helper documents the cross-call boundary consistency
+    /// (all three site-specific guards agree on the same equality
+    /// semantics) and catches a per-helper regression that the reclaim
+    /// pin can't see.
+    #[test]
+    fn assert_live_lease_treats_now_equal_expires_at_as_live() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
+        let expires_at = a.lease.expires_at;
+        let attempt_id = a.id as i64;
+
+        let tx = s.conn.transaction().unwrap();
+        assert_live_lease_for_session(&tx, "x", attempt_id, "sess1", expires_at)
+            .expect("now == expires_at must be live");
+        let err = assert_live_lease_for_session(
+            &tx,
+            "x",
+            attempt_id,
+            "sess1",
+            expires_at + time::Duration::nanoseconds(1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, StoreError::LeaseExpired(_)),
+            "now > expires_at must surface LeaseExpired, got {err:?}",
+        );
+    }
+
+    /// Sister to `assert_live_lease_treats_now_equal_expires_at_as_live`
+    /// for the renewal-path helper used by `heartbeat`. Same boundary
+    /// (`now > expires_at` Errs), but this helper also returns the stored
+    /// `ttl_sec` — guards consistency between the predicate-only and
+    /// renewal-path projections.
+    #[test]
+    fn project_live_lease_for_renewal_treats_now_equal_expires_at_as_live() {
+        let mut s = tmp_store();
+        make_capsule(&mut s, "x", "src/api");
+        let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
+        let expires_at = a.lease.expires_at;
+        let attempt_id = a.id as i64;
+
+        let tx = s.conn.transaction().unwrap();
+        let ttl = project_live_lease_for_renewal(&tx, "x", attempt_id, "sess1", expires_at)
+            .expect("now == expires_at must be live");
+        assert_eq!(ttl, 60, "renewal helper must return the stored ttl_sec");
+        let err = project_live_lease_for_renewal(
+            &tx,
+            "x",
+            attempt_id,
+            "sess1",
+            expires_at + time::Duration::nanoseconds(1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, StoreError::LeaseExpired(_)),
+            "now > expires_at must surface LeaseExpired, got {err:?}",
+        );
+    }
+
     /// Explicit reclaim rejects frozen capsules, unlike auto-reclaim paths
     /// that silently skip frozen rows.
     #[test]
