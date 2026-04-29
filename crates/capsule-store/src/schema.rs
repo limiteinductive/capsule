@@ -94,13 +94,13 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
         "BEGIN; CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY); COMMIT;",
     )?;
 
-    let current: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    // `schema_version` was just created above, and `COALESCE` covers
+    // the empty-table case. Any failure here is a real rusqlite error.
+    let current: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |r| r.get(0),
+    )?;
 
     for (idx, sql) in MIGRATIONS.iter().enumerate() {
         let v = (idx as i64) + 1;
