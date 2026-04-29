@@ -99,8 +99,9 @@ pub fn ensure(conn: &Connection) -> SqlResult<()> {
     )?;
 
     let skip = usize::try_from(current).unwrap_or(usize::MAX);
-    for (idx, sql) in MIGRATIONS.iter().enumerate().skip(skip) {
-        let v = (idx as i64) + 1;
+    let mut v = current;
+    for sql in MIGRATIONS.iter().skip(skip) {
+        v += 1;
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
         tx.execute("INSERT INTO schema_version(version) VALUES (?1)", [v])?;
