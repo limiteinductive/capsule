@@ -5335,13 +5335,12 @@ mod tests {
             .current_dir(cwd)
             .output()
             .expect("git invocation failed");
-        if !out.status.success() {
-            panic!(
-                "git {args:?} in {cwd:?} failed:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
+        assert!(
+            out.status.success(),
+            "git {args:?} in {cwd:?} failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
@@ -5748,6 +5747,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn land_other_failure_clears_pending_and_emits_paired_incident() {
+        use std::os::unix::fs::PermissionsExt;
         let id = "land_other";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
 
@@ -5757,7 +5757,6 @@ mod tests {
             "#!/bin/sh\necho 'capsule-test: policy rejected push' >&2\nexit 1\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut s = tmp_store();
@@ -5811,6 +5810,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn land_other_failure_incident_row_attributes_to_lander() {
+        use std::os::unix::fs::PermissionsExt;
         let id = "land_otherfail_attr";
         let (_dir, bare, work, verified_sha) = setup_bare_with_attempt(id);
 
@@ -5820,7 +5820,6 @@ mod tests {
             "#!/bin/sh\necho 'capsule-test: policy rejected push' >&2\nexit 1\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut s = tmp_store();
