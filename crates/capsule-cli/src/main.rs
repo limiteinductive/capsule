@@ -39,6 +39,8 @@ struct Cli {
 enum Cmd {
     /// Initialize a capsule store at `<dir>/state.db`.
     Init(InitArgs),
+    /// Diagnose local capsule setup without mutating state.
+    Doctor,
     /// Run the deployment ACL test suite (DESIGN §8.2). Hermetic mode spins
     /// up a tempdir bare repo with the reference pre-receive hook; remote
     /// mode runs against a real forge with three pre-provisioned principals.
@@ -410,6 +412,17 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Doctor => {
+            let report = run_doctor(&dir);
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_doctor(&report);
+            }
+            if !report.ok {
+                std::process::exit(1);
+            }
+        }
         Cmd::Create(args) => {
             let mut store = open_store(&dir)?;
             let scope_prefixes = canonicalize_scope_args(&args.scope)?;
@@ -722,6 +735,173 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct DoctorReport {
+    ok: bool,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    status: &'static str,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+impl DoctorReport {
+    fn new(checks: Vec<DoctorCheck>) -> Self {
+        Self {
+            ok: !checks.iter().any(|c| c.status == "fail"),
+            checks,
+        }
+    }
+}
+
+fn doctor_check(
+    name: &'static str,
+    status: &'static str,
+    detail: impl Into<String>,
+    hint: Option<impl Into<String>>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status,
+        detail: detail.into(),
+        hint: hint.map(Into::into),
+    }
+}
+
+fn run_doctor(dir: &Path) -> DoctorReport {
+    let mut checks = Vec::new();
+
+    match std::process::Command::new("git").arg("--version").output() {
+        Ok(out) if out.status.success() => checks.push(doctor_check(
+            "git",
+            "ok",
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            None::<String>,
+        )),
+        Ok(out) => checks.push(doctor_check(
+            "git",
+            "fail",
+            format!(
+                "git --version exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some("install git and ensure it is on PATH"),
+        )),
+        Err(e) => checks.push(doctor_check(
+            "git",
+            "fail",
+            format!("could not run git --version: {e}"),
+            Some("install git and ensure it is on PATH"),
+        )),
+    }
+
+    match std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(out) if out.status.success() => checks.push(doctor_check(
+            "worktree",
+            "ok",
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            None::<String>,
+        )),
+        _ => checks.push(doctor_check(
+            "worktree",
+            "warn",
+            "not running inside a git worktree",
+            Some("run capsule from a git repository for claim/attest/land workflows"),
+        )),
+    }
+
+    match config::load(dir).and_then(|cfg| config::canonicalize_required(&cfg).map(|r| r.len())) {
+        Ok(count) => checks.push(doctor_check(
+            "config",
+            "ok",
+            format!("{count} serialize_paths.required entries"),
+            None::<String>,
+        )),
+        Err(e) => checks.push(doctor_check(
+            "config",
+            "fail",
+            e.to_string(),
+            Some("fix config.toml or remove it to use defaults"),
+        )),
+    }
+
+    let db = dir.join("state.db");
+    let store = if db.exists() {
+        match Store::open(&db) {
+            Ok(store) => {
+                checks.push(doctor_check(
+                    "store",
+                    "ok",
+                    db.display().to_string(),
+                    None::<String>,
+                ));
+                Some(store)
+            }
+            Err(e) => {
+                checks.push(doctor_check(
+                    "store",
+                    "fail",
+                    format!("{}: {e}", db.display()),
+                    Some("restore the store from backup or re-run capsule init"),
+                ));
+                None
+            }
+        }
+    } else {
+        checks.push(doctor_check(
+            "store",
+            "fail",
+            format!("{} does not exist", db.display()),
+            Some("run capsule init"),
+        ));
+        None
+    };
+
+    if let Some(store) = store {
+        match store.check_deploy_verify_pass() {
+            Ok(true) => checks.push(doctor_check(
+                "deploy_verify",
+                "ok",
+                "recorded pass row present",
+                None::<String>,
+            )),
+            Ok(false) => checks.push(doctor_check(
+                "deploy_verify",
+                "warn",
+                "no recorded pass row",
+                Some("run capsule deploy-verify --hermetic or remote deploy verification"),
+            )),
+            Err(e) => checks.push(doctor_check(
+                "deploy_verify",
+                "fail",
+                e.to_string(),
+                Some("inspect the capsule store"),
+            )),
+        }
+    }
+
+    DoctorReport::new(checks)
+}
+
+fn print_doctor(report: &DoctorReport) {
+    println!("doctor\t{}", if report.ok { "ok" } else { "fail" });
+    for check in &report.checks {
+        println!("{}\t{}\t{}", check.status, check.name, check.detail);
+        if let Some(hint) = &check.hint {
+            println!("hint\t{}\t{}", check.name, hint);
+        }
+    }
 }
 
 struct SessionAttempt {

@@ -4037,8 +4037,7 @@ mod tests {
     fn heartbeat_same_session_lease_expired_carries_prior_expires_at() {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
-        let claimed = s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
-        let prior_expires = claimed.lease.expires_at;
+        s.claim(claim_req_with_ttl("x", "sess1", 1)).unwrap();
         let stored_str: String = s
             .conn
             .query_row(
@@ -4048,6 +4047,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        let prior_expires = parse_iso8601(&stored_str);
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let err = s.heartbeat("x", "sess1").unwrap_err();
         let StoreError::LeaseExpired(at_str) = err else {
@@ -4805,7 +4805,16 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
-        let expires_at = a.lease.expires_at;
+        let stored_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", a.id as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expires_at = parse_iso8601(&stored_str);
 
         {
             let tx = s.conn.transaction().unwrap();
@@ -4881,7 +4890,16 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
-        let expires_at = a.lease.expires_at;
+        let expires_at_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", a.id as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expires_at = parse_iso8601(&expires_at_str);
         let attempt_id = a.id as i64;
 
         let tx = s.conn.transaction().unwrap();

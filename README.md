@@ -37,6 +37,7 @@ Capsule is a working reference implementation, not only a design note.
 
 - Embedded SQLite store
 - Path-prefix scope conflict detection
+- `capsule doctor` setup diagnostics
 - Claim, heartbeat, attest, land, abandon, reclaim, deps, reconcile, force-unfreeze
 - Git atomic multi-ref push with witness refs
 - `capsule work --isolate=worktree`
@@ -70,6 +71,7 @@ Initialize a store in the current repo:
 
 ```sh
 capsule init
+capsule doctor
 ```
 
 Create a capsule for a bounded change:
