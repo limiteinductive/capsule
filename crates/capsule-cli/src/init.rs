@@ -212,7 +212,9 @@ mod tests {
     }
 
     fn run_at(cwd: &Path, dir: PathBuf, no_gitignore: bool) -> Result<InitReport> {
-        let _g = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(cwd).unwrap();
         let res = run(InitOpts { dir, no_gitignore });

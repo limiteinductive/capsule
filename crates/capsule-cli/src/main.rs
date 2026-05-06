@@ -4,9 +4,8 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
-    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest,
-    ForceUnfreezeRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
-    Store,
+    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
+    LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
 };
 use clap::{Parser, Subcommand};
 use time::format_description::well_known::Rfc3339;
@@ -216,27 +215,6 @@ struct AttestArgs {
 }
 
 #[derive(clap::Args)]
-struct DeployVerifyArgs {
-    /// Run hermetically against a tempdir bare repo + reference pre-receive
-    /// hook. Mutually exclusive with --remote.
-    #[arg(long, conflicts_with = "remote")]
-    hermetic: bool,
-    /// Remote URL for real-forge mode. Requires --lander-url, --worker-url,
-    /// --outsider-url to specify per-identity push URLs.
-    #[arg(long, requires_all = ["lander_url", "worker_url", "outsider_url"])]
-    remote: Option<String>,
-    #[arg(long = "lander-url")]
-    lander_url: Option<String>,
-    #[arg(long = "worker-url")]
-    worker_url: Option<String>,
-    #[arg(long = "outsider-url")]
-    outsider_url: Option<String>,
-    /// Base ref to land against (default "main").
-    #[arg(long = "base-ref", default_value = "main")]
-    base_ref: String,
-}
-
-#[derive(clap::Args)]
 struct LandArgs {
     capsule_id: String,
     #[arg(long, env = "CAPSULE_SESSION")]
@@ -256,6 +234,35 @@ struct LandArgs {
     /// verify` first to record a pass.
     #[arg(long = "skip-deploy-verify-gate")]
     skip_deploy_verify_gate: bool,
+}
+
+#[derive(clap::Args)]
+struct DeployVerifyArgs {
+    /// Run the §8.2 ACL suite against an in-process tempdir bare repo with
+    /// the reference `pre-receive.sh` hook. Default mode.
+    #[arg(long, conflicts_with = "remote")]
+    hermetic: bool,
+    /// Run the §8.2 ACL suite against the named git remote. Requires three
+    /// per-identity push URLs. Destructive: tests 3, 4b, 7 mutate real refs.
+    #[arg(long)]
+    remote: Option<String>,
+    /// Per-identity push URL: lander principal. Required with `--remote`.
+    #[arg(long = "lander-url", requires = "remote")]
+    lander_url: Option<String>,
+    /// Per-identity push URL: worker principal. Required with `--remote`.
+    #[arg(long = "worker-url", requires = "remote")]
+    worker_url: Option<String>,
+    /// Per-identity push URL: outsider principal. Required with `--remote`.
+    #[arg(long = "outsider-url", requires = "remote")]
+    outsider_url: Option<String>,
+    /// Protected base ref. Default `main`.
+    #[arg(long = "base-ref", default_value = "main")]
+    base_ref: String,
+    /// Confirm `--remote` mutates the configured remote (tests 3 and 4b
+    /// advance base_ref; tests 4b/7/8 mutate witness refs). Required for
+    /// `--remote`. Use a deploy-validation environment, not production.
+    #[arg(long = "remote-allow-mutations", requires = "remote")]
+    remote_allow_mutations: bool,
 }
 
 #[derive(clap::Args)]
@@ -328,7 +335,10 @@ fn parse_canonical_path(flag: &str, s: &str) -> Result<CanonicalPath> {
 
 /// Canonicalize repeated `--scope` args (used by `create` and `amend`).
 fn canonicalize_scope_args(scope: &[String]) -> Result<Vec<CanonicalPath>> {
-    scope.iter().map(|s| parse_canonical_path("scope", s)).collect()
+    scope
+        .iter()
+        .map(|s| parse_canonical_path("scope", s))
+        .collect()
 }
 
 fn store_dir(arg: Option<PathBuf>) -> PathBuf {
@@ -540,14 +550,20 @@ fn main() -> Result<()> {
         }
         Cmd::Attest(args) => {
             let mut store = open_store(&dir)?;
-            run_serialize_lint(
-                &dir,
-                &store,
-                &args.capsule_id,
-                &args.verified_sha,
-                args.repo_dir.as_deref(),
-                args.skip_serialize_lint,
-            )?;
+            if args.skip_serialize_lint {
+                eprintln!(
+                    "warning: --skip-serialize-lint set; PROPOSAL §3.2 lockfile lint bypassed"
+                );
+            } else {
+                run_serialize_lint(
+                    &dir,
+                    &store,
+                    &args.capsule_id,
+                    &args.session,
+                    &args.verified_sha,
+                    args.repo_dir.as_deref(),
+                )?;
+            }
             let ack = store.attest(AttestRequest {
                 capsule_id: args.capsule_id,
                 session_id: args.session,
@@ -662,30 +678,47 @@ fn main() -> Result<()> {
             }
         }
         Cmd::DeployVerify(args) => {
-            let mode = if args.hermetic {
-                deploy_verify::Mode::Hermetic
-            } else if let Some(remote) = args.remote.as_deref() {
-                deploy_verify::Mode::Remote {
-                    remote: remote.into(),
-                    lander_url: args.lander_url.clone().unwrap(),
-                    worker_url: args.worker_url.clone().unwrap(),
-                    outsider_url: args.outsider_url.clone().unwrap(),
+            let mode = match (
+                args.remote,
+                args.lander_url,
+                args.worker_url,
+                args.outsider_url,
+            ) {
+                (Some(remote), Some(lander_url), Some(worker_url), Some(outsider_url)) => {
+                    if !args.remote_allow_mutations {
+                        anyhow::bail!(
+                            "--remote mutates the configured remote — pass \
+                             --remote-allow-mutations to acknowledge"
+                        );
+                    }
+                    deploy_verify::Mode::Remote {
+                        remote,
+                        lander_url,
+                        worker_url,
+                        outsider_url,
+                    }
                 }
-            } else {
-                anyhow::bail!("must specify --hermetic or --remote <url>");
+                (Some(_), _, _, _) => {
+                    anyhow::bail!("--remote requires --lander-url, --worker-url, --outsider-url")
+                }
+                _ => deploy_verify::Mode::Hermetic,
             };
+            // Materialize the store *before* running the suite so we fail fast
+            // if the store dir is missing — and so we can record the pass row
+            // without re-opening.
+            let mut store = open_store(&dir)?;
             let report = deploy_verify::run(deploy_verify::Opts {
                 mode,
                 base_ref: args.base_ref,
                 json: cli.json,
             })?;
             if report.all_passed {
-                let mut store = open_store(&dir)?;
                 store
                     .record_deploy_verify_pass(&report.mode_label, &report.base_ref)
                     .context("recording deploy verify pass")?;
+            } else {
+                std::process::exit(1);
             }
-            std::process::exit(if report.all_passed { 0 } else { 1 });
         }
     }
     Ok(())
@@ -705,11 +738,7 @@ struct SessionAttempt {
 /// the user to `capsule claim`) from "`active_attempt` points at a row that
 /// does not exist" (state-shape violation, unreachable in well-formed state
 /// but `claim` can't repair it — so "run claim" would be actively misleading).
-fn load_session_attempt(
-    dir: &Path,
-    capsule_id: &str,
-    session: &str,
-) -> Result<SessionAttempt> {
+fn load_session_attempt(dir: &Path, capsule_id: &str, session: &str) -> Result<SessionAttempt> {
     let store = open_store(dir)?;
     let capsule = store.get_capsule(capsule_id)?;
     let active_attempt_id = capsule.active_attempt;
@@ -912,25 +941,50 @@ fn run_serialize_lint(
     dir: &Path,
     store: &Store,
     capsule_id: &str,
+    session: &str,
     verified_sha: &str,
     repo_dir_arg: Option<&Path>,
-    skip: bool,
 ) -> Result<()> {
+    let capsule = store.get_capsule(capsule_id)?;
+    let scope_prefixes = capsule.scope_prefixes.clone();
+    let active_attempt_id = capsule.active_attempt;
+    let attempt = capsule
+        .into_active_attempt()
+        .ok_or_else(|| match active_attempt_id {
+            Some(aid) => {
+                anyhow::anyhow!("active_attempt {aid} not found in attempts (corrupt state)")
+            }
+            None => anyhow::anyhow!("capsule has no active attempt; run `capsule claim`"),
+        })?;
+    if attempt.lease.session_id != session {
+        anyhow::bail!(
+            "session mismatch: active attempt session is {}",
+            attempt.lease.session_id
+        );
+    }
+    let base_sha = attempt.base_sha;
+
     let cfg = config::load(dir)?;
     let required = config::canonicalize_required(&cfg)?;
     if required.is_empty() {
         return Ok(());
     }
-    let capsule = store.get_capsule(capsule_id)?;
-    let scope_prefixes = capsule.scope_prefixes.clone();
-    let base_sha = capsule
-        .into_active_attempt()
-        .ok_or_else(|| anyhow::anyhow!("no active attempt for {capsule_id}"))?
-        .base_sha;
     let repo_dir = match repo_dir_arg {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().context("resolving --repo-dir / cwd")?,
     };
+    let exists = std::process::Command::new("git")
+        .args(["cat-file", "-e", verified_sha])
+        .current_dir(&repo_dir)
+        .status()
+        .with_context(|| format!("invoking git in {}", repo_dir.display()))?;
+    if !exists.success() {
+        anyhow::bail!(
+            "verified_sha {verified_sha} not found in {}; ensure the worker has pushed and \
+             this repo has fetched it before attest, or pass --skip-serialize-lint",
+            repo_dir.display()
+        );
+    }
     let findings = serialize_lint::check_attest_diff(
         &repo_dir,
         &base_sha,
@@ -946,10 +1000,6 @@ fn run_serialize_lint(
             "serialize_path_uncovered: {} (matched required {})",
             f.path, f.matched_required
         );
-    }
-    if skip {
-        eprintln!("warning: --skip-serialize-lint set; PROPOSAL §3.2 lockfile lint bypassed");
-        return Ok(());
     }
     eprintln!(
         "hint: amend the capsule with the listed paths in --scope, or pass \
@@ -1086,7 +1136,10 @@ mod tests {
         let p1 = CanonicalPath::new("src/foo").unwrap();
         let p2 = CanonicalPath::new("docs").unwrap();
         assert_eq!(format!("{}", ScopeList(&[])), "");
-        assert_eq!(format!("{}", ScopeList(std::slice::from_ref(&p1))), "src/foo");
+        assert_eq!(
+            format!("{}", ScopeList(std::slice::from_ref(&p1))),
+            "src/foo"
+        );
         assert_eq!(format!("{}", ScopeList(&[p1, p2])), "src/foo,docs");
     }
 }

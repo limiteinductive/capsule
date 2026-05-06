@@ -59,7 +59,19 @@ fn hermetic_acl_suite_passes() {
     assert_eq!(report.base_ref, "main");
     assert!(report.all_passed, "tests: {:?}", failed_names(&report));
     assert_eq!(report.failed, 0);
-    assert_eq!(report.passed, report.tests.len());
+    // Hermetic mode skips test 6 (wildcard refspec is forge-specific).
+    let skipped = report.tests.iter().filter(|t| t.status == "skip").count();
+    assert_eq!(report.passed + skipped, report.tests.len());
+    assert_eq!(skipped, 1, "exactly test 6 should skip in hermetic");
+    assert!(
+        report
+            .tests
+            .iter()
+            .find(|t| t.name == "outsider_wildcard_witness")
+            .map(|t| t.status == "skip")
+            .unwrap_or(false),
+        "test 6 should be skipped in hermetic"
+    );
     // Pin the case set so a future spec change forces a deliberate test edit.
     let names: Vec<&str> = report.tests.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(

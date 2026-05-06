@@ -551,20 +551,14 @@ detached
 
     #[test]
     fn parse_worktree_list_unknown_branch_is_none() {
-        assert_eq!(
-            parse_worktree_list_for_branch(PORCELAIN, "nope"),
-            None
-        );
+        assert_eq!(parse_worktree_list_for_branch(PORCELAIN, "nope"), None);
     }
 
     /// Detached records have no `branch` line, so they must never match,
     /// regardless of how the caller spells the query.
     #[test]
     fn parse_worktree_list_detached_record_never_matches() {
-        assert_eq!(
-            parse_worktree_list_for_branch(PORCELAIN, "detached"),
-            None
-        );
+        assert_eq!(parse_worktree_list_for_branch(PORCELAIN, "detached"), None);
     }
 
     /// Stray `branch` line outside any record (regression guard for the

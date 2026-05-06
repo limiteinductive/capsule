@@ -343,7 +343,10 @@ impl Store {
         };
         let mut stmt = tx.prepare_cached(q)?;
         let rows: Vec<RowCapsule> = stmt
-            .query_map(rusqlite::params_from_iter(status_param), RowCapsule::from_row)?
+            .query_map(
+                rusqlite::params_from_iter(status_param),
+                RowCapsule::from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
@@ -395,7 +398,11 @@ impl Store {
 
         let status = parse_status(&status_str);
         if status != Status::Planned {
-            return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Claim, status));
+            return Err(StoreError::wrong_status(
+                req.capsule_id,
+                StoreOp::Claim,
+                status,
+            ));
         }
 
         let unmet = find_unmet_deps(&tx, &depends_on_json)?;
@@ -495,7 +502,11 @@ impl Store {
 
         let status = parse_status(&status_str);
         if status != Status::Active {
-            return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Attest, status));
+            return Err(StoreError::wrong_status(
+                req.capsule_id,
+                StoreOp::Attest,
+                status,
+            ));
         }
         let aid = active_attempt.expect("active ⇒ active_attempt set");
 
@@ -643,7 +654,11 @@ impl Store {
             }
             let status = parse_status(&status_str);
             if status != Status::Accepted {
-                return Err(StoreError::wrong_status(req.capsule_id, StoreOp::Land, status));
+                return Err(StoreError::wrong_status(
+                    req.capsule_id,
+                    StoreOp::Land,
+                    status,
+                ));
             }
             let aid = active_attempt.expect("accepted ⇒ active_attempt set");
             let in_tx_verified_sha =
@@ -845,10 +860,7 @@ impl Store {
             return Ok(());
         }
         if creates_cycle(&tx, &req.capsule_id, &req.depends_on)? {
-            return Err(StoreError::DependencyCycle(
-                req.capsule_id,
-                req.depends_on,
-            ));
+            return Err(StoreError::DependencyCycle(req.capsule_id, req.depends_on));
         }
         deps.push(req.depends_on);
         let new_json = json::to_string(&deps)?;
@@ -926,9 +938,7 @@ impl Store {
     pub fn check_deploy_verify_pass(&self) -> Result<bool> {
         Ok(self
             .conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM deploy_verify_pass WHERE id = 1)",
-            )?
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM deploy_verify_pass WHERE id = 1)")?
             .query_row([], |r| r.get(0))?)
     }
 
@@ -1013,7 +1023,9 @@ impl Store {
             WitnessState::AtVerifiedSha(_) => {
                 let advanced_base_ref = pending.verified_sha != pending.prior_base_sha;
                 let landing =
-                    pending.clone().into_landing(now, advanced_base_ref, actor.to_string());
+                    pending
+                        .clone()
+                        .into_landing(now, advanced_base_ref, actor.to_string());
                 finalize_landed(&tx, capsule_id, &landing, &now_str)?;
                 ReconcileOutcome::Landed
             }
@@ -1605,10 +1617,7 @@ fn reclaim_expired_in_tx(tx: &rusqlite::Transaction<'_>, now: OffsetDateTime) ->
 /// missing or not yet `landed`. `json_each` keeps everything to one bind (no
 /// SQLite variable-limit ceiling) and `ORDER BY j.key` preserves the input
 /// order so `UnmetDeps` reports stable positions.
-fn find_unmet_deps(
-    tx: &rusqlite::Transaction<'_>,
-    depends_on_json: &str,
-) -> Result<Vec<String>> {
+fn find_unmet_deps(tx: &rusqlite::Transaction<'_>, depends_on_json: &str) -> Result<Vec<String>> {
     let mut stmt = tx.prepare_cached(
         "SELECT j.value FROM json_each(?1) j
          LEFT JOIN capsule c ON c.id = j.value AND c.status = 'landed'
@@ -1690,8 +1699,7 @@ fn retain_available(
             c.status == Status::Planned
                 && c.depends_on.iter().all(|d| landed_ids.contains(d))
                 && !in_flight_scopes.iter().any(|(other_id, other_scope)| {
-                    other_id != &c.id
-                        && CanonicalPath::any_overlap(&c.scope_prefixes, other_scope)
+                    other_id != &c.id && CanonicalPath::any_overlap(&c.scope_prefixes, other_scope)
                 })
         })
         .collect())
@@ -1824,10 +1832,7 @@ fn project_live_lease_for_renewal(
 /// `pending_land_snapshot_unchanged`, which keeps the blob inside SQLite.
 /// Accepts `&Connection` so that `&Transaction` (which derefs to
 /// `&Connection`) callers work without per-shape duplication.
-fn load_pending_land_json(
-    conn: &rusqlite::Connection,
-    capsule_id: &str,
-) -> Result<Option<String>> {
+fn load_pending_land_json(conn: &rusqlite::Connection, capsule_id: &str) -> Result<Option<String>> {
     conn.prepare_cached("SELECT pending_land_json FROM capsule WHERE id = ?1")?
         .query_row(params![capsule_id], |r| r.get(0))
         .or_not_found(capsule_id)
@@ -1877,10 +1882,7 @@ fn serialize_value_and_text<T: serde::Serialize>(value: &T) -> Result<(json::Val
 /// crosses into Rust when only the boolean matters. Standalone in-tx
 /// boolean checks share this; wider precondition reads project the same
 /// expression inline because they already fetch adjacent columns.
-fn is_pending_land_set_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    capsule_id: &str,
-) -> Result<bool> {
+fn is_pending_land_set_in_tx(tx: &rusqlite::Transaction<'_>, capsule_id: &str) -> Result<bool> {
     tx.prepare_cached("SELECT pending_land_json IS NOT NULL FROM capsule WHERE id = ?1")?
         .query_row(params![capsule_id], |r| r.get(0))
         .or_not_found(capsule_id)
@@ -1924,11 +1926,7 @@ fn load_deps_for_mutation(
 /// close a cycle (DESIGN.md §7.1.3). Equivalent to: is `capsule_id`
 /// reachable from `new_dep`? Self-dep falls out reflexively from
 /// `reachable(tx, x, x) == true`.
-fn creates_cycle(
-    tx: &rusqlite::Transaction<'_>,
-    capsule_id: &str,
-    new_dep: &str,
-) -> Result<bool> {
+fn creates_cycle(tx: &rusqlite::Transaction<'_>, capsule_id: &str, new_dep: &str) -> Result<bool> {
     reachable(tx, new_dep, capsule_id)
 }
 
@@ -2083,13 +2081,15 @@ impl AmendUpdate {
     }
 
     fn bind_set_only(&mut self, col: &str, val: rusqlite::types::Value) {
-        self.sets.push(format!("{col} = ?{}", self.next_placeholder()));
+        self.sets
+            .push(format!("{col} = ?{}", self.next_placeholder()));
         self.vals.push(val);
     }
 
     fn set_string(&mut self, col: &str, diff_key: &str, value: String) {
         self.bind_set_only(col, value.clone().into());
-        self.diff.insert(diff_key.into(), json::Value::String(value));
+        self.diff
+            .insert(diff_key.into(), json::Value::String(value));
     }
 
     /// Serialize once into a `Value`, then bind both the audit diff (which
@@ -2282,7 +2282,11 @@ fn parse_status(s: &str) -> Status {
 }
 
 fn parse_outcome(s: &str) -> capsule_core::AttemptOutcome {
-    parse_wire("attempt outcome", s, capsule_core::AttemptOutcome::from_wire)
+    parse_wire(
+        "attempt outcome",
+        s,
+        capsule_core::AttemptOutcome::from_wire,
+    )
 }
 
 fn format_iso8601(t: OffsetDateTime) -> Result<String> {
@@ -2356,7 +2360,15 @@ fn persist_dep_change(
     tx.prepare_cached("UPDATE capsule SET depends_on_json=?1, updated_at=?2 WHERE id=?3")?
         .execute(params![deps_json, now_str, capsule_id])?;
     let payload = json::json!({ "dep_id": dep_id });
-    insert_event(tx, now_str, capsule_id, None, actor::SYSTEM, event_kind, &payload)?;
+    insert_event(
+        tx,
+        now_str,
+        capsule_id,
+        None,
+        actor::SYSTEM,
+        event_kind,
+        &payload,
+    )?;
     Ok(())
 }
 
@@ -2451,7 +2463,12 @@ fn close_attempt(
         "UPDATE attempt SET outcome=?1, closed_at=?2
          WHERE capsule_id=?3 AND attempt_id=?4",
     )?
-    .execute(params![outcome.as_wire_str(), now_str, capsule_id, attempt_id])?;
+    .execute(params![
+        outcome.as_wire_str(),
+        now_str,
+        capsule_id,
+        attempt_id
+    ])?;
     Ok(())
 }
 
@@ -2756,7 +2773,10 @@ mod tests {
     fn witness_state_wire_table_pinned() {
         let cases = [
             (WitnessState::Absent, "absent"),
-            (WitnessState::AtVerifiedSha("dead".into()), "at_verified_sha"),
+            (
+                WitnessState::AtVerifiedSha("dead".into()),
+                "at_verified_sha",
+            ),
             (WitnessState::Different("beef".into()), "different"),
         ];
         for (v, wire) in &cases {
@@ -2829,10 +2849,16 @@ mod tests {
         assert_eq!(v["session_id"], "sess1");
         assert!(v.get("base_sha").is_some(), "missing base_sha");
         let lease = v.get("lease").expect("missing lease object");
-        assert!(lease.is_object(), "lease must be a JSON object, not a scalar");
+        assert!(
+            lease.is_object(),
+            "lease must be a JSON object, not a scalar"
+        );
         assert!(lease.get("expires_at").is_some());
         assert!(lease.get("ttl_sec").is_some());
-        assert!(v.get("lease_expires_at").is_none(), "old key must not return");
+        assert!(
+            v.get("lease_expires_at").is_none(),
+            "old key must not return"
+        );
     }
 
     /// Pin attempt_claimed audit-row attribution. The event row must be
@@ -2900,7 +2926,13 @@ mod tests {
         let keys = sorted_keys(obj);
         assert_eq!(
             keys,
-            vec!["command", "duration_ms", "exit_code", "log_ref", "verified_sha"]
+            vec![
+                "command",
+                "duration_ms",
+                "exit_code",
+                "log_ref",
+                "verified_sha"
+            ]
         );
         assert_eq!(v["verified_sha"], FAKE_SHA);
         assert_eq!(v["duration_ms"], 7);
@@ -2945,7 +2977,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "sess1", "attest attributes to the session that called it");
+        assert_eq!(
+            actor, "sess1",
+            "attest attributes to the session that called it"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -3124,7 +3159,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "sess1", "abandon attributes to the session that called it");
+        assert_eq!(
+            actor, "sess1",
+            "abandon attributes to the session that called it"
+        );
         assert_eq!(
             row_attempt_id,
             Some(attempt_id),
@@ -3265,7 +3303,10 @@ mod tests {
             panic!("expected ScopeConflict, got {err:?}");
         };
         assert_eq!(claimed, "b", "first arg is the failing claim's capsule");
-        assert_eq!(conflict, "a", "second arg is the existing in-flight capsule");
+        assert_eq!(
+            conflict, "a",
+            "second arg is the existing in-flight capsule"
+        );
         assert_eq!(
             err.to_string(),
             "capsule b scope overlaps in-flight capsule a"
@@ -3382,7 +3423,11 @@ mod tests {
         assert!(
             matches!(
                 err,
-                StoreError::WrongStatus { op: "claim", current_status: "active", .. }
+                StoreError::WrongStatus {
+                    op: "claim",
+                    current_status: "active",
+                    ..
+                }
             ),
             "got {err:?}"
         );
@@ -3518,16 +3563,21 @@ mod tests {
         const TTL: i64 = 3600;
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
-        s.claim(claim_req_with_ttl("x", "sess1", TTL as u64)).unwrap();
+        s.claim(claim_req_with_ttl("x", "sess1", TTL as u64))
+            .unwrap();
         let before = OffsetDateTime::now_utc();
         let ack = s.heartbeat("x", "sess1").unwrap();
         let after = OffsetDateTime::now_utc();
-        let upper = (after - before).whole_seconds() + TTL;
+        let lower = time::Duration::seconds(TTL);
+        let upper = lower + (after - before);
 
-        let ack_ext = (ack.lease_expires_at - before).whole_seconds();
+        let ack_ext = ack.lease_expires_at - before;
         assert!(
-            (TTL..=upper).contains(&ack_ext),
-            "ack_ext={ack_ext}s outside [{TTL}, {upper}]"
+            (lower..=upper).contains(&ack_ext),
+            "ack_ext={}ns outside [{}, {}]ns",
+            ack_ext.whole_nanoseconds(),
+            lower.whole_nanoseconds(),
+            upper.whole_nanoseconds()
         );
 
         let stored_str: String = s
@@ -3539,10 +3589,13 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let stored_ext = (parse_iso8601(&stored_str) - before).whole_seconds();
+        let stored_ext = parse_iso8601(&stored_str) - before;
         assert!(
-            (TTL..=upper).contains(&stored_ext),
-            "stored_ext={stored_ext}s outside [{TTL}, {upper}]"
+            (lower..=upper).contains(&stored_ext),
+            "stored_ext={}ns outside [{}, {}]ns",
+            stored_ext.whole_nanoseconds(),
+            lower.whole_nanoseconds(),
+            upper.whole_nanoseconds()
         );
     }
 
@@ -3631,7 +3684,10 @@ mod tests {
         make_capsule(&mut s, "x", "src/api");
         s.claim(claim_req("x", "sess1")).unwrap();
         let pre = s.get_capsule("x").unwrap();
-        assert!(pre.attempts[0].tip_sha.is_none(), "claim leaves tip_sha NULL");
+        assert!(
+            pre.attempts[0].tip_sha.is_none(),
+            "claim leaves tip_sha NULL"
+        );
         s.attest(AttestRequest {
             capsule_id: "x".into(),
             session_id: "sess1".into(),
@@ -3669,7 +3725,9 @@ mod tests {
         assert!(!ack.accepted);
         assert_eq!(ack.new_status, Status::Active);
         let c = s.get_capsule("x").unwrap();
-        let v = c.verification.expect("failed attest must persist verification");
+        let v = c
+            .verification
+            .expect("failed attest must persist verification");
         assert_eq!(v.verified_sha, FAKE_SHA);
         assert!(matches!(v.exit_code, capsule_core::ExitCode::Code(1)));
         assert_eq!(c.attempts.len(), 1, "guard: single attempt before indexing");
@@ -3683,7 +3741,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "failed attest must still emit attempt_attested for audit");
+        assert_eq!(
+            count, 1,
+            "failed attest must still emit attempt_attested for audit"
+        );
     }
 
     /// Failed attestations are retryable while the attempt remains Active.
@@ -3714,7 +3775,9 @@ mod tests {
 
         let c = s.get_capsule("x").unwrap();
         assert_eq!(c.status, Status::Accepted);
-        let v = c.verification.expect("verification must persist after pass");
+        let v = c
+            .verification
+            .expect("verification must persist after pass");
         assert_eq!(v.verified_sha, other_sha);
         assert!(matches!(v.exit_code, capsule_core::ExitCode::Code(0)));
     }
@@ -3958,7 +4021,11 @@ mod tests {
         assert!(
             matches!(
                 err,
-                StoreError::WrongStatus { op: "heartbeat", current_status: "planned", .. }
+                StoreError::WrongStatus {
+                    op: "heartbeat",
+                    current_status: "planned",
+                    ..
+                }
             ),
             "got {err:?}"
         );
@@ -3987,7 +4054,10 @@ mod tests {
             panic!("expected LeaseExpired, got {err:?}");
         };
         assert_eq!(parse_iso8601(&at_str), prior_expires);
-        assert_eq!(at_str, stored_str, "payload must pass through json_extract bytes");
+        assert_eq!(
+            at_str, stored_str,
+            "payload must pass through json_extract bytes"
+        );
     }
 
     /// Pin precedence: a wrong-session caller whose lease has ALSO expired
@@ -4041,7 +4111,10 @@ mod tests {
         let StoreError::LeaseExpired(at_str) = err else {
             panic!("expected LeaseExpired, got {err:?}");
         };
-        assert_eq!(at_str, stored_str, "payload must pass through json_extract bytes");
+        assert_eq!(
+            at_str, stored_str,
+            "payload must pass through json_extract bytes"
+        );
     }
 
     /// Parallel pin to `cross_session_outranks_expired_lease` for the
@@ -4221,7 +4294,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "system", "auto-reclaim is system-driven, not the prior session");
+        assert_eq!(
+            actor, "system",
+            "auto-reclaim is system-driven, not the prior session"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -4485,7 +4561,11 @@ mod tests {
             })
             .unwrap();
         let ids: Vec<&str> = filtered.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, vec!["z_first", "a_second", "m_third"], "status-filtered arm");
+        assert_eq!(
+            ids,
+            vec!["z_first", "a_second", "m_third"],
+            "status-filtered arm"
+        );
     }
 
     #[test]
@@ -4516,7 +4596,11 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert!(res.is_empty(), "got {:?}", res.iter().map(|c| &c.id).collect::<Vec<_>>());
+        assert!(
+            res.is_empty(),
+            "got {:?}",
+            res.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -4758,7 +4842,16 @@ mod tests {
         let mut s = tmp_store();
         make_capsule(&mut s, "x", "src/api");
         let a = s.claim(claim_req_with_ttl("x", "sess1", 60)).unwrap();
-        let expires_at = a.lease.expires_at;
+        let expires_at_str: String = s
+            .conn
+            .query_row(
+                "SELECT json_extract(lease_json, '$.expires_at')
+                 FROM attempt WHERE capsule_id = ?1 AND attempt_id = ?2",
+                params!["x", a.id as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expires_at = parse_iso8601(&expires_at_str);
         let attempt_id = a.id as i64;
 
         let tx = s.conn.transaction().unwrap();
@@ -4843,10 +4936,7 @@ mod tests {
         let c = s.get_capsule("x").unwrap();
         assert_eq!(c.attempts.len(), 2);
         assert_eq!(c.attempts[0].id, 1);
-        assert_eq!(
-            c.attempts[0].outcome,
-            capsule_core::AttemptOutcome::Expired
-        );
+        assert_eq!(c.attempts[0].outcome, capsule_core::AttemptOutcome::Expired);
         assert_eq!(c.attempts[1].id, 2);
     }
 
@@ -4979,7 +5069,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "operator", "capsule_amended must stay operator-attributed");
+        assert_eq!(
+            actor, "operator",
+            "capsule_amended must stay operator-attributed"
+        );
         assert_eq!(attempt_id, None, "amend has no active attempt to link to");
     }
 
@@ -5181,7 +5274,10 @@ mod tests {
         let StoreError::DependencyCycle(adder, target) = &err else {
             panic!("expected DependencyCycle, got {err:?}");
         };
-        assert_eq!(adder, "c", "first arg is the capsule that tried to add the dep");
+        assert_eq!(
+            adder, "c",
+            "first arg is the capsule that tried to add the dep"
+        );
         assert_eq!(target, "a", "second arg is the dep target");
         assert_eq!(
             err.to_string(),
@@ -5240,7 +5336,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0, "absent-edge remove must not emit a dep_removed event");
+        assert_eq!(
+            count, 0,
+            "absent-edge remove must not emit a dep_removed event"
+        );
     }
 
     #[test]
@@ -5275,16 +5374,16 @@ mod tests {
         make_capsule(&mut s, "a", "src/a");
         make_capsule(&mut s, "b", "src/b");
         s.conn
-            .execute(
-                "UPDATE capsule SET status='landed' WHERE id='a'",
-                params![],
-            )
+            .execute("UPDATE capsule SET status='landed' WHERE id='a'", params![])
             .unwrap();
         s.add_dep(dep_req("a", "b")).unwrap();
         s.remove_dep(dep_req("a", "b")).unwrap();
         let c = s.get_capsule("a").unwrap();
         assert_eq!(c.status, Status::Landed, "guard: capsule still Landed");
-        assert!(c.depends_on.is_empty(), "Landed must accept the call but emit no edge");
+        assert!(
+            c.depends_on.is_empty(),
+            "Landed must accept the call but emit no edge"
+        );
         let count: i64 = s
             .conn
             .query_row(
@@ -5565,7 +5664,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "test-lander", "live-land incident attributes to the lander");
+        assert_eq!(
+            actor, "test-lander",
+            "live-land incident attributes to the lander"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -5846,7 +5948,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "test-lander", "OtherFailure incident attributes to the lander");
+        assert_eq!(
+            actor, "test-lander",
+            "OtherFailure incident attributes to the lander"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -5935,7 +6040,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "test-lander", "actor must be the lander, not the session_id");
+        assert_eq!(
+            actor, "test-lander",
+            "actor must be the lander, not the session_id"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -6032,7 +6140,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "test-lander", "actor must be the lander, not the session_id");
+        assert_eq!(
+            actor, "test-lander",
+            "actor must be the lander, not the session_id"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -6176,11 +6287,9 @@ mod tests {
             .unwrap();
         let count: i64 = s
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM deploy_verify_pass",
-                params![],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM deploy_verify_pass", params![], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1, "INSERT OR REPLACE must keep a single row");
         let (mode, base_ref): (String, String) = s
@@ -6306,7 +6415,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(post_create, 0, "autonomous reconcile on unfrozen must emit no events");
+        assert_eq!(
+            post_create, 0,
+            "autonomous reconcile on unfrozen must emit no events"
+        );
     }
 
     /// Crash window: §7.1.2 step 3 (push) succeeded, step 4 (DB commit)
@@ -6386,7 +6498,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "reconciler", "autonomous reconcile attributes to the reconciler role");
+        assert_eq!(
+            actor, "reconciler",
+            "autonomous reconcile attributes to the reconciler role"
+        );
         assert_eq!(
             attempt_id,
             Some(ack.id as i64),
@@ -6532,7 +6647,11 @@ mod tests {
             .expect("list_capsules drives reclaim_expired_in_tx");
 
         let c = s.get_capsule(id).unwrap();
-        assert_eq!(c.status, Status::Accepted, "frozen capsule must not be reclaimed");
+        assert_eq!(
+            c.status,
+            Status::Accepted,
+            "frozen capsule must not be reclaimed"
+        );
         assert_eq!(c.active_attempt, Some(1));
         assert!(c.verification.is_some(), "verification must persist");
         assert!(c.pending_land.is_some(), "pending_land must persist");
@@ -6640,7 +6759,11 @@ mod tests {
             .as_object()
             .expect("witness_remote_state must be a JSON object");
         let state_keys = sorted_keys(state);
-        assert_eq!(state_keys, vec!["state"], "Absent variant must not carry sha");
+        assert_eq!(
+            state_keys,
+            vec!["state"],
+            "Absent variant must not carry sha"
+        );
         assert_eq!(state["state"], "absent");
     }
 
@@ -6747,7 +6870,10 @@ mod tests {
         assert_eq!(v["operator"], "operator-jane");
         assert_eq!(v["reason"], "thought it was stuck");
         assert_eq!(v["post_action_outcome"], "not_frozen");
-        assert!(v["snapshot"].is_null(), "snapshot must be null when nothing was frozen");
+        assert!(
+            v["snapshot"].is_null(),
+            "snapshot must be null when nothing was frozen"
+        );
 
         let (actor, attempt_id): (String, Option<i64>) = s
             .conn
@@ -6758,8 +6884,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(actor, "operator-jane", "row actor must mirror operator identity");
-        assert_eq!(attempt_id, None, "NotFrozen path has no snapshot to project from");
+        assert_eq!(
+            actor, "operator-jane",
+            "row actor must mirror operator identity"
+        );
+        assert_eq!(
+            attempt_id, None,
+            "NotFrozen path has no snapshot to project from"
+        );
 
         let count: i64 = s
             .conn
@@ -7004,7 +7136,10 @@ mod tests {
         let v = read_event_payload(&s, id, "force_unfreeze_invoked");
         assert_eq!(v["operator"], "operator-jane");
         assert_eq!(v["post_action_outcome"], "abandoned");
-        assert!(v["snapshot"].is_object(), "snapshot must carry the pending_land");
+        assert!(
+            v["snapshot"].is_object(),
+            "snapshot must carry the pending_land"
+        );
     }
 
     /// Force-unfreeze on witness absence clears `pending_land` without
@@ -7035,7 +7170,11 @@ mod tests {
         let c = s.get_capsule(id).unwrap();
         assert_eq!(c.status, Status::Accepted, "Cleared keeps status=Accepted");
         assert!(c.pending_land.is_none(), "pending_land cleared");
-        assert_eq!(c.attempts.len(), 1, "guard: attempts[0] must be the land attempt");
+        assert_eq!(
+            c.attempts.len(),
+            1,
+            "guard: attempts[0] must be the land attempt"
+        );
         assert_eq!(
             c.attempts[0].outcome,
             capsule_core::AttemptOutcome::InFlight,
@@ -7065,7 +7204,10 @@ mod tests {
         let v = read_event_payload(&s, id, "force_unfreeze_invoked");
         assert_eq!(v["operator"], "operator-jane");
         assert_eq!(v["post_action_outcome"], "cleared");
-        assert!(v["snapshot"].is_object(), "snapshot must carry the pending_land");
+        assert!(
+            v["snapshot"].is_object(),
+            "snapshot must carry the pending_land"
+        );
     }
 
     /// `format_iso8601` and `parse_iso8601` are a tied pair: every

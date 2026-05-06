@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use capsule_core::path::CanonicalPath;
 
 /// Returned for each diff entry that fails the lint.
@@ -36,24 +36,15 @@ pub fn check_attest_diff(
         return Ok(Vec::new());
     }
     let touched = git_diff_name_only(repo_dir, base_sha, verified_sha)?;
-    let mut findings = Vec::new();
-    for raw in touched {
-        let Ok(touched_path) = CanonicalPath::new(&raw) else {
-            // Untrackable filenames (NFC-violating, etc.) skip the lint —
-            // the store side will reject the attest later if it matters.
-            continue;
-        };
-        let Some(req_match) = required.iter().find(|r| paths_match(r, &touched_path)) else {
-            continue;
-        };
-        if !scope_prefixes.iter().any(|s| s.overlaps(&touched_path)) {
-            findings.push(Uncovered {
-                path: raw,
-                matched_required: req_match.as_str().to_string(),
-            });
-        }
-    }
-    Ok(findings)
+    let touched = touched
+        .into_iter()
+        .map(|raw| {
+            let path = CanonicalPath::new(&raw)
+                .with_context(|| format!("canonicalizing diff path {raw:?}"))?;
+            Ok((raw, path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(lint_paths(&touched, scope_prefixes, required))
 }
 
 /// A required entry "matches" a touched path iff the touched path is at or
@@ -63,11 +54,32 @@ fn paths_match(required: &CanonicalPath, touched: &CanonicalPath) -> bool {
     required.overlaps(touched)
 }
 
+fn lint_paths(
+    touched: &[(String, CanonicalPath)],
+    scope_prefixes: &[CanonicalPath],
+    required: &[CanonicalPath],
+) -> Vec<Uncovered> {
+    let mut findings = Vec::new();
+    for (raw, touched_path) in touched {
+        let Some(req_match) = required.iter().find(|r| paths_match(r, touched_path)) else {
+            continue;
+        };
+        if !scope_prefixes.iter().any(|s| s.overlaps(touched_path)) {
+            findings.push(Uncovered {
+                path: raw.clone(),
+                matched_required: req_match.as_str().to_string(),
+            });
+        }
+    }
+    findings
+}
+
 fn git_diff_name_only(repo_dir: &Path, base_sha: &str, verified_sha: &str) -> Result<Vec<String>> {
     let out = Command::new("git")
         .args([
             "diff",
             "--name-only",
+            "-z",
             &format!("{base_sha}..{verified_sha}"),
         ])
         .current_dir(repo_dir)
@@ -81,11 +93,15 @@ fn git_diff_name_only(repo_dir: &Path, base_sha: &str, verified_sha: &str) -> Re
             String::from_utf8_lossy(&out.stderr).trim(),
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect())
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|bytes| {
+            let s = std::str::from_utf8(bytes)
+                .with_context(|| format!("non-utf8 path in diff: {bytes:?}"))?;
+            Ok(s.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -111,5 +127,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = check_attest_diff(dir.path(), "HEAD", "HEAD", &[cp("src")], &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn lint_passes_when_scope_covers_touched_lockfile() {
+        let touched = vec![
+            ("Cargo.lock".to_string(), cp("Cargo.lock")),
+            ("src/main.rs".to_string(), cp("src/main.rs")),
+        ];
+        let scope = vec![cp("Cargo.lock"), cp("src")];
+        let required = vec![cp("Cargo.lock")];
+        assert_eq!(lint_paths(&touched, &scope, &required), vec![]);
+    }
+
+    #[test]
+    fn lint_flags_uncovered_lockfile() {
+        let touched = vec![
+            ("Cargo.lock".to_string(), cp("Cargo.lock")),
+            ("src/main.rs".to_string(), cp("src/main.rs")),
+        ];
+        let scope = vec![cp("src")];
+        let required = vec![cp("Cargo.lock")];
+
+        let v = lint_paths(&touched, &scope, &required);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "Cargo.lock");
+        assert_eq!(v[0].matched_required, "Cargo.lock");
+    }
+
+    #[test]
+    fn lint_handles_directory_prefix_required_entry() {
+        let touched = vec![(
+            "db/migrations/2024_01_01_init.sql".to_string(),
+            cp("db/migrations/2024_01_01_init.sql"),
+        )];
+        let scope = vec![cp("src")];
+        let required = vec![cp("db/migrations/")];
+
+        let v = lint_paths(&touched, &scope, &required);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].matched_required, "db/migrations");
+    }
+
+    #[test]
+    fn lint_does_not_flag_adjacent_files() {
+        let touched = vec![("Cargo.toml".to_string(), cp("Cargo.toml"))];
+        let scope = vec![cp("src")];
+        let required = vec![cp("Cargo.lock")];
+        assert_eq!(lint_paths(&touched, &scope, &required), vec![]);
+    }
+
+    #[test]
+    fn lint_ignores_paths_not_in_required_list() {
+        let touched = vec![("README.md".to_string(), cp("README.md"))];
+        let scope = vec![cp("src")];
+        let required = vec![cp("Cargo.lock")];
+        assert_eq!(lint_paths(&touched, &scope, &required), vec![]);
     }
 }
