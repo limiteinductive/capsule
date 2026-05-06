@@ -39,6 +39,7 @@ Capsule is a working reference implementation, not only a design note.
 - Path-prefix scope conflict detection
 - `capsule doctor` setup diagnostics
 - Claim, heartbeat, attest, land, abandon, reclaim, deps, reconcile, force-unfreeze
+- `capsule events` audit-log inspection
 - Git atomic multi-ref push with witness refs
 - `capsule work --isolate=worktree`
 - `capsule cleanup-worktrees` for stale managed worktrees
@@ -188,6 +189,16 @@ Important refs:
 
 The land operation uses `git push --atomic --force-with-lease` so base ref
 movement and witness ref publication succeed or fail together.
+
+## Audit Events
+
+Every state transition appends an audit event. Inspect recent events:
+
+```sh
+capsule events
+capsule events api-timeout --kind attempt_attested
+capsule --json events api-timeout
+```
 
 ## Worktree Cleanup
 

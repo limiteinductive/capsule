@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use capsule_core::path::CanonicalPath;
 use capsule_core::{Acceptance, Capsule, ExpectExit, Status};
 use capsule_store::{
-    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
-    LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
+    AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest, EventFilter,
+    EventRecord, ForceUnfreezeRequest, LandRequest, ListFilter, NewCapsule, ReconcileRequest,
+    Store,
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use time::format_description::well_known::Rfc3339;
@@ -56,6 +57,8 @@ enum Cmd {
     Amend(AmendArgs),
     /// Show full state of a single capsule.
     Status(StatusArgs),
+    /// Show audit events.
+    Events(EventsArgs),
     /// Claim a planned capsule for a session.
     Claim(ClaimArgs),
     /// Run a command under the active attempt, heartbeating until it exits.
@@ -161,6 +164,18 @@ struct AmendArgs {
 #[derive(clap::Args)]
 struct StatusArgs {
     capsule_id: String,
+}
+
+#[derive(clap::Args)]
+struct EventsArgs {
+    /// Restrict to one capsule id.
+    capsule_id: Option<String>,
+    /// Restrict to one event kind, such as `capsule_created`.
+    #[arg(long)]
+    kind: Option<String>,
+    /// Return the newest N matching events, displayed oldest-to-newest.
+    #[arg(long, default_value_t = 50)]
+    limit: u32,
 }
 
 #[derive(clap::Args)]
@@ -467,6 +482,27 @@ fn print_cleanup_worktrees(report: &CleanupWorktreesReport) {
     }
 }
 
+fn print_events(events: &[EventRecord]) -> Result<()> {
+    for event in events {
+        let payload = serde_json::to_string(&event.payload)?;
+        let attempt = event
+            .attempt_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            event.rowid,
+            fmt_ts(event.at),
+            event.capsule_id,
+            attempt,
+            event.actor,
+            event.kind,
+            payload
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -631,6 +667,19 @@ fn main() -> Result<()> {
                 print_json(&capsule)?;
             } else {
                 print_status(&capsule);
+            }
+        }
+        Cmd::Events(args) => {
+            let store = open_store(&dir)?;
+            let events = store.list_events(EventFilter {
+                capsule_id: args.capsule_id,
+                kind: args.kind,
+                limit: Some(args.limit),
+            })?;
+            if cli.json {
+                print_json(&events)?;
+            } else {
+                print_events(&events)?;
             }
         }
         Cmd::Claim(args) => {

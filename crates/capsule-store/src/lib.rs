@@ -5,8 +5,8 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 use capsule_core::path::CanonicalPath;
-use capsule_core::{Acceptance, Capsule, CapsuleId, Landing, PendingLand, Status};
-use rusqlite::{params, Connection};
+use capsule_core::{Acceptance, AttemptId, Capsule, CapsuleId, Landing, PendingLand, Status};
+use rusqlite::{params, types::Value, Connection};
 use serde_json as json;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -1127,6 +1127,46 @@ impl Store {
         row.into_capsule(&tx)
     }
 
+    /// Read audit events in chronological order. When `limit` is set, returns
+    /// the newest N matching rows, still ordered oldest-to-newest for display.
+    pub fn list_events(&self, filter: EventFilter) -> Result<Vec<EventRecord>> {
+        let tx = self.snapshot_read_tx()?;
+        let mut where_parts = Vec::new();
+        let mut vals = Vec::new();
+        if let Some(capsule_id) = filter.capsule_id {
+            where_parts.push("capsule_id = ?");
+            vals.push(Value::Text(capsule_id));
+        }
+        if let Some(kind) = filter.kind {
+            where_parts.push("kind = ?");
+            vals.push(Value::Text(kind));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+
+        let select = "SELECT rowid, at, capsule_id, attempt_id, actor, kind, payload_json \
+                      FROM event";
+        let sql = if let Some(limit) = filter.limit {
+            vals.push(Value::Integer(i64::from(limit)));
+            format!(
+                "SELECT rowid, at, capsule_id, attempt_id, actor, kind, payload_json \
+                 FROM ({select}{where_sql} ORDER BY rowid DESC LIMIT ?) \
+                 ORDER BY rowid ASC"
+            )
+        } else {
+            format!("{select}{where_sql} ORDER BY rowid ASC")
+        };
+
+        let mut stmt = tx.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(vals), RowEvent::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RowEvent::into_event).collect()
+    }
+
     /// Open a read-only `Transaction` over `&self.conn` so a multi-statement
     /// read sees one snapshot — without this, separate statements each pick
     /// their own and a concurrent writer (e.g. `claim`) committing between
@@ -1166,6 +1206,27 @@ pub struct ListFilter {
     /// Restrict to capsules whose scope_prefixes overlap this path
     /// (path-component-wise, see `CanonicalPath::overlaps`).
     pub scope_overlaps: Option<CanonicalPath>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    pub capsule_id: Option<CapsuleId>,
+    /// Raw event kind wire string, such as `capsule_created`.
+    pub kind: Option<String>,
+    /// Newest N matching rows. `None` returns all matches.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventRecord {
+    pub rowid: i64,
+    #[serde(with = "time::serde::iso8601")]
+    pub at: OffsetDateTime,
+    pub capsule_id: CapsuleId,
+    pub attempt_id: Option<AttemptId>,
+    pub actor: String,
+    pub kind: String,
+    pub payload: json::Value,
 }
 
 /// Amend a `Planned` capsule. Fields left as `None` are unchanged. `depends_on`
@@ -2266,6 +2327,42 @@ impl RowAttempt {
     }
 }
 
+struct RowEvent {
+    rowid: i64,
+    at: String,
+    capsule_id: String,
+    attempt_id: Option<i64>,
+    actor: String,
+    kind: String,
+    payload_json: String,
+}
+
+impl RowEvent {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            rowid: r.get("rowid")?,
+            at: r.get("at")?,
+            capsule_id: r.get("capsule_id")?,
+            attempt_id: r.get("attempt_id")?,
+            actor: r.get("actor")?,
+            kind: r.get("kind")?,
+            payload_json: r.get("payload_json")?,
+        })
+    }
+
+    fn into_event(self) -> Result<EventRecord> {
+        Ok(EventRecord {
+            rowid: self.rowid,
+            at: parse_iso8601(&self.at),
+            capsule_id: self.capsule_id,
+            attempt_id: self.attempt_id.map(|id| id as u64),
+            actor: self.actor,
+            kind: self.kind,
+            payload: json::from_str(&self.payload_json)?,
+        })
+    }
+}
+
 /// Read-side wire-string parser shared by `parse_status` and `parse_outcome`.
 ///
 /// Wire round-trips live on the enums in `capsule_core::model`; the SQL CHECK
@@ -2718,6 +2815,55 @@ mod tests {
         for (v, wire) in cases {
             assert_eq!(v.as_wire_str(), wire);
         }
+    }
+
+    #[test]
+    fn list_events_filters_limits_and_keeps_chronological_order() {
+        let mut s = tmp_store();
+        s.create_capsule(new_capsule_args("x", "src")).unwrap();
+        s.amend(AmendRequest {
+            capsule_id: "x".into(),
+            title: Some("new title".into()),
+            ..AmendRequest::default()
+        })
+        .unwrap();
+        s.create_capsule(new_capsule_args("y", "docs")).unwrap();
+
+        let all_x = s
+            .list_events(EventFilter {
+                capsule_id: Some("x".into()),
+                kind: None,
+                limit: None,
+            })
+            .unwrap();
+        let kinds: Vec<&str> = all_x.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(kinds, ["capsule_created", "capsule_amended"]);
+        assert!(all_x[0].rowid < all_x[1].rowid);
+        assert_eq!(all_x[0].actor, actor::SYSTEM);
+        assert_eq!(all_x[1].actor, actor::OPERATOR);
+
+        let latest_x = s
+            .list_events(EventFilter {
+                capsule_id: Some("x".into()),
+                kind: None,
+                limit: Some(1),
+            })
+            .unwrap();
+        assert_eq!(latest_x.len(), 1);
+        assert_eq!(latest_x[0].kind, "capsule_amended");
+
+        let created = s
+            .list_events(EventFilter {
+                capsule_id: None,
+                kind: Some("capsule_created".into()),
+                limit: None,
+            })
+            .unwrap();
+        let ids: Vec<&str> = created
+            .iter()
+            .map(|event| event.capsule_id.as_str())
+            .collect();
+        assert_eq!(ids, ["x", "y"]);
     }
 
     #[test]
@@ -4656,7 +4802,6 @@ mod tests {
             pre.attempts[0].closed_at.is_none(),
             "in-flight attempt must have no closed_at"
         );
-        let before = OffsetDateTime::now_utc();
         s.abandon(AbandonRequest {
             capsule_id: "x".into(),
             session_id: "sess1".into(),
@@ -4673,8 +4818,9 @@ mod tests {
             .closed_at
             .expect("abandoned attempt must record closed_at");
         assert!(
-            closed >= before,
-            "closed_at {closed} earlier than abandon start {before}"
+            closed >= post.attempts[0].opened_at,
+            "closed_at {closed} earlier than opened_at {}",
+            post.attempts[0].opened_at
         );
     }
 

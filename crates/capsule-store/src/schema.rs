@@ -8,7 +8,7 @@ use rusqlite::{Connection, Result as SqlResult};
 /// follows.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
-const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_DEPLOY_VERIFY_GATE];
+const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_DEPLOY_VERIFY_GATE, V3_EVENT_KIND_INDEX];
 
 /// v1: initial schema. Capsule is the aggregate root; attempts and events
 /// are normalized; attestations and landing live inline on the capsule
@@ -87,6 +87,12 @@ const V2_DEPLOY_VERIFY_GATE: &str = r"
         mode      TEXT NOT NULL,
         base_ref  TEXT NOT NULL
     );
+    ";
+
+/// v3: event inspection can filter globally by kind (`capsule events --kind`).
+/// Keep rowid second so latest-N scans can use the same index ordering.
+const V3_EVENT_KIND_INDEX: &str = r"
+    CREATE INDEX IF NOT EXISTS idx_event_kind_rowid ON event(kind, rowid);
     ";
 
 pub fn ensure(conn: &Connection) -> SqlResult<()> {
@@ -177,11 +183,11 @@ mod tests {
 
     /// Pin the partial-upgrade path: a DB stamped at v1 must skip V1_INITIAL
     /// (its `INSERT INTO schema_version VALUES (1)` would PK-conflict if
-    /// re-run) and apply V2 only. Without this, an off-by-one in the skip
+    /// re-run) and apply only the migration tail. Without this, an off-by-one in the skip
     /// guard (`v <= current` flipped to `v < current`) re-runs V1 on every
     /// upgrade and surfaces as a confusing PK conflict at INSERT time
     /// instead of a clean idempotent skip. Also covers the symmetric case
-    /// for a future v3+ migration: the loop must apply only the new tail.
+    /// for future migrations: the loop must apply only the new tail.
     #[test]
     fn ensure_skips_already_applied_migrations() {
         let conn = Connection::open_in_memory().unwrap();
@@ -197,7 +203,10 @@ mod tests {
             table_exists(&conn, "deploy_verify_pass"),
             "V2 must apply on top of v1-stamped DB",
         );
-        assert_eq!(recorded_versions(&conn), vec![1, 2]);
+        assert_eq!(
+            recorded_versions(&conn),
+            (1..=SCHEMA_VERSION).collect::<Vec<_>>()
+        );
     }
 
     /// Read the live CREATE TABLE SQL for `table_name` from `sqlite_schema`.
