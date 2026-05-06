@@ -18,4 +18,5 @@ fn bash_completions_include_current_subcommands() {
     assert!(stdout.contains("deploy-verify"), "{stdout}");
     assert!(stdout.contains("force-unfreeze"), "{stdout}");
     assert!(stdout.contains("completions"), "{stdout}");
+    assert!(stdout.contains("queue"), "{stdout}");
 }

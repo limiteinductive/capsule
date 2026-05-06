@@ -46,6 +46,8 @@ enum Cmd {
     Completions(CompletionsArgs),
     /// Remove Capsule-managed worktrees for terminal attempts.
     CleanupWorktrees(CleanupWorktreesArgs),
+    /// Show queue health, claimable work, and in-flight capsules.
+    Queue(QueueArgs),
     /// Run the deployment ACL test suite (DESIGN §8.2). Hermetic mode spins
     /// up a tempdir bare repo with the reference pre-receive hook; remote
     /// mode runs against a real forge with three pre-provisioned principals.
@@ -107,6 +109,16 @@ struct CleanupWorktreesArgs {
     /// Pass `--force` to `git worktree remove` for dirty or locked worktrees.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(clap::Args)]
+struct QueueArgs {
+    /// Max capsules shown per queue bucket.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Restrict the available bucket to capsules whose scope overlaps this path.
+    #[arg(long = "scope-overlaps")]
+    scope_overlaps: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -503,6 +515,111 @@ fn print_events(events: &[EventRecord]) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct QueueCounts {
+    planned: usize,
+    active: usize,
+    accepted: usize,
+    landed: usize,
+    abandoned: usize,
+}
+
+impl QueueCounts {
+    fn from_capsules(capsules: &[Capsule]) -> Self {
+        let mut counts = Self {
+            planned: 0,
+            active: 0,
+            accepted: 0,
+            landed: 0,
+            abandoned: 0,
+        };
+        for capsule in capsules {
+            match capsule.status {
+                Status::Planned => counts.planned += 1,
+                Status::Active => counts.active += 1,
+                Status::Accepted => counts.accepted += 1,
+                Status::Landed => counts.landed += 1,
+                Status::Abandoned => counts.abandoned += 1,
+            }
+        }
+        counts
+    }
+}
+
+#[derive(serde::Serialize)]
+struct QueueReport<'a> {
+    counts: QueueCounts,
+    deploy_verify_passed: bool,
+    available: Vec<CapsuleSummary<'a>>,
+    active: Vec<CapsuleSummary<'a>>,
+    accepted: Vec<CapsuleSummary<'a>>,
+}
+
+impl<'a> QueueReport<'a> {
+    fn new(
+        all: &'a [Capsule],
+        available: &'a [Capsule],
+        limit: usize,
+        deploy_verify_passed: bool,
+    ) -> Self {
+        Self {
+            counts: QueueCounts::from_capsules(all),
+            deploy_verify_passed,
+            available: capsule_summaries(available.iter(), limit),
+            active: capsule_summaries(all.iter().filter(|c| c.status == Status::Active), limit),
+            accepted: capsule_summaries(all.iter().filter(|c| c.status == Status::Accepted), limit),
+        }
+    }
+}
+
+fn capsule_summaries<'a>(
+    capsules: impl Iterator<Item = &'a Capsule>,
+    limit: usize,
+) -> Vec<CapsuleSummary<'a>> {
+    capsules.take(limit).map(CapsuleSummary::from).collect()
+}
+
+fn print_queue(all: &[Capsule], available: &[Capsule], limit: usize, deploy_verify_passed: bool) {
+    let counts = QueueCounts::from_capsules(all);
+    println!(
+        "queue\tplanned={}\tactive={}\taccepted={}\tlanded={}\tabandoned={}\tavailable={}\tdeploy_verify={}",
+        counts.planned,
+        counts.active,
+        counts.accepted,
+        counts.landed,
+        counts.abandoned,
+        available.len(),
+        if deploy_verify_passed { "ok" } else { "missing" }
+    );
+    print_queue_section("available", available.iter().take(limit));
+    print_queue_section(
+        "active",
+        all.iter()
+            .filter(|c| c.status == Status::Active)
+            .take(limit),
+    );
+    print_queue_section(
+        "accepted",
+        all.iter()
+            .filter(|c| c.status == Status::Accepted)
+            .take(limit),
+    );
+}
+
+fn print_queue_section<'a>(label: &str, capsules: impl Iterator<Item = &'a Capsule>) {
+    let mut printed = false;
+    for capsule in capsules {
+        if !printed {
+            println!("{label}:");
+            printed = true;
+        }
+        print_capsule_summary_line(capsule);
+    }
+    if !printed {
+        println!("{label}: none");
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -568,6 +685,35 @@ fn main() -> Result<()> {
                 print_json(&report)?;
             } else {
                 print_cleanup_worktrees(&report);
+            }
+        }
+        Cmd::Queue(args) => {
+            let mut store = open_store(&dir)?;
+            let scope_overlaps = args
+                .scope_overlaps
+                .as_deref()
+                .map(|s| parse_canonical_path("scope-overlaps", s))
+                .transpose()?;
+            let capsules = store.list_capsules(ListFilter {
+                status: None,
+                available: false,
+                scope_overlaps: None,
+            })?;
+            let available = store.list_capsules(ListFilter {
+                status: None,
+                available: true,
+                scope_overlaps,
+            })?;
+            let deploy_verify_passed = store.check_deploy_verify_pass()?;
+            if cli.json {
+                print_json(&QueueReport::new(
+                    &capsules,
+                    &available,
+                    args.limit,
+                    deploy_verify_passed,
+                ))?;
+            } else {
+                print_queue(&capsules, &available, args.limit, deploy_verify_passed);
             }
         }
         Cmd::Create(args) => {

@@ -110,6 +110,13 @@ capsule create \
   --base-ref main
 ```
 
+Inspect the queue and find claimable work:
+
+```sh
+capsule queue
+capsule queue --scope-overlaps crates/capsule-cli --limit 5
+```
+
 Claim it for a session:
 
 ```sh
