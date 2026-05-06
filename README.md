@@ -261,7 +261,7 @@ cargo test --workspace --all-targets --locked
 ```
 
 The repo currently keeps `Cargo.lock` checked in because the CLI is a binary.
-The workspace declares Rust 1.75 as its MSRV; CI checks both stable and MSRV.
+The workspace declares Rust 1.85 as its MSRV; CI checks both stable and MSRV.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for design boundaries, test
 expectations, and PR guidance.
