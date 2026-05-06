@@ -1,6 +1,7 @@
 # capsule
 
 [![CI](https://github.com/limiteinductive/capsule/actions/workflows/ci.yml/badge.svg)](https://github.com/limiteinductive/capsule/actions/workflows/ci.yml)
+[![Release](https://github.com/limiteinductive/capsule/actions/workflows/release.yml/badge.svg)](https://github.com/limiteinductive/capsule/actions/workflows/release.yml)
 
 Capsule is a path-prefix lock and verified atomic land protocol for parallel
 coding agents working in the same git repository.
@@ -52,6 +53,16 @@ The full protocol design is in [DESIGN.md](DESIGN.md). The product positioning
 and implementation proposal is in [PROPOSAL.md](PROPOSAL.md).
 
 ## Install
+
+Install the latest release on Linux x86_64 or Apple silicon macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/limiteinductive/capsule/main/scripts/install.sh | sh
+```
+
+The installer downloads the matching release binary, verifies its `.sha256`
+file, and installs to `~/.local/bin` by default. Override with `PREFIX`,
+`BIN_DIR`, or `CAPSULE_VERSION=v0.0.2`.
 
 From this checkout:
 
