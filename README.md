@@ -256,11 +256,12 @@ Run the same checks as CI:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 The repo currently keeps `Cargo.lock` checked in because the CLI is a binary.
+The workspace declares Rust 1.75 as its MSRV; CI checks both stable and MSRV.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for design boundaries, test
 expectations, and PR guidance.

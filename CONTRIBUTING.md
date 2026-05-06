@@ -8,7 +8,8 @@ sequence must be explainable from durable store state plus git refs.
 
 Required tools:
 
-- Rust stable
+- Rust stable for development
+- Rust 1.75 compatibility for MSRV-sensitive dependency changes
 - Git
 
 Recommended first check:
@@ -27,12 +28,16 @@ cargo run -- doctor
 
 ## Required Checks
 
+Capsule declares Rust 1.75 as its minimum supported Rust version (MSRV).
+Keep dependency updates compatible with that MSRV unless the workspace
+`rust-version` is deliberately raised.
+
 Before opening a PR, run the same checks as CI:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 For focused iteration, run the narrowest relevant test first, then the full
