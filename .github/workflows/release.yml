@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy rustfmt
+          rustup default stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: macos
+            os: macos-latest
+          - name: windows
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin capsule
+
+      - name: Resolve artifact names
+        id: artifact
+        shell: bash
+        run: |
+          host="$(rustc -vV | awk '/^host:/ { print $2 }')"
+          artifact="capsule-${host}"
+          bin="target/release/capsule"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            artifact="${artifact}.exe"
+            bin="${bin}.exe"
+          fi
+          echo "artifact=${artifact}" >> "${GITHUB_OUTPUT}"
+          echo "bin=${bin}" >> "${GITHUB_OUTPUT}"
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ steps.artifact.outputs.bin }}" "dist/${{ steps.artifact.outputs.artifact }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${{ steps.artifact.outputs.artifact }}" > "dist/${{ steps.artifact.outputs.artifact }}.sha256"
+          else
+            shasum -a 256 "dist/${{ steps.artifact.outputs.artifact }}" > "dist/${{ steps.artifact.outputs.artifact }}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.artifact }}
+          path: |
+            dist/${{ steps.artifact.outputs.artifact }}
+            dist/${{ steps.artifact.outputs.artifact }}.sha256
+
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.artifact.outputs.artifact }}
+            dist/${{ steps.artifact.outputs.artifact }}.sha256

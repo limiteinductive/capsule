@@ -65,6 +65,20 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Releases
+
+Release tags use the `vX.Y.Z` format. Pushing a version tag runs the release
+workflow, verifies format, clippy, and tests, then builds native `capsule`
+binaries for Linux, macOS, and Windows:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow attaches each binary and a `.sha256` checksum file to the GitHub
+release for the tag.
+
 ## Quickstart
 
 Initialize a store in the current repo:
