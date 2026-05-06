@@ -197,6 +197,8 @@ Use `required = []` to disable the lint for a repo.
 - `skills/capsule`: agent-facing operating discipline and reference hook
 - `DESIGN.md`: protocol design
 - `PROPOSAL.md`: positioning and implementation plan
+- `CONTRIBUTING.md`: contribution workflow and design rules
+- `SECURITY.md`: vulnerability reporting and security-sensitive areas
 
 ## Development
 
@@ -209,6 +211,9 @@ cargo test --workspace --all-targets
 ```
 
 The repo currently keeps `Cargo.lock` checked in because the CLI is a binary.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for design boundaries, test
+expectations, and PR guidance.
 
 ## Non-Goals
 
