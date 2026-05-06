@@ -7,7 +7,7 @@ use capsule_store::{
     AbandonRequest, AmendRequest, AttestRequest, ClaimRequest, DepRequest, ForceUnfreezeRequest,
     LandRequest, ListFilter, NewCapsule, ReconcileRequest, Store,
 };
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use time::format_description::well_known::Rfc3339;
 
 mod config;
@@ -41,6 +41,8 @@ enum Cmd {
     Init(InitArgs),
     /// Diagnose local capsule setup without mutating state.
     Doctor,
+    /// Generate shell completion scripts.
+    Completions(CompletionsArgs),
     /// Run the deployment ACL test suite (DESIGN §8.2). Hermetic mode spins
     /// up a tempdir bare repo with the reference pre-receive hook; remote
     /// mode runs against a real forge with three pre-provisioned principals.
@@ -83,6 +85,13 @@ struct InitArgs {
     /// Don't touch `.gitignore`. Default: append a rule so `state.db` isn't committed.
     #[arg(long = "no-gitignore")]
     no_gitignore: bool,
+}
+
+#[derive(clap::Args)]
+struct CompletionsArgs {
+    /// Shell to generate completions for.
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 #[derive(clap::Args)]
@@ -422,6 +431,11 @@ fn main() -> Result<()> {
             if !report.ok {
                 std::process::exit(1);
             }
+        }
+        Cmd::Completions(args) => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            clap_complete::generate(args.shell, &mut cmd, bin_name, &mut std::io::stdout());
         }
         Cmd::Create(args) => {
             let mut store = open_store(&dir)?;

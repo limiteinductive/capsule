@@ -65,6 +65,14 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+Generate shell completions from the current CLI schema:
+
+```sh
+capsule completions bash > ~/.local/share/bash-completion/completions/capsule
+capsule completions zsh > "${fpath[1]}/_capsule"
+capsule completions fish > ~/.config/fish/completions/capsule.fish
+```
+
 ## Releases
 
 Release tags use the `vX.Y.Z` format. Pushing a version tag runs the release

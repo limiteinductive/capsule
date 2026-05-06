@@ -17,6 +17,7 @@ capsule-store.workspace = true
 capsule-git.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
