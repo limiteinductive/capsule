@@ -24,7 +24,7 @@ clap_complete = "4"
 rusqlite = { version = "0.39", features = ["bundled"] }
 # time 0.3.46 raises its MSRV to Rust 1.88; keep this below that
 # boundary while Capsule's workspace MSRV is Rust 1.85.
-time = { version = ">=0.3, <0.3.46", features = ["serde", "formatting", "parsing", "macros"] }
+time = { version = ">=0.3, <0.3.48", features = ["serde", "formatting", "parsing", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
