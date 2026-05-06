@@ -9,6 +9,12 @@ updates:
       time: "10:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
+    ignore:
+      # time 0.3.46+ requires Rust 1.88; keep this ignored until the
+      # workspace MSRV is deliberately raised beyond Rust 1.85.
+      - dependency-name: "time"
+        versions:
+          - ">= 0.3.46"
     groups:
       rust-dependencies:
         patterns:
