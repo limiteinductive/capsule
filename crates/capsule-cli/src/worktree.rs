@@ -15,6 +15,16 @@ use fs2::FileExt;
 
 const SETUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, serde::Serialize)]
+pub struct CleanupWorktreeEntry {
+    pub capsule_id: String,
+    pub attempt: u64,
+    pub branch: String,
+    pub path: PathBuf,
+    pub action: &'static str,
+    pub detail: String,
+}
+
 pub struct IsolateState {
     pub worktree_path: PathBuf,
     pub canonical_capsule_dir: PathBuf,
@@ -62,7 +72,7 @@ pub fn setup(
     let setup_lock = acquire_setup_lock(&setup_lock_path)?;
 
     let worktree_path = match worktree_dir_override {
-        None => canonical_capsule_dir.join(format!("worktrees/{capsule_id}-a{attempt_num}")),
+        None => default_worktree_path(&canonical_capsule_dir, capsule_id, attempt_num),
         Some(p) => validate_worktree_dir_override(p, &main_worktree_root, &canonical_capsule_dir)?,
     };
 
@@ -125,6 +135,102 @@ pub fn setup(
         canonical_capsule_dir,
         _runtime_lock: runtime_lock,
     })
+}
+
+/// Remove a terminal attempt's default worktree, if it is still registered at
+/// Capsule's managed path. Caller decides which attempts are terminal; this
+/// helper deliberately refuses non-default registrations so explicit
+/// `--worktree-dir` users do not lose local scratch state.
+pub fn cleanup_default_worktree(
+    capsule_dir: &Path,
+    capsule_id: &str,
+    attempt_num: u64,
+    branch: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<Option<CleanupWorktreeEntry>> {
+    let canonical_capsule_dir = fs::canonicalize(capsule_dir)
+        .with_context(|| format!("canonicalize capsule dir {}", capsule_dir.display()))?;
+    let worktree_path = default_worktree_path(&canonical_capsule_dir, capsule_id, attempt_num);
+
+    let registered = git_worktree_list_for_branch(branch)?;
+    let Some(registered_path) = registered else {
+        if worktree_path.exists() {
+            return Ok(Some(cleanup_entry(
+                capsule_id,
+                attempt_num,
+                branch,
+                worktree_path.clone(),
+                "skipped",
+                "default path exists but is not a registered git worktree",
+            )));
+        }
+        return Ok(None);
+    };
+
+    if Path::new(&registered_path) != worktree_path {
+        return Ok(Some(cleanup_entry(
+            capsule_id,
+            attempt_num,
+            branch,
+            PathBuf::from(registered_path),
+            "skipped",
+            "branch is registered at a non-default worktree path",
+        )));
+    }
+
+    if dry_run {
+        return Ok(Some(cleanup_entry(
+            capsule_id,
+            attempt_num,
+            branch,
+            worktree_path,
+            "would_remove",
+            "registered default worktree",
+        )));
+    }
+
+    match git_worktree_remove(&worktree_path, force) {
+        Ok(()) => Ok(Some(cleanup_entry(
+            capsule_id,
+            attempt_num,
+            branch,
+            worktree_path,
+            "removed",
+            "removed registered default worktree",
+        ))),
+        Err(detail) => Ok(Some(cleanup_entry(
+            capsule_id,
+            attempt_num,
+            branch,
+            worktree_path,
+            "skipped",
+            detail,
+        ))),
+    }
+}
+
+fn default_worktree_path(capsule_dir: &Path, capsule_id: &str, attempt_num: u64) -> PathBuf {
+    capsule_dir.join(format!("worktrees/{capsule_id}-a{attempt_num}"))
+}
+
+fn cleanup_entry(
+    capsule_id: &str,
+    attempt: u64,
+    branch: &str,
+    path: PathBuf,
+    action: &'static str,
+    detail: impl Into<String>,
+) -> CleanupWorktreeEntry {
+    let detail = detail.into().replace(['\r', '\n'], " ");
+    CleanupWorktreeEntry {
+        capsule_id: capsule_id.to_string(),
+        attempt,
+        branch: branch.to_string(),
+        path,
+        action,
+        detail,
+    }
 }
 
 /// Validate a `--worktree-dir` override. Rejects relative paths up-front:
@@ -338,6 +444,29 @@ fn git_worktree_add_existing_branch(path: &Path, branch: &str) -> Result<()> {
         bail!("git worktree add {} {branch} failed", path.display());
     }
     Ok(())
+}
+
+fn git_worktree_remove(path: &Path, force: bool) -> std::result::Result<(), String> {
+    let mut command = Command::new("git");
+    command.args(["worktree", "remove"]);
+    if force {
+        command.arg("--force");
+    }
+    let out = command
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn git worktree remove: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!("git worktree remove failed: {detail}"))
 }
 
 fn run_git_capture(args: &[&str]) -> Result<String> {

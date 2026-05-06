@@ -61,7 +61,10 @@ Three changes. None modifies the protocol crates (`capsule-core`, `capsule-store
 
 **Cost.** Small. Pure CLI shell-out. No core/store/git crate changes.
 
-**Risk.** Low. The shim is opt-in; existing workflows unaffected. Worktree pruning is the user's responsibility (or wire CLI-layer cleanup to `capsule abandon` and to `capsule land` on success).
+**Risk.** Low. The shim is opt-in; existing workflows unaffected. Worktree
+cleanup is explicit via `capsule cleanup-worktrees`; it only targets Capsule's
+default worktree paths for terminal attempts and lets `git worktree remove`
+refuse dirty worktrees unless the caller passes `--force`.
 
 **Non-goal.** Not "reframing capsule on top of worktrees." The protocol remains a coordination primitive over refs + DB; the worktree shim is convenience only.
 
@@ -145,7 +148,11 @@ DESIGN.md §8.2 fully specifies an 8-test ACL/branch-protection suite (tests 1, 
 ## 6. Open questions
 
 - ~~Default `serialize_paths.required` list: ship empty or preloaded?~~ **Resolved: preloaded.** `DEFAULT_REQUIRED` ships `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `uv.lock`. Repos that disagree set `[serialize_paths] required = []` (or a custom list) in the capsule store config (`.capsule/config.toml` by default).
-- Worktree pruning hook: should `capsule abandon` and `capsule land` (on success) automatically `git worktree remove` paths created by `capsule work --isolate=worktree`? Cleaner UX vs. risk of clobbering uncommitted work in the worktree dir. Open.
+- Worktree pruning hook: `capsule cleanup-worktrees` now covers explicit
+  cleanup of default terminal worktrees. Automatic cleanup in `abandon` or
+  successful `land` remains intentionally avoided because it can surprise users
+  with uncommitted work in the worktree dir; callers can opt into
+  `cleanup-worktrees --force` when they have made that decision.
 
 ## 7. Decided in DESIGN.md (not open)
 
@@ -164,7 +171,7 @@ The following questions appeared in earlier proposal drafts but are settled by D
 | §3.2 default config + attest lint | ✓ shipped | `capsule-cli/src/config.rs`, `capsule-cli/src/serialize_lint.rs`, wired in `main.rs::run_serialize_lint` |
 | §3.2 PreToolUse hook extension | deferred | predicate (`lint_paths`) ready; integration is agent-runtime-specific |
 | §3.1 worktree shim | ✓ shipped | `capsule-cli/src/worktree.rs` (default path `<capsule_dir>/worktrees/<id>-a<N>`) |
-| §3.1 worktree auto-prune on land/abandon | open (§6) | not implemented; user-driven `git worktree remove` |
+| §3.1 worktree cleanup | ✓ shipped | explicit `capsule cleanup-worktrees`; auto-prune on land/abandon intentionally not default |
 | §3.1 worktree auto-push on first commit | not planned | discipline: skill (`skills/capsule/SKILL.md`) instructs the worker to push before `capsule attest`; `Cmd::Attest` lint fails closed if `verified_sha` is not in the local object DB |
 
 ### Test coverage

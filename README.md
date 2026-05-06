@@ -41,6 +41,7 @@ Capsule is a working reference implementation, not only a design note.
 - Claim, heartbeat, attest, land, abandon, reclaim, deps, reconcile, force-unfreeze
 - Git atomic multi-ref push with witness refs
 - `capsule work --isolate=worktree`
+- `capsule cleanup-worktrees` for stale managed worktrees
 - `capsule deploy-verify` hermetic ACL suite
 - Remote deploy-verify mode for provisioned lander, worker, and outsider principals
 - Attest-time serialize-path lint for lockfiles such as `Cargo.lock`
@@ -187,6 +188,22 @@ Important refs:
 
 The land operation uses `git push --atomic --force-with-lease` so base ref
 movement and witness ref publication succeed or fail together.
+
+## Worktree Cleanup
+
+`capsule work --isolate=worktree` creates default attempt worktrees under
+`.capsule/worktrees/<id>-a<N>`. Once a capsule is `landed` or `abandoned`, clean
+those managed worktrees explicitly:
+
+```sh
+capsule cleanup-worktrees --dry-run
+capsule cleanup-worktrees
+```
+
+The cleanup command only removes Capsule's default worktree paths for terminal
+attempts. It leaves active attempts and custom `--worktree-dir` registrations
+alone, and relies on `git worktree remove` to refuse dirty worktrees unless
+`--force` is passed.
 
 ## Serialized Paths
 

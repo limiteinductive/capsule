@@ -43,6 +43,8 @@ enum Cmd {
     Doctor,
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
+    /// Remove Capsule-managed worktrees for terminal attempts.
+    CleanupWorktrees(CleanupWorktreesArgs),
     /// Run the deployment ACL test suite (DESIGN §8.2). Hermetic mode spins
     /// up a tempdir bare repo with the reference pre-receive hook; remote
     /// mode runs against a real forge with three pre-provisioned principals.
@@ -92,6 +94,16 @@ struct CompletionsArgs {
     /// Shell to generate completions for.
     #[arg(value_enum)]
     shell: clap_complete::Shell,
+}
+
+#[derive(clap::Args)]
+struct CleanupWorktreesArgs {
+    /// Show what would be removed without deleting worktrees.
+    #[arg(long)]
+    dry_run: bool,
+    /// Pass `--force` to `git worktree remove` for dirty or locked worktrees.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -384,6 +396,77 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct CleanupWorktreesReport {
+    removed: usize,
+    would_remove: usize,
+    skipped: usize,
+    entries: Vec<worktree::CleanupWorktreeEntry>,
+}
+
+impl CleanupWorktreesReport {
+    fn new(entries: Vec<worktree::CleanupWorktreeEntry>) -> Self {
+        Self {
+            removed: count_cleanup_action(&entries, "removed"),
+            would_remove: count_cleanup_action(&entries, "would_remove"),
+            skipped: count_cleanup_action(&entries, "skipped"),
+            entries,
+        }
+    }
+}
+
+fn count_cleanup_action(entries: &[worktree::CleanupWorktreeEntry], action: &str) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.action == action)
+        .count()
+}
+
+fn cleanup_worktrees(
+    dir: &Path,
+    capsules: &[Capsule],
+    force: bool,
+    dry_run: bool,
+) -> Result<CleanupWorktreesReport> {
+    let mut entries = Vec::new();
+    for capsule in capsules {
+        if !matches!(capsule.status, Status::Landed | Status::Abandoned) {
+            continue;
+        }
+        for attempt in &capsule.attempts {
+            if let Some(entry) = worktree::cleanup_default_worktree(
+                dir,
+                &capsule.id,
+                attempt.id,
+                &attempt.branch,
+                force,
+                dry_run,
+            )? {
+                entries.push(entry);
+            }
+        }
+    }
+    Ok(CleanupWorktreesReport::new(entries))
+}
+
+fn print_cleanup_worktrees(report: &CleanupWorktreesReport) {
+    println!(
+        "cleanup-worktrees\tremoved={}\twould_remove={}\tskipped={}",
+        report.removed, report.would_remove, report.skipped
+    );
+    for entry in &report.entries {
+        println!(
+            "{}\t{}\tattempt={}\tbranch={}\tpath={}\t{}",
+            entry.action,
+            entry.capsule_id,
+            entry.attempt,
+            entry.branch,
+            entry.path.display(),
+            entry.detail
+        );
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -436,6 +519,20 @@ fn main() -> Result<()> {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
             clap_complete::generate(args.shell, &mut cmd, bin_name, &mut std::io::stdout());
+        }
+        Cmd::CleanupWorktrees(args) => {
+            let mut store = open_store(&dir)?;
+            let capsules = store.list_capsules(ListFilter {
+                status: None,
+                available: false,
+                scope_overlaps: None,
+            })?;
+            let report = cleanup_worktrees(&dir, &capsules, args.force, args.dry_run)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_cleanup_worktrees(&report);
+            }
         }
         Cmd::Create(args) => {
             let mut store = open_store(&dir)?;
