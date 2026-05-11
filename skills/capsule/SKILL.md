@@ -95,10 +95,10 @@ Do NOT invoke for: solo-dev one-session work in a repo without `.capsule/` (caps
 
 ```
 capsule init                       # creates .capsule/state.db (sqlite, embedded)
-capsule deploy verify              # runs ACL test suite against your remote
+capsule deploy-verify              # runs ACL test suite against your remote
 ```
 
-`init` is idempotent. `deploy verify` is required before first `land` in a new deployment — refuses to land otherwise.
+`init` is idempotent. `deploy-verify` is required before first `land` in a new deployment — refuses to land otherwise.
 
 ## What capsule is NOT
 
@@ -109,4 +109,4 @@ capsule deploy verify              # runs ACL test suite against your remote
 
 ## Reference
 
-Full design: `docs/capsule-design.md` (or wherever the deployment placed it). Design defines the data model, protocols, forge matrix, ACL test suite, and threat model.
+Full design: `DESIGN.md`. Design defines the data model, protocols, forge matrix, ACL test suite, and threat model.

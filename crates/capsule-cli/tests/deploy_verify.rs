@@ -1,4 +1,4 @@
-//! Integration test for `capsule deploy verify --hermetic` (DESIGN §8.2).
+//! Integration test for `capsule deploy-verify --hermetic` (DESIGN §8.2).
 //!
 //! Spawns the CLI as a subprocess against a tempdir store, parses the JSON
 //! report, and asserts every test case in the ACL suite passes against the

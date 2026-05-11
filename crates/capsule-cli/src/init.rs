@@ -7,7 +7,7 @@
 //! - warns if the `git` CLI is missing or < 2.13 (DESIGN §3.1 requires
 //!   `--force-with-lease`, client-side git ≥ 2.13).
 //!
-//! The hard check for git belongs in `capsule deploy verify` (DESIGN §8.2); `init`
+//! The hard check for git belongs in `capsule deploy-verify` (DESIGN §8.2); `init`
 //! only warns so the user can create a store offline / ahead of tooling.
 
 use std::fs;

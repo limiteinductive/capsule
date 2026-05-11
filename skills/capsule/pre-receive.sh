@@ -8,7 +8,7 @@
 #
 # In real deployments these rules live in the forge's branch-protection ACL
 # (GitHub rulesets, GitLab protected branches, Gitea, etc.). This hook is the
-# canonical artifact for hermetic verification — `capsule deploy verify
+# canonical artifact for hermetic verification — `capsule deploy-verify
 # --hermetic` runs the §8.2 ACL test suite against a tempdir bare repo with
 # this hook installed.
 #

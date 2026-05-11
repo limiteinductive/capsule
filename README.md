@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/limiteinductive/capsule/main/script
 
 The installer downloads the matching release binary, verifies its `.sha256`
 file, and installs to `~/.local/bin` by default. Override with `PREFIX`,
-`BIN_DIR`, or `CAPSULE_VERSION=v0.0.2`.
+`BIN_DIR`, or `CAPSULE_VERSION=v0.0.3`.
 
 From this checkout:
 

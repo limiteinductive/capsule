@@ -105,11 +105,11 @@ Both are bypassable by direct `Store::attest` calls — that's intentional; the 
 
 **Risk.** Low. Backwards-compatible. Repos may extend the list (e.g., add `db/migrations/` for stricter ordering) or empty it. Migrations directories are a separate question — most teams want ordering, not exclusion; if they want exclusion they declare `--scope db/migrations/`.
 
-### 3.3 Implement DESIGN.md §8.2 (`capsule deploy verify`)
+### 3.3 Implement DESIGN.md §8.2 (`capsule deploy-verify`)
 
 **Status: implemented** (`crates/capsule-cli/src/deploy_verify.rs`; gate enforced in `Store::land` via `enforce_deploy_verify_gate`).
 
-DESIGN.md §8.2 fully specifies an 8-test ACL/branch-protection suite (tests 1, 2, 3, 4a, 4b, 5, 6, 7, 8) using three identities (lander, worker, outsider) against the configured remote. CLAUDE.md confirms this was the only spec'd item that previously `bail!`d. The work was wiring the harness to `capsule deploy verify` and shipping it as the deployment go-live gate per §8.2 mandate ("Refuse to run `land` in production until the suite is recorded as passing").
+DESIGN.md §8.2 fully specifies an 8-test ACL/branch-protection suite (tests 1, 2, 3, 4a, 4b, 5, 6, 7, 8) using three identities (lander, worker, outsider) against the configured remote. CLAUDE.md confirms this was the only spec'd item that previously `bail!`d. The work was wiring the harness to `capsule deploy-verify` and shipping it as the deployment go-live gate per §8.2 mandate ("Refuse to run `land` in production until the suite is recorded as passing").
 
 **Two modes.**
 
@@ -120,7 +120,7 @@ DESIGN.md §8.2 fully specifies an 8-test ACL/branch-protection suite (tests 1, 
 
 **Land gate.** A successful run records a single row in the `deploy_verify_pass` table (schema v2, `deploy_verify_pass(id PK CHECK(id=1), at, mode, base_ref)` — single-row by construction). `Store::land` enforces presence of this row unless `LandRequest::skip_deploy_verify_gate` is set; bypassed via `capsule land --skip-deploy-verify-gate` for tests / break-glass / development.
 
-**Important scope distinction.** §8.2 is an *ACL/branch-protection* suite — every test exercises who can push/create/delete which refs against a real remote. It is not a protocol fault-injection suite. Adversarial schedules (concurrent landers, base_ref races, witness OID mismatches under load, crashes between push and DB commit) are valuable but belong in `cargo test -p capsule-store` against tempdir bare repos, not in `capsule deploy verify` (which assumes a configured remote with three identities). These are separate work items; this proposal covers only §8.2.
+**Important scope distinction.** §8.2 is an *ACL/branch-protection* suite — every test exercises who can push/create/delete which refs against a real remote. It is not a protocol fault-injection suite. Adversarial schedules (concurrent landers, base_ref races, witness OID mismatches under load, crashes between push and DB commit) are valuable but belong in `cargo test -p capsule-store` against tempdir bare repos, not in `capsule deploy-verify` (which assumes a configured remote with three identities). These are separate work items; this proposal covers only §8.2.
 
 **Why.** §8.2 is the deployment gate by design; until it ships, the README cannot honestly claim "verified atomic land is provably race-free in your deployment." Cheapest unique-defense move available.
 
@@ -159,7 +159,7 @@ DESIGN.md §8.2 fully specifies an 8-test ACL/branch-protection suite (tests 1, 
 The following questions appeared in earlier proposal drafts but are settled by DESIGN.md and removed from §6:
 
 - **Worktree branch identity.** §3.2 trust model: workers push `capsules/<id>/a<N>`, lander creates `capsule-witness/<id>/a<N>`. Merging the two would require workers to have push authority on the witness namespace, breaking the trust separation.
-- **`capsule deploy verify` entry point.** §8.2 specifies it as a CLI command that gates `land`, exercising real-remote ACLs with three identities. A `cargo test` entry point cannot replace it — tempdir bare repos cannot test remote branch-protection ACLs (tests 1, 2, 5, 6, 8). Different harnesses, different scopes.
+- **`capsule deploy-verify` entry point.** §8.2 specifies it as a CLI command that gates `land`, exercising real-remote ACLs with three identities. A `cargo test` entry point cannot replace it — tempdir bare repos cannot test remote branch-protection ACLs (tests 1, 2, 5, 6, 8). Different harnesses, different scopes.
 
 ## 8. Implementation status
 

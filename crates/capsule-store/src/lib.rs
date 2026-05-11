@@ -81,7 +81,7 @@ pub enum StoreError {
     )]
     ForceUnfreezeNotConfirmed,
     #[error(
-        "deploy verify gate: no recorded pass — run `capsule deploy verify --hermetic` \
+        "deploy-verify gate: no recorded pass — run `capsule deploy-verify --hermetic` \
          (or `--remote <url>`) before landing, or pass --skip-deploy-verify-gate \
          (DESIGN.md §8.2)"
     )]
@@ -1288,7 +1288,7 @@ pub struct LandRequest {
     pub repo_dir: PathBuf,
     /// Bypass the DESIGN §8.2 deploy-verify gate. Tests and development
     /// flows pass `true`; production landers must pre-record a deploy-verify
-    /// pass via `capsule deploy verify`.
+    /// pass via `capsule deploy-verify`.
     pub skip_deploy_verify_gate: bool,
 }
 
@@ -6420,9 +6420,9 @@ mod tests {
     }
 
     /// `DeployVerifyMissing`'s Display message is the operator's only hint
-    /// at the remediation step (`capsule deploy verify --hermetic` /
+    /// at the remediation step (`capsule deploy-verify --hermetic` /
     /// `--remote <url>`). Pin the literal so a refactor that shortened
-    /// the message to a generic "deploy verify gate: missing pass"
+    /// the message to a generic "deploy-verify gate: missing pass"
     /// (matching the variant pattern but losing the actionable hint)
     /// fails the test.
     #[test]
@@ -6430,15 +6430,15 @@ mod tests {
         let err = StoreError::DeployVerifyMissing;
         assert_eq!(
             err.to_string(),
-            "deploy verify gate: no recorded pass — run \
-             `capsule deploy verify --hermetic` (or `--remote <url>`) \
+            "deploy-verify gate: no recorded pass — run \
+             `capsule deploy-verify --hermetic` (or `--remote <url>`) \
              before landing, or pass --skip-deploy-verify-gate \
              (DESIGN.md §8.2)"
         );
     }
 
     /// `record_deploy_verify_pass` is single-row by construction (PK CHECK
-    /// id=1, INSERT OR REPLACE) — re-running `capsule deploy verify` from
+    /// id=1, INSERT OR REPLACE) — re-running `capsule deploy-verify` from
     /// the operator overwrites the prior pass rather than accumulating
     /// rows. A refactor that dropped `OR REPLACE` (plain INSERT) would
     /// leave the first pass passing but the second call would fail with a

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.3 - 2026-05-10
+
+### Fixed
+
+- Corrected `capsule deploy-verify` command references in production-facing
+  design docs, the bundled agent skill, the reference hook comments, and the
+  land-gate remediation message.
+
 ## 0.0.2 - 2026-05-06
 
 ### Added

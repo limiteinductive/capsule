@@ -470,7 +470,7 @@ Prerequisites per row: `--atomic` push, `--force-with-lease` (both universal git
 | GitLab.com SaaS | **Conditional** | Protected branches on SaaS restrict *push*, not *creation*, for patterns where no branch yet exists; GitLab applies the *most permissive matching rule*, so a broader `*` wildcard owned by another maintainer nullifies the restriction. Usable only if (a) the project has no broader `*` protected-branch rule, (b) a `capsule-witness/*` rule with "Allowed to push and merge: none except <lander>" is in place, and (c) §8.2 ACL tests pass for *creation*. Where feasible, prefer a self-managed GitLab instance with the pre-receive hook. |
 | GitHub Enterprise Server | **Full, with org ruleset** | Use repository or org-level rulesets targeting `refs/heads/capsule-witness/**` with "Restrict creations" + "Restrict updates" + a bypass list containing only the lander **GitHub App**. Requires org-owned repo. PATs are **not** first-class ruleset bypass actors — use an App. |
 | GitHub.com (org repo) | **Conditional** | Same ruleset config as GHES. Requires (a) the repo is owned by an organization, (b) the lander is installed as a GitHub App with `contents:write` scoped to the repo and listed as the sole bypass actor on the ruleset, and (c) rulesets configured to "Restrict creations" (commonly missed). Rulesets are available on public repos with GitHub Free (v9 correction); the org-ownership is what gates bypass-actor support, not the billing tier. |
-| GitHub.com (personal repo) | **Conditional / unverified** | Personal accounts can install GitHub Apps and create repository rulesets; an App-backed lander with bypass on a `capsule-witness/**` ruleset is structurally possible. We have not run §8.2 ACL tests against a personal-account deployment to confirm "Restrict creations" semantics match org behavior. Deploy only after running `capsule deploy verify`. Org-owned repos remain the recommended target. |
+| GitHub.com (personal repo) | **Conditional / unverified** | Personal accounts can install GitHub Apps and create repository rulesets; an App-backed lander with bypass on a `capsule-witness/**` ruleset is structurally possible. We have not run §8.2 ACL tests against a personal-account deployment to confirm "Restrict creations" semantics match org behavior. Deploy only after running `capsule deploy-verify`. Org-owned repos remain the recommended target. |
 | Gitea / Forgejo | **Conditional** | Branch protection restricts push but creation restriction depends on version. Require Gitea ≥ 1.21 / Forgejo ≥ 7 with "restrict pushes that create matching branches" enabled. Otherwise deploy with a server-side hook. |
 | Bitbucket / Azure DevOps | **Unverified** | Not targeted for v0. Users wanting these must run §8.2 ACL tests and file results. |
 
@@ -489,7 +489,7 @@ A deployment is valid only if *all* tests pass against the configured remote, us
 7. Prune path: `lander` deletes a landed witness branch — must succeed (required for §8.4 pruning to work).
 8. `outsider` deletes a witness branch — must be rejected.
 
-Ship these as `capsule deploy verify` in the reference CLI. Refuse to run `land` in production until the suite is recorded as passing for the deployment.
+Ship these as `capsule deploy-verify` in the reference CLI. Refuse to run `land` in production until the suite is recorded as passing for the deployment.
 
 ### 8.3 Lander principal realization
 
@@ -506,7 +506,7 @@ Operate the lander as a single-writer service. Concurrent landers on the same ca
 `capsule prune-branches` deletes attempt branches and witness branches for `landed` / `abandoned` attempts older than a configurable threshold. Witness branches for attempts with unresolved `pending_land` are preserved unconditionally.
 
 **Caveats:**
-- On GitHub.com, protected branches cannot be deleted via git push by default; the lander deletes via API call from its bypass-identity App. `capsule deploy verify` step 7 checks this.
+- On GitHub.com, protected branches cannot be deleted via git push by default; the lander deletes via API call from its bypass-identity App. `capsule deploy-verify` step 7 checks this.
 - On GitLab, protected branches cannot be deleted by `git push` at all; the lander must call the protected-branches API to unprotect, then delete, then (optionally) re-apply protection — or simply leave witnesses in place and accept ref-count growth.
 - Witness branches grow ref count linearly with landed attempts. At 10k+ landed attempts, `git ls-remote` latency and UI branch-list pagination degrade noticeably; plan for periodic pruning or archival to a separate refspace.
 
@@ -540,7 +540,7 @@ Why a skill rather than CLAUDE.md prose:
 Skill responsibilities:
 - Encode **the discipline** (claim → heartbeat → attest → land) as procedural instructions an agent follows turn-to-turn.
 - Map every CLI error code to a recovery action (`scope_conflict`, `base_ref_moved`, `lease_expired`, `witness_oid_mismatch`, `pending_land`, etc.).
-- Walk the user through `capsule init` + `capsule deploy verify` on first use.
+- Walk the user through `capsule init` + `capsule deploy-verify` on first use.
 - State explicitly when *not* to invoke (solo dev, no `.capsule/`).
 
 Skill explicitly does NOT:
@@ -587,7 +587,7 @@ Beyond the skill (which guides agent behavior), deployments may install a `PreTo
 - **ACL test 4 rewritten (v8→v9).** Split into 4a (same-OID idempotency confirmation) and 4b (different-OID rejection + `base_ref`-rollback confirmation). The old test 4 was invalid — empirical testing showed it never fails.
 - **GitHub narrowing (v8→v9).** PAT path removed from supported lander configurations on GitHub (rulesets' bypass-actor mechanism is Apps/roles/teams/deploy-keys; PATs are not first-class). GitHub Free public-repo over-pessimism corrected: rulesets are available; org-ownership gates bypass-actor support, not the billing tier.
 - **Durable pre-push state (v7→v8).** `PendingLand` record, DB-committed before the git push. Reconciler populates `Landing` from `PendingLand` + remote witness query, without in-memory dependency.
-- **Honest forge matrix (v7→v8):** §8.1 narrowed with per-forge prerequisites; §8.2 adds `capsule deploy verify` ACL test suite; §8.4 documents protected-branch deletion caveats; §8.5 documents CI side-effects.
+- **Honest forge matrix (v7→v8):** §8.1 narrowed with per-forge prerequisites; §8.2 adds `capsule deploy-verify` ACL test suite; §8.4 documents protected-branch deletion caveats; §8.5 documents CI side-effects.
 - **Witness placement (v6→v7):** `refs/heads/capsule-witness/*` (protectable) replaces `refs/capsules/*` (unprotectable on SaaS).
 - **Fast-forward rule (v6→v7):** "strict descendant" → "descendant or equal" (git's actual semantics). `Landing.advanced_base_ref` records no-op advances.
 - **Earlier:** atomic multi-ref push with witness (v6), strict sha-equality landing (v5), lease retention through accepted (v4), add-dep atomicity (v4), verified_sha binding (v3), path-component canonicalization (v3), per-attempt fencing (v2), claim-time scope overlap (v2).
